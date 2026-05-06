@@ -1,0 +1,102 @@
+/* ---------- Tokens ---------- */
+:root {
+  color-scheme: dark;
+
+  /* Surfaces */
+  --bg-0:     #07090d;
+  --bg-1:     #0d1117;
+  --bg-2:     #131922;
+  --bg-3:     #1b2230;
+  --line:     #22293a;
+  --line-2:   #2c3447;
+  --hairline: #1a2030;
+
+  /* Text */
+  --fg:       #e6edf3;
+  --fg-muted: #8b98a8;
+  --fg-dim:   #5b667a;
+
+  /* Accents */
+  --green:    #00d68f;
+  --green-2:  #00b377;
+  --amber:    #f5b14a;
+  --red:      #ff5d6c;
+  --purple:   #b18cff;
+  --blue:     #5aa9ff;
+  --cyan:     #4dd6e6;
+  --pink:     #ff7eb9;
+
+  /* Tag colors */
+  --t-ledger:    #00d68f;
+  --t-running:   #5aa9ff;
+  --t-cons-lost: #f5b14a;
+  --t-fork:      #ff5d6c;
+  --t-out-sync:  #b18cff;
+  --t-error:     #ff5d6c;
+  --t-warn:      #f5b14a;
+  --t-started:   #4dd6e6;
+  --t-stopped:   #5b667a;
+  --t-role:      #ff7eb9;
+  --t-other:     #5b667a;
+
+  /* Layout */
+  --radius:    14px;
+  --radius-sm: 10px;
+  --pad:       18px;
+
+  --shadow-1: 0 1px 0 0 rgba(255,255,255,0.03) inset, 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-2: 0 8px 28px rgba(0,0,0,0.55);
+
+  --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, "Segoe UI", "Inter", system-ui, Roboto, "Helvetica Neue", sans-serif;
+}
+
+* { box-sizing: border-box; }
+html, body, #app { height: 100%; }
+body {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.45;
+  color: var(--fg);
+  background:
+    radial-gradient(1100px 600px at 90% -10%, rgba(0,214,143,0.06), transparent 60%),
+    radial-gradient(900px 600px at -10% 110%, rgba(177,140,255,0.05), transparent 60%),
+    var(--bg-0);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button {
+  font: inherit; color: inherit; cursor: pointer; background: transparent; border: 0;
+}
+
+::selection { background: var(--green); color: #06120e; }
+
+/* Reusable */
+.mono { font-family: var(--mono); }
+.muted { color: var(--fg-muted); }
+.dim   { color: var(--fg-dim); }
+
+.scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-2) transparent;
+}
+.scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 4px; }
+.scroll::-webkit-scrollbar-track { background: transparent; }
+
+/* Skeleton shimmer */
+.skel {
+  position: relative;
+  overflow: hidden;
+  background: var(--bg-3);
+  border-radius: 6px;
+}
+.skel::after {
+  content: '';
+  position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
+  animation: shimmer 1.4s infinite;
+}
+@keyframes shimmer { from { transform: translateX(-100%);} to { transform: translateX(100%);} }

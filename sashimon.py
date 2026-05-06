@@ -232,6 +232,15 @@ class Store:
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
+    def earliest_event_ts(self, instance: str | None = None) -> float | None:
+        q = "SELECT MIN(ts) FROM events"
+        args: list = []
+        if instance:
+            q += " WHERE instance=?"
+            args.append(instance)
+        with self.lock:
+            return self.conn.execute(q, args).fetchone()[0]
+
     def histogram(
         self,
         instance: str | None,
@@ -258,8 +267,10 @@ class Store:
         return [out[k] for k in sorted(out)]
 
     def summary(self, window_seconds: int = 3600) -> list[dict]:
+        """window_seconds=0 means all-time."""
         now = time.time()
-        since = now - window_seconds
+        all_time = (window_seconds <= 0)
+        since = 0.0 if all_time else now - window_seconds
         results: list[dict] = []
         with self.lock:
             inst_rows = self.conn.execute(
@@ -297,9 +308,17 @@ class Store:
                 else:
                     health = "unknown"
 
-                # Approx uptime % over window: fraction of 2s slots that
-                # produced a ledger (HP roundtime is 2000ms by default).
-                slots = max(1, window_seconds // 2)
+                # Approx uptime % = fraction of 2s slots producing a ledger
+                # (HP roundtime is 2000ms by default). For all-time, use the
+                # span between first-seen and now.
+                if all_time:
+                    first_ts = self.conn.execute(
+                        "SELECT MIN(ts) FROM events WHERE instance=?", (name,)
+                    ).fetchone()[0]
+                    span = max(2.0, (now - first_ts)) if first_ts else 2.0
+                else:
+                    span = max(2.0, float(window_seconds))
+                slots = max(1, int(span // 2))
                 uptime_pct = round(
                     100.0 * min(counts.get("ledger_created", 0), slots) / slots,
                     1,
@@ -730,7 +749,20 @@ scheduleRefresh();
 """
 
 
-def make_handler(store: Store):
+def _parse_window(raw: str | None) -> int:
+    """Returns seconds. 0 means 'all-time'."""
+    if raw is None:
+        return 3600
+    s = raw.strip().lower()
+    if s in ("all", "0", ""):
+        return 0
+    try:
+        return max(0, int(s))
+    except ValueError:
+        return 3600
+
+
+def make_handler(store: Store, static_html_path: str | None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args) -> None:  # silence default logger
             pass
@@ -747,13 +779,24 @@ def make_handler(store: Store):
             self._send(code, json.dumps(obj).encode("utf-8"),
                        "application/json; charset=utf-8")
 
+        def _serve_dashboard(self) -> None:
+            html: bytes
+            if static_html_path:
+                try:
+                    with open(static_html_path, "rb") as f:
+                        html = f.read()
+                except OSError:
+                    html = DASHBOARD_HTML.encode("utf-8")
+            else:
+                html = DASHBOARD_HTML.encode("utf-8")
+            self._send(200, html, "text/html; charset=utf-8")
+
         def do_GET(self) -> None:  # noqa: N802
             u = urlparse(self.path)
             qs = parse_qs(u.query)
 
             if u.path in ("/", "/index.html"):
-                self._send(200, DASHBOARD_HTML.encode("utf-8"),
-                           "text/html; charset=utf-8")
+                self._serve_dashboard()
                 return
 
             if u.path == "/api/instances":
@@ -761,7 +804,7 @@ def make_handler(store: Store):
                 return
 
             if u.path == "/api/summary":
-                w = int(qs.get("window", ["3600"])[0])
+                w = _parse_window(qs.get("window", [None])[0])
                 self._json(store.summary(w))
                 return
 
@@ -776,10 +819,14 @@ def make_handler(store: Store):
 
             if u.path == "/api/histogram":
                 inst = qs.get("instance", [None])[0]
-                window = int(qs.get("window", ["3600"])[0])
+                window = _parse_window(qs.get("window", [None])[0])
                 bucket = int(qs.get("bucket", ["60"])[0])
                 until = time.time()
-                since = until - window
+                if window <= 0:
+                    earliest = store.earliest_event_ts(inst)
+                    since = earliest if earliest is not None else until - 60
+                else:
+                    since = until - window
                 self._json(store.histogram(inst, since, until, bucket))
                 return
 
@@ -807,12 +854,22 @@ def main() -> None:
     ap.add_argument("--retention-days", type=int,
                     default=int(os.environ.get("SASHIMON_RETENTION_DAYS",
                                                RETENTION_DAYS)))
+    ap.add_argument("--static",
+                    default=os.environ.get("SASHIMON_STATIC", ""),
+                    help="Path to dashboard index.html. Defaults to "
+                         "<script-dir>/index.html if it exists.")
     args = ap.parse_args()
 
     sashi_path = shutil.which(args.sashi) or args.sashi
     store = Store(args.db)
     stop = threading.Event()
     tails: dict[str, Tail] = {}
+
+    static_path = args.static.strip() or str(
+        Path(__file__).resolve().parent / "index.html"
+    )
+    if not Path(static_path).exists():
+        static_path = ""
 
     def _term(_sig, _frm):
         print("[sashimon] shutting down")
@@ -823,8 +880,12 @@ def main() -> None:
     Discoverer(store, tails, stop, sashi_path).start()
     Pruner(store, stop, args.retention_days).start()
 
-    server = ThreadingHTTPServer((args.bind, args.port), make_handler(store))
+    server = ThreadingHTTPServer(
+        (args.bind, args.port),
+        make_handler(store, static_path or None),
+    )
     print(f"[sashimon] db={args.db}  sashi={sashi_path}")
+    print(f"[sashimon] static={static_path or '(embedded fallback)'}")
     print(f"[sashimon] dashboard http://{args.bind}:{args.port}")
     threading.Thread(target=server.serve_forever, daemon=True,
                      name="http").start()

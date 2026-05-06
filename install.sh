@@ -56,6 +56,8 @@ mkdir -p "$INSTALL_DIR" "$DATA_DIR"
 echo "[sashimon] downloading sashimon.py"
 curl -fsSL "$REPO/sashimon.py" -o "$INSTALL_DIR/sashimon.py"
 chmod +x "$INSTALL_DIR/sashimon.py"
+echo "[sashimon] downloading dashboard"
+curl -fsSL "$REPO/index.html" -o "$INSTALL_DIR/index.html"
 
 # 4. systemd unit
 echo "[sashimon] writing $SERVICE_FILE"
