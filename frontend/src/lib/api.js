@@ -28,4 +28,9 @@ export const api = {
     if (minCount != null) q.set('min_count', minCount);
     return j('/api/spells?' + q.toString());
   },
+  clearAll: async () => {
+    const r = await fetch('/api/clear', { method: 'POST', cache: 'no-store' });
+    if (!r.ok) throw new Error('/api/clear ' + r.status);
+    return r.json();
+  },
 };

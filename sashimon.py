@@ -414,6 +414,19 @@ class Store:
             self.conn.commit()
             return cur.rowcount
 
+    def clear_all(self) -> dict:
+        """Wipe all events and instance rows. Tail threads keep running;
+        the next discovery poll will re-upsert live instances."""
+        with self.lock:
+            ev = self.conn.execute("DELETE FROM events").rowcount
+            ins = self.conn.execute("DELETE FROM instances").rowcount
+            self.conn.commit()
+            try:
+                self.conn.execute("VACUUM")
+            except sqlite3.OperationalError:
+                pass
+            return {"events_deleted": ev, "instances_deleted": ins}
+
 
 # --------------------------------------------------------------------------
 # Tail worker (one per instance)
@@ -621,8 +634,8 @@ DASHBOARD_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <h1>sashimon</h1>
-  <span class="meta">Sashimono HotPocket monitor</span>
+  <h1>sashi.mon</h1>
+  <span class="meta">Sashimono HotPocket instance monitor</span>
   <span class="meta" id="lastUpdate"></span>
 </header>
 <main>
@@ -933,6 +946,26 @@ def make_handler(store: Store, static_html_path: str | None):
 
             if u.path == "/healthz":
                 self._json({"ok": True})
+                return
+
+            self._send(404, b"not found", "text/plain")
+
+        def do_POST(self) -> None:  # noqa: N802
+            u = urlparse(self.path)
+
+            if u.path == "/api/clear":
+                # Drain any request body to keep the connection clean.
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 0:
+                    try:
+                        self.rfile.read(length)
+                    except Exception:
+                        pass
+                try:
+                    result = store.clear_all()
+                    self._json({"ok": True, **result})
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)}, code=500)
                 return
 
             self._send(404, b"not found", "text/plain")

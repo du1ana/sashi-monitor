@@ -50,7 +50,34 @@
   let loading = $state(true);
   let err = $state('');
   let selected = $state(null);
+  let clearing = $state(false);
   let timer;
+
+  async function clearDb() {
+    if (clearing) return;
+    const ok = typeof confirm === 'function' && confirm(
+      'Clear all monitoring data?\n\n' +
+      'This wipes every event and instance row from the database. ' +
+      'Tail processes keep running, so live instances reappear within ~30s.\n\n' +
+      'This cannot be undone.'
+    );
+    if (!ok) return;
+    clearing = true;
+    try {
+      await api.clearAll();
+      // Reset client state so cards/charts vanish immediately.
+      summary = [];
+      globalBuckets = [];
+      perInstanceBuckets = {};
+      perInstanceSpells = {};
+      err = '';
+      await refresh();
+    } catch (e) {
+      err = String(e.message || e);
+    } finally {
+      clearing = false;
+    }
+  }
 
   let bucketSec = $derived(granularity === 'minute' ? 60 : 3600);
 
@@ -149,6 +176,21 @@
     <div class="hdr-meta dim">
       {#if lastUpdate}updated {fmtTime(lastUpdate / 1000)}{:else}—{/if}
       {#if err}<span class="err-pill" title={err}>error</span>{/if}
+      <button
+        class="danger-btn"
+        onclick={clearDb}
+        disabled={clearing}
+        title="Wipe all events and instance rows from the database. Live instances re-discover within ~30s."
+        aria-label="Clear database"
+      >
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M3 6h18"/>
+          <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+          <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/>
+          <path d="M10 11v6"/><path d="M14 11v6"/>
+        </svg>
+        <span>{clearing ? 'Clearing…' : 'Clear DB'}</span>
+      </button>
     </div>
   </header>
 
@@ -309,6 +351,26 @@
     text-transform: uppercase; letter-spacing: 0.08em;
     padding: 2px 8px; border-radius: 999px;
   }
+  .danger-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 10px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    color: var(--fg-muted);
+    font-size: 11px; font-weight: 600;
+    cursor: pointer;
+    transition: color .15s, border-color .15s, background .15s, transform .12s;
+  }
+  .danger-btn:hover:not(:disabled) {
+    color: #ff97a2;
+    border-color: var(--red);
+    background: rgba(255,93,108,0.08);
+  }
+  .danger-btn:hover:not(:disabled) svg { color: var(--red); }
+  .danger-btn:active:not(:disabled) { transform: scale(0.97); }
+  .danger-btn:disabled { opacity: 0.55; cursor: progress; }
+  .danger-btn svg { color: var(--fg-dim); }
 
   /* ---- KPIs ---- */
   .kpis {
