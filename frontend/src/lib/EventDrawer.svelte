@@ -13,7 +13,15 @@
   let spells = $state([]);
   let loading = $state(true);
   let err = $state('');
+  let spellsOpen = $state(
+    (typeof localStorage !== 'undefined' && localStorage.getItem('sashimon.spellsOpen') !== 'false')
+  );
   let timer;
+
+  function toggleSpells() {
+    spellsOpen = !spellsOpen;
+    try { localStorage.setItem('sashimon.spellsOpen', spellsOpen); } catch {}
+  }
 
   async function load() {
     try {
@@ -63,40 +71,63 @@
     <button class="close" onclick={() => onClose?.()} aria-label="Close">✕</button>
   </header>
 
-  <div class="grid">
-    <div><span class="k">Sashi status</span><span class="v">{instance.sashi_status || '—'}</span></div>
-    <div><span class="k">Uptime</span><span class="v mono">{instance.uptime_pct ?? 0}%</span></div>
-    <div><span class="k">Last ledger</span><span class="v mono">{instance.last_ledger_age_s != null ? instance.last_ledger_age_s.toFixed(1) + 's' : '—'} ago</span></div>
-    <div><span class="k">Last event</span><span class="v mono">{instance.last_event_age_s != null ? instance.last_event_age_s.toFixed(1) + 's' : '—'} ago</span></div>
-  </div>
+  <div class="body scroll">
+    <div class="grid">
+      <div><span class="k">Sashi status</span><span class="v">{instance.sashi_status || '—'}</span></div>
+      <div><span class="k">Uptime</span><span class="v mono">{instance.uptime_pct ?? 0}%</span></div>
+      <div><span class="k">Last ledger</span><span class="v mono">{instance.last_ledger_age_s != null ? instance.last_ledger_age_s.toFixed(1) + 's' : '—'} ago</span></div>
+      <div><span class="k">Last event</span><span class="v mono">{instance.last_event_age_s != null ? instance.last_event_age_s.toFixed(1) + 's' : '—'} ago</span></div>
+    </div>
 
-  <h3>Issue spells</h3>
-  <div class="spells-wrap">
-    {#if loading && spells.length === 0}
-      {#each Array(3) as _}<div class="row skel" style="height:46px"></div>{/each}
-    {:else}
-      <Spells {spells} />
+    <button
+      class="section-head"
+      onclick={toggleSpells}
+      aria-expanded={spellsOpen}
+      aria-controls="spells-panel"
+    >
+      <svg
+        class="chev"
+        class:open={spellsOpen}
+        width="11" height="11" viewBox="0 0 24 24"
+        fill="none" stroke="currentColor" stroke-width="2.6"
+        stroke-linecap="round" stroke-linejoin="round"
+      >
+        <polyline points="9 6 15 12 9 18"/>
+      </svg>
+      <span>Issue spells</span>
+      {#if spells.length > 0}
+        <span class="count">{spells.length}</span>
+      {/if}
+    </button>
+    {#if spellsOpen}
+      <div id="spells-panel" class="spells-wrap">
+        {#if loading && spells.length === 0}
+          {#each Array(3) as _}<div class="row skel" style="height:46px"></div>{/each}
+        {:else}
+          <Spells {spells} />
+        {/if}
+      </div>
     {/if}
-  </div>
 
-  <h3>Recent events</h3>
-  <div class="log scroll">
-    {#if loading && events.length === 0}
-      {#each Array(10) as _}<div class="row skel" style="height:18px"></div>{/each}
-    {:else if err}
-      <div class="err">{err}</div>
-    {:else if events.length === 0}
-      <div class="empty dim">No events yet.</div>
-    {:else}
-      {#each events as e}
-        {@const tag = TAG_BY_ID[e.tag] || { color: 'var(--fg-dim)', label: e.tag }}
-        <div class="row" style:--c={tag.color}>
-          <span class="ts mono">{fmtTime(e.ts, true)}</span>
-          <span class="tag" style:--c={tag.color}>{tag.label}</span>
-          <span class="msg mono">{e.msg}</span>
-        </div>
-      {/each}
-    {/if}
+    <h3>Recent events</h3>
+    <div class="log">
+      {#if loading && events.length === 0}
+        {#each Array(10) as _}<div class="row skel" style="height:18px"></div>{/each}
+      {:else if err}
+        <div class="err">{err}</div>
+      {:else if events.length === 0}
+        <div class="empty dim">No events yet.</div>
+      {:else}
+        {#each events as e}
+          {@const tag = TAG_BY_ID[e.tag] || { color: 'var(--fg-dim)', label: e.tag }}
+          <div class="row" style:--c={tag.color}>
+            <span class="ts mono">{fmtTime(e.ts, true)}</span>
+            <span class="tag" style:--c={tag.color}>{tag.label}</span>
+            <span class="msg mono">{e.msg}</span>
+          </div>
+        {/each}
+      {/if}
+    </div>
   </div>
 </div>
 
@@ -125,7 +156,25 @@
     display: flex; align-items: flex-start; justify-content: space-between;
     padding: 18px 20px;
     border-bottom: 1px solid var(--line);
+    flex-shrink: 0;
   }
+  .body {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    /* Firefox */
+    scrollbar-width: thin;
+    scrollbar-color: var(--line-2) transparent;
+  }
+  /* Webkit/Blink */
+  .body::-webkit-scrollbar { width: 10px; }
+  .body::-webkit-scrollbar-track { background: transparent; }
+  .body::-webkit-scrollbar-thumb {
+    background: var(--line-2);
+    border-radius: 6px;
+    border: 2px solid var(--bg-1);
+  }
+  .body::-webkit-scrollbar-thumb:hover { background: var(--fg-dim); }
   .title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .name  { font-size: 13px; font-weight: 600; }
   .sub   { font-size: 10.5px; word-break: break-all; margin-top: 6px; }
@@ -147,10 +196,39 @@
   .v { font-size: 14px; }
 
   h3 { margin: 16px 20px 8px; font-size: 11px; font-weight: 600; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.08em; }
+  .section-head {
+    display: flex; align-items: center; gap: 8px;
+    margin: 16px 20px 8px;
+    padding: 4px 8px 4px 4px;
+    background: transparent;
+    border: 0;
+    border-radius: 6px;
+    color: var(--fg-dim);
+    font-size: 11px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    cursor: pointer;
+    transition: color .15s, background .15s;
+    width: max-content;
+  }
+  .section-head:hover { color: var(--fg); background: var(--bg-2); }
+  .section-head .chev {
+    transition: transform .18s ease;
+    color: var(--fg-dim);
+  }
+  .section-head:hover .chev { color: var(--fg-muted); }
+  .section-head .chev.open { transform: rotate(90deg); }
+  .section-head .count {
+    font-family: var(--mono);
+    font-size: 10px; font-weight: 700;
+    padding: 1px 7px; border-radius: 999px;
+    background: var(--bg-3);
+    color: var(--fg-muted);
+    letter-spacing: 0;
+    text-transform: none;
+  }
   .spells-wrap { padding: 0 20px 4px; }
 
   .log {
-    flex: 1; overflow-y: auto;
     padding: 0 20px 20px;
     display: flex; flex-direction: column; gap: 1px;
   }

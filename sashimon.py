@@ -363,19 +363,51 @@ class Store:
                 last_event = self.conn.execute(
                     "SELECT MAX(ts) FROM events WHERE instance=?", (name,)
                 ).fetchone()[0]
+                last_fork = self.conn.execute(
+                    "SELECT MAX(ts) FROM events "
+                    "WHERE instance=? AND tag='fork_warn'",
+                    (name,),
+                ).fetchone()[0]
+                last_cons_lost = self.conn.execute(
+                    "SELECT MAX(ts) FROM events "
+                    "WHERE instance=? AND tag='consensus_lost'",
+                    (name,),
+                ).fetchone()[0]
+                last_oos = self.conn.execute(
+                    "SELECT MAX(ts) FROM events "
+                    "WHERE instance=? AND tag='out_of_sync'",
+                    (name,),
+                ).fetchone()[0]
 
                 ledger_age = (now - last_ledger) if last_ledger else None
                 event_age = (now - last_event) if last_event else None
 
-                if counts.get("fork_warn", 0) > 0:
-                    health = "forked"
-                elif (counts.get("consensus_lost", 0) > 0
-                      and (ledger_age is None or ledger_age > STALL_THRESHOLD)):
-                    health = "consensus_loss"
-                elif ledger_age is not None and ledger_age <= STALL_THRESHOLD:
+                # Health is derived from current state, not aggregate counts.
+                # A recent ledger trumps any past error: if we're producing
+                # ledgers within STALL_THRESHOLD, we're healthy.
+                fresh_ledger = (
+                    last_ledger is not None
+                    and (now - last_ledger) <= STALL_THRESHOLD
+                )
+                # Most-recent error tag wins if no fresh ledger.
+                err_candidates = [
+                    ("forked",          last_fork),
+                    ("consensus_loss",  last_cons_lost),
+                    ("consensus_loss",  last_oos),
+                ]
+                err_candidates = [(h, ts) for h, ts in err_candidates if ts]
+                latest_err = max(err_candidates, key=lambda x: x[1]) if err_candidates else None
+
+                if fresh_ledger and (
+                    latest_err is None or latest_err[1] < last_ledger
+                ):
                     health = "healthy"
+                elif latest_err is not None:
+                    health = latest_err[0]
                 elif event_age is not None and event_age > STALL_THRESHOLD:
                     health = "stalled"
+                elif fresh_ledger:
+                    health = "healthy"
                 else:
                     health = "unknown"
 
