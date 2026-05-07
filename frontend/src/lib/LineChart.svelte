@@ -10,13 +10,22 @@
     CategoryScale, TimeScale, Tooltip, Legend, Filler,
   );
 
-  let { buckets = [], bucketSec = 60, tags = [], visible = {}, height = 220, showLegend = false } = $props();
+  let {
+    buckets = [],
+    bucketSec = 60,
+    tags = [],
+    visible = {},
+    height = 220,
+    showLegend = false,
+    mode = 'smooth', // 'smooth' | 'step'
+  } = $props();
 
   let canvas;
   let chart;
 
   function buildData() {
     const labels = buckets.map(b => b.bucket_start * 1000);
+    const stepped = mode === 'step';
     const datasets = tags
       .filter(t => visible[t.id] !== false)
       .map(t => {
@@ -27,8 +36,9 @@
           borderColor: color,
           backgroundColor: hexA(color, 0.18),
           fill: true,
-          tension: 0.34,
-          borderWidth: 2,
+          tension: stepped ? 0 : 0.34,
+          stepped: stepped ? 'before' : false,
+          borderWidth: stepped ? 1.8 : 2,
           pointRadius: 0,
           pointHoverRadius: 4,
           pointHoverBackgroundColor: color,
@@ -138,7 +148,7 @@
 
   $effect(() => {
     // Re-render whenever inputs change.
-    void buckets; void visible; void tags; void bucketSec;
+    void buckets; void visible; void tags; void bucketSec; void mode;
     if (chart) {
       chart.data = buildData();
       chart.options = opts();

@@ -11,6 +11,14 @@
 
   let windowVal = $state('3600');
   let refreshMs = $state(5000);
+  let chartMode = $state(
+    (typeof localStorage !== 'undefined' && localStorage.getItem('sashimon.chartMode')) || 'smooth'
+  );
+
+  function toggleChartMode() {
+    chartMode = chartMode === 'smooth' ? 'step' : 'smooth';
+    try { localStorage.setItem('sashimon.chartMode', chartMode); } catch {}
+  }
   let summary = $state([]);
   let globalBuckets = $state([]);
   let perInstanceBuckets = $state({});  // name -> [bucket]
@@ -155,9 +163,29 @@
   <section class="panel">
     <div class="panel-head">
       <h2>All instances · events / {bucketSec >= 86400 ? 'day' : bucketSec >= 3600 ? 'hour' : bucketSec >= 60 ? 'min' : 'tick'}</h2>
-      <span class="dim">{globalBuckets.length} buckets · {bucketSec}s</span>
+      <div class="head-tools">
+        <button
+          class="mode-btn"
+          onclick={toggleChartMode}
+          title="Toggle chart mode (smooth / step)"
+          aria-label="Chart mode: {chartMode}"
+        >
+          {#if chartMode === 'smooth'}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 17 C 7 17, 8 7, 12 7 S 17 17, 21 17"/>
+            </svg>
+            <span>Smooth</span>
+          {:else}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 17 H 8 V 11 H 13 V 17 H 18 V 7 H 21"/>
+            </svg>
+            <span>Step</span>
+          {/if}
+        </button>
+        <span class="dim">{globalBuckets.length} buckets · {bucketSec}s</span>
+      </div>
     </div>
-    <LineChart buckets={globalBuckets} {bucketSec} tags={TAGS} {visible} height={260} showLegend={true} />
+    <LineChart buckets={globalBuckets} {bucketSec} tags={TAGS} {visible} mode={chartMode} height={260} showLegend={true} />
   </section>
 
   <section class="grid">
@@ -181,6 +209,7 @@
           buckets={perInstanceBuckets[inst.name] || []}
           {bucketSec}
           {visible}
+          mode={chartMode}
           onSelect={(i) => selected = i}
         />
       {/each}
@@ -306,6 +335,23 @@
     text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-muted);
   }
   .panel-head .dim { font-size: 10.5px; }
+  .head-tools { display: flex; align-items: center; gap: 12px; }
+  .mode-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 10px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    color: var(--fg-muted);
+    font-size: 11px; font-weight: 600;
+    transition: color .15s, border-color .15s, background .15s, transform .12s;
+  }
+  .mode-btn:hover {
+    color: var(--fg); border-color: var(--green);
+    background: color-mix(in srgb, var(--green) 8%, var(--bg-2));
+  }
+  .mode-btn:active { transform: scale(0.97); }
+  .mode-btn svg { color: var(--green); }
 
   /* ---- instance grid ---- */
   .grid {

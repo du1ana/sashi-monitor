@@ -4,7 +4,7 @@
   import { TAGS } from './tags.js';
   import { fmtAge, fmtNum, shortName } from './format.js';
 
-  let { instance, buckets = [], bucketSec = 60, visible = {}, onSelect } = $props();
+  let { instance, buckets = [], bucketSec = 60, visible = {}, mode = 'smooth', onSelect } = $props();
 
   const counts = $derived(instance.counts || {});
 </script>
@@ -36,7 +36,7 @@
   </div>
 
   <div class="chart">
-    <LineChart {buckets} {bucketSec} tags={TAGS} {visible} height={130} />
+    <LineChart {buckets} {bucketSec} tags={TAGS} {visible} {mode} height={130} />
   </div>
 </button>
 
