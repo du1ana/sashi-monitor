@@ -98,8 +98,9 @@
           callbacks: {
             title: (items) => {
               if (!items.length) return '';
-              const ts = items[0].label;
-              return new Date(+ts).toLocaleString();
+              const ms = items[0].parsed?.x;
+              if (typeof ms !== 'number' || !isFinite(ms)) return '';
+              return new Date(ms).toLocaleString();
             },
           },
         },
