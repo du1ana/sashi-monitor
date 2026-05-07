@@ -1,7 +1,7 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import { api } from './lib/api.js';
-  import { TAGS } from './lib/tags.js';
+  import { TAGS, ERROR_TAG_IDS, ERROR_TAG_SET } from './lib/tags.js';
   import LineChart from './lib/LineChart.svelte';
   import InstanceCard from './lib/InstanceCard.svelte';
   import TagFilter from './lib/TagFilter.svelte';
@@ -9,38 +9,57 @@
   import EventDrawer from './lib/EventDrawer.svelte';
   import { fmtNum, fmtTime } from './lib/format.js';
 
-  let windowVal = $state('3600');
+  let windowVal = $state(
+    (typeof localStorage !== 'undefined' && localStorage.getItem('sashimon.window')) || 'all'
+  );
   let refreshMs = $state(5000);
   let chartMode = $state(
     (typeof localStorage !== 'undefined' && localStorage.getItem('sashimon.chartMode')) || 'smooth'
   );
+  let granularity = $state(
+    (typeof localStorage !== 'undefined' && localStorage.getItem('sashimon.granularity')) || 'minute'
+  ); // 'minute' | 'hour'
 
   function toggleChartMode() {
     chartMode = chartMode === 'smooth' ? 'step' : 'smooth';
     try { localStorage.setItem('sashimon.chartMode', chartMode); } catch {}
   }
+
+  function toggleGranularity() {
+    granularity = granularity === 'minute' ? 'hour' : 'minute';
+    try { localStorage.setItem('sashimon.granularity', granularity); } catch {}
+    // In minute mode, force-hide non-error tags (perf safeguard).
+    if (granularity === 'minute') {
+      const next = {};
+      for (const t of TAGS) next[t.id] = ERROR_TAG_SET.has(t.id) ? (visible[t.id] !== false) : false;
+      visible = next;
+    } else {
+      // hour mode: re-enable all
+      const next = {};
+      for (const t of TAGS) next[t.id] = true;
+      visible = next;
+    }
+  }
   let summary = $state([]);
   let globalBuckets = $state([]);
   let perInstanceBuckets = $state({});  // name -> [bucket]
   let perInstanceSpells  = $state({});  // name -> [spell]
-  let visible = $state(Object.fromEntries(TAGS.map(t => [t.id, true])));
+  // Default: only error states visible (matches default minute granularity).
+  let visible = $state(Object.fromEntries(TAGS.map(t => [t.id, ERROR_TAG_SET.has(t.id)])));
   let lastUpdate = $state(null);
   let loading = $state(true);
   let err = $state('');
   let selected = $state(null);
   let timer;
 
-  function bucketSecFor(w) {
-    if (w === 'all') return 3600;
-    const n = +w;
-    if (n <= 900)   return 30;
-    if (n <= 3600)  return 60;
-    if (n <= 21600) return 300;
-    if (n <= 86400) return 900;
-    return 3600;
-  }
+  let bucketSec = $derived(granularity === 'minute' ? 60 : 3600);
 
-  let bucketSec = $derived(bucketSecFor(windowVal));
+  // Disabled tag set — non-error tags can't be selected in minute mode (perf).
+  let disabledIds = $derived(
+    granularity === 'minute'
+      ? new Set(TAGS.filter(t => !ERROR_TAG_SET.has(t.id)).map(t => t.id))
+      : new Set()
+  );
 
   async function refresh() {
     try {
@@ -107,8 +126,13 @@
   });
   onDestroy(() => clearInterval(timer));
 
-  // Re-run when window changes.
-  $effect(() => { void windowVal; refresh(); });
+  // Re-run when window or granularity changes.
+  $effect(() => {
+    void windowVal;
+    try { localStorage.setItem('sashimon.window', windowVal); } catch {}
+    refresh();
+  });
+  $effect(() => { void granularity; refresh(); });
   $effect(() => { void refreshMs; reschedule(); });
 </script>
 
@@ -165,13 +189,36 @@
 
   <section class="filters">
     <span class="filters-label dim">Filter</span>
-    <TagFilter bind:visible counts={aggCounts} />
+    <TagFilter
+      bind:visible
+      counts={aggCounts}
+      {disabledIds}
+      disabledHint="Disabled in minute granularity (perf). Switch to hour to enable."
+    />
   </section>
 
   <section class="panel">
     <div class="panel-head">
-      <h2>All instances · events / {bucketSec >= 86400 ? 'day' : bucketSec >= 3600 ? 'hour' : bucketSec >= 60 ? 'min' : 'tick'}</h2>
+      <h2>All events · per {granularity}</h2>
       <div class="head-tools">
+        <button
+          class="mode-btn"
+          onclick={toggleGranularity}
+          title="Toggle granularity (minute / hour). Minute is errors-only for performance."
+          aria-label="Granularity: {granularity}"
+        >
+          {#if granularity === 'minute'}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/><path d="M12 7 V 12 L 15.5 14"/>
+            </svg>
+            <span>Minute</span>
+          {:else}
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9"/><path d="M12 7 V 12 L 16 12"/>
+            </svg>
+            <span>Hour</span>
+          {/if}
+        </button>
         <button
           class="mode-btn"
           onclick={toggleChartMode}

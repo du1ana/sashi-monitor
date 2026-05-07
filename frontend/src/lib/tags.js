@@ -14,6 +14,9 @@ export const TAGS = [
 
 export const TAG_BY_ID = Object.fromEntries(TAGS.map(t => [t.id, t]));
 
+export const ERROR_TAG_IDS = TAGS.filter(t => t.important).map(t => t.id);
+export const ERROR_TAG_SET = new Set(ERROR_TAG_IDS);
+
 export const HEALTH = {
   healthy:        { label: 'healthy',         bg: 'rgba(0,214,143,0.18)',  fg: '#69f0bd', dot: 'var(--green)' },
   consensus_loss: { label: 'consensus loss',  bg: 'rgba(245,177,74,0.16)', fg: '#ffd28a', dot: 'var(--amber)' },

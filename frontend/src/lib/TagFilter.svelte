@@ -1,18 +1,25 @@
 <script>
   import { TAGS } from './tags.js';
-  let { visible = $bindable({}), counts = {} } = $props();
+  let {
+    visible = $bindable({}),
+    counts = {},
+    disabledIds = new Set(),
+    disabledHint = '',
+  } = $props();
 
   function toggle(id) {
+    if (disabledIds.has(id)) return;
     visible = { ...visible, [id]: visible[id] === false ? true : false };
   }
   function only(id) {
+    if (disabledIds.has(id)) return;
     const next = {};
-    for (const t of TAGS) next[t.id] = (t.id === id);
+    for (const t of TAGS) next[t.id] = (t.id === id) && !disabledIds.has(t.id);
     visible = next;
   }
   function all() {
     const next = {};
-    for (const t of TAGS) next[t.id] = true;
+    for (const t of TAGS) next[t.id] = !disabledIds.has(t.id);
     visible = next;
   }
 </script>
@@ -23,13 +30,16 @@
   {#each TAGS as t}
     {@const on = visible[t.id] !== false}
     {@const c = counts[t.id] || 0}
+    {@const dis = disabledIds.has(t.id)}
     <button
       class="chip"
       class:off={!on}
+      class:disabled={dis}
       style:--c={t.color}
       onclick={() => toggle(t.id)}
       ondblclick={() => only(t.id)}
-      title={`${t.label} — click to toggle, double-click to isolate`}
+      disabled={dis}
+      title={dis ? (disabledHint || 'Disabled') : `${t.label} — click to toggle, double-click to isolate`}
     >
       <span class="swatch"></span>
       <span class="label">{t.label}</span>
@@ -67,6 +77,12 @@
   .chip:hover { border-color: var(--c); transform: translateY(-1px); }
   .chip.off { opacity: .42; }
   .chip.off .swatch { opacity: .3; }
+  .chip.disabled {
+    opacity: .25;
+    cursor: not-allowed;
+    pointer-events: auto;
+  }
+  .chip.disabled:hover { transform: none; border-color: var(--line); }
 
   .swatch {
     width: 8px; height: 8px; border-radius: 50%;
