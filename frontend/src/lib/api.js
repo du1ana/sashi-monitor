@@ -20,4 +20,12 @@ export const api = {
     if (tag) q.set('tag', tag);
     return j('/api/events?' + q.toString());
   },
+  spells: ({ instance, window = '3600', tags, maxGap, minCount } = {}) => {
+    const q = new URLSearchParams({ window });
+    if (instance) q.set('instance', instance);
+    if (tags && tags.length) q.set('tags', tags.join(','));
+    if (maxGap != null) q.set('max_gap', maxGap);
+    if (minCount != null) q.set('min_count', minCount);
+    return j('/api/spells?' + q.toString());
+  },
 };

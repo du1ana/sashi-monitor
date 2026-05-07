@@ -38,3 +38,19 @@ export function shortName(name, n = 12) {
   if (name.length <= n) return name;
   return name.slice(0, n);
 }
+
+export function fmtDuration(s) {
+  if (s == null) return '—';
+  if (s < 1)     return '<1s';
+  if (s < 60)    return s.toFixed(1) + 's';
+  if (s < 3600) {
+    const m = Math.floor(s / 60), sec = Math.round(s % 60);
+    return sec ? `${m}m ${sec}s` : `${m}m`;
+  }
+  if (s < 86400) {
+    const h = Math.floor(s / 3600), m = Math.round((s % 3600) / 60);
+    return m ? `${h}h ${m}m` : `${h}h`;
+  }
+  const d = Math.floor(s / 86400), h = Math.round((s % 86400) / 3600);
+  return h ? `${d}d ${h}h` : `${d}d`;
+}

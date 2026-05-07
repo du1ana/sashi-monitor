@@ -232,6 +232,77 @@ class Store:
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
+    def spells(
+        self,
+        instance: str | None = None,
+        since: float = 0.0,
+        until: float | None = None,
+        tags: tuple[str, ...] = (
+            "consensus_lost", "fork_warn", "out_of_sync", "error", "warning",
+        ),
+        max_gap: float = 10.0,
+        min_count: int = 1,
+    ) -> list[dict]:
+        """
+        Group consecutive same-(instance, tag) events into spells.
+
+        A spell ends when:
+          * the next event has a different (instance, tag), or
+          * the gap to the next event exceeds max_gap seconds.
+
+        Returns each spell as:
+          {instance, tag, start_ts, end_ts, duration_s, count}
+
+        max_gap default 10s ≈ 5× HotPocket roundtime; suits consensus-loop
+        emissions which repeat every ~2s while a condition holds.
+        """
+        if until is None:
+            until = time.time()
+        if not tags:
+            return []
+        placeholders = ",".join(["?"] * len(tags))
+        q = (
+            f"SELECT instance, tag, ts FROM events "
+            f"WHERE tag IN ({placeholders}) AND ts>=? AND ts<=? "
+        )
+        args: list = list(tags) + [since, until]
+        if instance:
+            q += "AND instance=? "
+            args.append(instance)
+        q += "ORDER BY instance, tag, ts"
+
+        out: list[dict] = []
+        cur_inst: str | None = None
+        cur_tag: str | None = None
+        cur_start = cur_end = 0.0
+        cur_count = 0
+
+        def flush():
+            if cur_inst is not None and cur_count >= min_count:
+                out.append({
+                    "instance":   cur_inst,
+                    "tag":        cur_tag,
+                    "start_ts":   cur_start,
+                    "end_ts":     cur_end,
+                    "duration_s": max(0.0, cur_end - cur_start),
+                    "count":      cur_count,
+                })
+
+        with self.lock:
+            for inst, tag, ts in self.conn.execute(q, args):
+                if (inst != cur_inst or tag != cur_tag
+                        or (cur_count > 0 and ts - cur_end > max_gap)):
+                    flush()
+                    cur_inst, cur_tag = inst, tag
+                    cur_start = ts
+                    cur_count = 0
+                cur_end = ts
+                cur_count += 1
+            flush()
+
+        out.sort(key=lambda s: s["duration_s"], reverse=True)
+        return out
+
     def earliest_event_ts(self, instance: str | None = None) -> float | None:
         q = "SELECT MIN(ts) FROM events"
         args: list = []
@@ -828,6 +899,36 @@ def make_handler(store: Store, static_html_path: str | None):
                 else:
                     since = until - window
                 self._json(store.histogram(inst, since, until, bucket))
+                return
+
+            if u.path == "/api/spells":
+                inst = qs.get("instance", [None])[0]
+                window = _parse_window(qs.get("window", [None])[0])
+                until = time.time()
+                if window <= 0:
+                    earliest = store.earliest_event_ts(inst)
+                    since = earliest if earliest is not None else until - 60
+                else:
+                    since = until - window
+                tags_raw = qs.get("tags", [None])[0]
+                tags: tuple[str, ...]
+                if tags_raw:
+                    tags = tuple(t for t in tags_raw.split(",") if t)
+                else:
+                    tags = ("consensus_lost", "fork_warn", "out_of_sync",
+                            "error", "warning")
+                try:
+                    max_gap = float(qs.get("max_gap", ["10"])[0])
+                except ValueError:
+                    max_gap = 10.0
+                try:
+                    min_count = int(qs.get("min_count", ["1"])[0])
+                except ValueError:
+                    min_count = 1
+                self._json(store.spells(
+                    instance=inst, since=since, until=until,
+                    tags=tags, max_gap=max_gap, min_count=min_count,
+                ))
                 return
 
             if u.path == "/healthz":

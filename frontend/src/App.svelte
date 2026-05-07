@@ -22,6 +22,7 @@
   let summary = $state([]);
   let globalBuckets = $state([]);
   let perInstanceBuckets = $state({});  // name -> [bucket]
+  let perInstanceSpells  = $state({});  // name -> [spell]
   let visible = $state(Object.fromEntries(TAGS.map(t => [t.id, true])));
   let lastUpdate = $state(null);
   let loading = $state(true);
@@ -51,12 +52,19 @@
       summary = s;
       globalBuckets = gb;
 
-      // Per-instance histograms
-      const next = {};
+      // Per-instance histograms + spells (parallel per-instance, parallel per-call).
+      const nextB = {};
+      const nextS = {};
       await Promise.all(s.map(async (inst) => {
-        next[inst.name] = await api.histogram(w, bucketSec, inst.name);
+        const [b, sp] = await Promise.all([
+          api.histogram(w, bucketSec, inst.name),
+          api.spells({ instance: inst.name, window: w }),
+        ]);
+        nextB[inst.name] = b;
+        nextS[inst.name] = sp;
       }));
-      perInstanceBuckets = next;
+      perInstanceBuckets = nextB;
+      perInstanceSpells  = nextS;
 
       lastUpdate = Date.now();
       err = '';
@@ -207,6 +215,7 @@
         <InstanceCard
           instance={inst}
           buckets={perInstanceBuckets[inst.name] || []}
+          spells={perInstanceSpells[inst.name] || []}
           {bucketSec}
           {visible}
           mode={chartMode}
@@ -224,7 +233,7 @@
 </div>
 
 {#if selected}
-  <EventDrawer instance={selected} onClose={() => selected = null} />
+  <EventDrawer instance={selected} window={windowVal} onClose={() => selected = null} />
 {/if}
 
 <style>

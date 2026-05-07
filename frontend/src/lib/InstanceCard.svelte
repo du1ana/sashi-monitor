@@ -1,12 +1,22 @@
 <script>
   import LineChart from './LineChart.svelte';
   import HealthDot from './HealthDot.svelte';
-  import { TAGS } from './tags.js';
-  import { fmtAge, fmtNum, shortName } from './format.js';
+  import { TAGS, TAG_BY_ID } from './tags.js';
+  import { fmtAge, fmtNum, fmtDuration, shortName } from './format.js';
 
-  let { instance, buckets = [], bucketSec = 60, visible = {}, mode = 'smooth', onSelect } = $props();
+  let { instance, buckets = [], spells = [], bucketSec = 60, visible = {}, mode = 'smooth', onSelect } = $props();
 
   const counts = $derived(instance.counts || {});
+
+  const longest = $derived(
+    spells.length ? spells.reduce((a, b) => (b.duration_s > a.duration_s ? b : a)) : null
+  );
+  const totalIssueTime = $derived(
+    spells.reduce((sum, s) => sum + (s.duration_s || 0), 0)
+  );
+  const ongoing = $derived(
+    spells.some(s => (Date.now() / 1000 - s.end_ts) <= 10)
+  );
 </script>
 
 <button class="card" onclick={() => onSelect?.(instance)} aria-label="Open {instance.name}">
@@ -28,12 +38,22 @@
       <span class="v mono">{instance.uptime_pct ?? 0}%</span>
     </div>
     <div>
-      <span class="k">Errors</span>
-      <span class="v mono" class:bad={(counts.error||0) + (counts.fork_warn||0) > 0}>
-        {fmtNum((counts.error||0) + (counts.fork_warn||0) + (counts.consensus_lost||0))}
+      <span class="k">Issue time</span>
+      <span class="v mono" class:bad={totalIssueTime > 0}>
+        {totalIssueTime > 0 ? fmtDuration(totalIssueTime) : '—'}
       </span>
     </div>
   </div>
+
+  {#if longest}
+    {@const t = TAG_BY_ID[longest.tag] || { color: 'var(--fg-dim)', label: longest.tag }}
+    <div class="spell" style:--c={t.color}>
+      <span class="dot"></span>
+      <span class="lbl">{t.label}</span>
+      <span class="dur mono">{fmtDuration(longest.duration_s)}</span>
+      {#if ongoing}<span class="now">ongoing</span>{:else}<span class="dim mono">×{longest.count}</span>{/if}
+    </div>
+  {/if}
 
   <div class="chart">
     <LineChart {buckets} {bucketSec} tags={TAGS} {visible} {mode} height={130} />
@@ -80,4 +100,42 @@
   .v { color: var(--fg); font-size: 13px; font-variant-numeric: tabular-nums; }
   .v.bad { color: var(--red); }
   .chart { margin-top: 2px; }
+
+  .spell {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px;
+    background: color-mix(in srgb, var(--c) 8%, var(--bg-3));
+    border: 1px solid color-mix(in srgb, var(--c) 25%, var(--line));
+    border-radius: 8px;
+    font-size: 11.5px;
+    margin-top: -2px;
+  }
+  .spell .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--c);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 22%, transparent);
+  }
+  .spell .lbl {
+    color: var(--c);
+    font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  .spell .dur {
+    margin-left: auto;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+  }
+  .spell .now {
+    font-size: 9.5px; font-weight: 700;
+    color: #ffd28a;
+    background: rgba(245,177,74,0.18);
+    padding: 1px 7px; border-radius: 999px;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    animation: pulse 1.6s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+  }
 </style>

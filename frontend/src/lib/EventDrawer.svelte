@@ -5,9 +5,12 @@
   import { fmtTime, shortName } from './format.js';
   import HealthDot from './HealthDot.svelte';
 
-  let { instance, onClose } = $props();
+  import Spells from './Spells.svelte';
+
+  let { instance, window: windowVal = '3600', onClose } = $props();
 
   let events = $state([]);
+  let spells = $state([]);
   let loading = $state(true);
   let err = $state('');
   let timer;
@@ -15,7 +18,12 @@
   async function load() {
     try {
       loading = true;
-      events = await api.events({ instance: instance.name, limit: 300 });
+      const [ev, sp] = await Promise.all([
+        api.events({ instance: instance.name, limit: 300 }),
+        api.spells({ instance: instance.name, window: windowVal }),
+      ]);
+      events = ev;
+      spells = sp;
       err = '';
     } catch (e) {
       err = String(e.message || e);
@@ -60,6 +68,15 @@
     <div><span class="k">Uptime</span><span class="v mono">{instance.uptime_pct ?? 0}%</span></div>
     <div><span class="k">Last ledger</span><span class="v mono">{instance.last_ledger_age_s != null ? instance.last_ledger_age_s.toFixed(1) + 's' : '—'} ago</span></div>
     <div><span class="k">Last event</span><span class="v mono">{instance.last_event_age_s != null ? instance.last_event_age_s.toFixed(1) + 's' : '—'} ago</span></div>
+  </div>
+
+  <h3>Issue spells</h3>
+  <div class="spells-wrap">
+    {#if loading && spells.length === 0}
+      {#each Array(3) as _}<div class="row skel" style="height:46px"></div>{/each}
+    {:else}
+      <Spells {spells} />
+    {/if}
   </div>
 
   <h3>Recent events</h3>
@@ -130,6 +147,7 @@
   .v { font-size: 14px; }
 
   h3 { margin: 16px 20px 8px; font-size: 11px; font-weight: 600; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.08em; }
+  .spells-wrap { padding: 0 20px 4px; }
 
   .log {
     flex: 1; overflow-y: auto;
