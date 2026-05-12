@@ -52,12 +52,18 @@ if ! command -v sashi >/dev/null 2>&1; then
 fi
 
 # 3. Fetch payload
+#    The dashboard is now embedded in sashimon.py (DASHBOARD_HTML) — self-
+#    contained, no separate frontend build to keep in sync. Older installs
+#    dropped an index.html next to the script which would *override* the
+#    embedded dashboard, so remove it on (re)install.
 mkdir -p "$INSTALL_DIR" "$DATA_DIR"
 echo "[sashimon] downloading sashimon.py"
 curl -fsSL "$REPO/sashimon.py" -o "$INSTALL_DIR/sashimon.py"
 chmod +x "$INSTALL_DIR/sashimon.py"
-echo "[sashimon] downloading dashboard"
-curl -fsSL "$REPO/index.html" -o "$INSTALL_DIR/index.html"
+if [[ -f "$INSTALL_DIR/index.html" ]]; then
+  echo "[sashimon] removing legacy $INSTALL_DIR/index.html (embedded dashboard is used now)"
+  rm -f "$INSTALL_DIR/index.html"
+fi
 
 # 4. systemd unit
 echo "[sashimon] writing $SERVICE_FILE"

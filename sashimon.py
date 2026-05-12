@@ -1488,42 +1488,58 @@ DASHBOARD_HTML = r"""<!doctype html>
              color: var(--warn); border-left:2px solid var(--warn-dim); padding-left:10px; }
   .verdict:empty { display:none; }
 
-  /* --- spells table --- */
-  table.spells { width:100%; border-collapse:collapse; margin-top:14px; font-family:var(--mono); font-size:11px; }
-  table.spells th, table.spells td { text-align:left; padding:5px 10px; border-bottom:1px solid var(--line); white-space:nowrap; }
-  table.spells td.msg { white-space:normal; color:var(--fg-dim); }
-  table.spells th { color:var(--fg-dim); font-weight:600; text-transform:uppercase; letter-spacing:.06em; font-size:9.5px; }
-  table.spells tr td:first-child::before { content:"\25CF"; margin-right:7px; }
-  table.spells tr.recovered td:first-child::before { color:var(--warn); }
-  table.spells tr.active    td:first-child::before { color:var(--bad); }
-  table.spells tr.hardfork  td:first-child::before { color:var(--bad); text-shadow:0 0 6px var(--bad-dim); }
-  table.spells tr.ended     td:first-child::before { color:var(--fg-faint); }
-  table.spells tbody tr { cursor:pointer; }
-  table.spells tbody tr:hover { background: var(--bg2); }
-  table.spells tbody tr.sel { background: var(--bg3); outline:1px solid var(--line2); }
+  /* --- host status bar (homescreen at-a-glance) --- */
+  #statusbar { display:flex; align-items:stretch; margin-bottom:18px; border:1px solid var(--line);
+               border-radius:4px; overflow:hidden; cursor:pointer; font-family:var(--mono); flex-wrap:wrap; }
+  #statusbar .sx { padding:9px 16px; display:flex; flex-direction:column; gap:2px; justify-content:center;
+                   min-width:104px; border-left:1px solid var(--line); }
+  #statusbar .sx:first-child { border-left:none; }
+  #statusbar .sx .l { font-size:9px; text-transform:uppercase; letter-spacing:.07em; color:var(--fg-faint); }
+  #statusbar .sx .v { font-size:13px; font-weight:700; color:var(--fg); }
+  #statusbar .sx .v.bad { color:var(--bad); } #statusbar .sx .v.warn { color:var(--warn); } #statusbar .sx .v.ok { color:var(--ok); }
+  #statusbar .stat { min-width:148px; }
+  #statusbar .stat .v { font-size:16px; letter-spacing:.12em; }
+  #statusbar .stat.ok       { background:linear-gradient(180deg, rgba(63,185,80,.16), transparent); border-left:3px solid var(--ok); }
+  #statusbar .stat.watch    { background:linear-gradient(180deg, rgba(224,168,46,.16), transparent); border-left:3px solid var(--warn); }
+  #statusbar .stat.critical { background:linear-gradient(180deg, rgba(255,90,82,.20), transparent); border-left:3px solid var(--bad);
+                              animation: pulse 1.6s ease-in-out infinite; }
+  #statusbar .note { flex:1; min-width:240px; padding:9px 16px; font-size:10.5px; color:var(--warn);
+                     display:flex; align-items:center; border-left:1px solid var(--line); }
+  #statusbar .note:empty::after { content:"all clear"; color:var(--fg-faint); }
 
-  /* --- spell detail drawer --- */
-  #scrim { position:fixed; inset:0; background:rgba(0,0,0,.55); backdrop-filter:blur(2px);
-           opacity:0; pointer-events:none; transition:opacity .18s; z-index:90; }
-  #scrim.on { opacity:1; pointer-events:auto; }
-  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(880px,94vw); z-index:100;
-            background: var(--bg1); border-left:1px solid var(--line2);
-            box-shadow:-24px 0 60px rgba(0,0,0,.5); transform:translateX(100%);
-            transition: transform .22s cubic-bezier(.4,0,.2,1); display:flex; flex-direction:column; }
-  #drawer.on { transform:translateX(0); }
-  #drawer .dh { padding:14px 18px; border-bottom:1px solid var(--line);
-                display:flex; align-items:center; gap:12px; }
-  #drawer .dh h2 { margin:0; font-family:var(--mono); font-size:14px; font-weight:600; }
-  #drawer .dh .x { margin-left:auto; background:none; border:1px solid var(--line); color:var(--fg-dim);
-                   width:26px; height:26px; border-radius:3px; cursor:pointer; font-size:14px; line-height:1; }
-  #drawer .dh .x:hover { color:var(--fg); border-color:var(--line2); }
-  #drawer .db { overflow-y:auto; padding:16px 18px 40px; flex:1; }
-  #drawer h4 { font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.08em;
-               color:var(--fg-dim); margin:22px 0 8px; padding-bottom:5px; border-bottom:1px solid var(--line); }
-  #drawer h4:first-child { margin-top:0; }
+  /* --- error-spell list (inline-expandable rows) --- */
+  .spelllist { margin-top:14px; display:flex; flex-direction:column; gap:6px; }
+  .spell-item { border:1px solid var(--line); border-left-width:2px; border-radius:3px; overflow:hidden; background:var(--bg); }
+  .spell-item.recovered { border-left-color:var(--warn); }
+  .spell-item.active    { border-left-color:var(--bad); }
+  .spell-item.hardfork  { border-left-color:var(--bad); box-shadow:inset 3px 0 14px var(--bad-dim); }
+  .spell-item.ended     { border-left-color:var(--fg-faint); }
+  .spell-item > summary { list-style:none; cursor:pointer; padding:7px 12px; display:flex; gap:12px; align-items:center;
+                          font-family:var(--mono); font-size:11px; }
+  .spell-item > summary::-webkit-details-marker { display:none; }
+  .spell-item > summary::before { content:"\25B8"; color:var(--fg-dim); transition:transform .12s; flex:0 0 auto; }
+  .spell-item[open] > summary::before { transform:rotate(90deg); }
+  .spell-item[open] > summary { border-bottom:1px solid var(--line); background:var(--bg2); }
+  .spell-item > summary:hover { background:var(--bg2); }
+  .spell-item .st { flex:0 0 86px; font-weight:600; }
+  .spell-item.recovered .st { color:var(--warn); } .spell-item.active .st { color:var(--bad); }
+  .spell-item.hardfork .st { color:var(--bad); } .spell-item.ended .st { color:var(--fg-faint); }
+  .spell-item .ins { flex:0 0 150px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .spell-item .tg  { flex:0 0 124px; color:var(--bad); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .spell-item .ms  { flex:1 1 120px; color:var(--fg-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .spell-item .tm  { flex:0 0 auto; color:var(--fg-faint); white-space:nowrap; }
+  .spell-item > .sd { padding:14px; }
+  .spelllist .empty-row { font-family:var(--mono); font-size:11px; color:var(--fg-faint); padding:10px; }
+
+  /* --- shared spell-detail body (used inline in a row AND in the drawer) --- */
+  .spell-detail h4 { font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.08em;
+                     color:var(--fg-dim); margin:20px 0 8px; padding-bottom:5px; border-bottom:1px solid var(--line); }
+  .spell-detail h4:first-child { margin-top:0; }
+  .spell-detail .hdrline { font-family:var(--mono); font-size:11px; color:var(--fg-dim); margin-bottom:2px; line-height:1.6; }
+  .spell-detail .hdrline b { color:var(--fg); } .spell-detail .hdrline b.bad { color:var(--bad); }
   .dgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(220px,1fr)); gap:10px; }
-  .dgrid .mc canvas { height:58px !important; }
-  .evtline { font-family:var(--mono); font-size:10.5px; max-height:160px; overflow-y:auto;
+  .dgrid .mc canvas { height:56px !important; }
+  .evtline { font-family:var(--mono); font-size:10.5px; max-height:200px; overflow-y:auto;
              border:1px solid var(--line); border-radius:3px; }
   .evtline .e { display:flex; gap:10px; padding:2px 8px; border-bottom:1px solid rgba(255,255,255,.03); }
   .evtline .e:last-child { border-bottom:none; }
@@ -1533,8 +1549,11 @@ DASHBOARD_HTML = r"""<!doctype html>
   .evtline .e.consensus_lost .g, .evtline .e.out_of_sync .g { color:var(--warn); }
   .evtline .e.ledger_created .g { color:var(--ok); }
   .evtline .e .m { color:var(--fg-dim); white-space:pre-wrap; word-break:break-word; }
-  .arts .a { border:1px solid var(--line); border-radius:3px; margin-bottom:8px; overflow:hidden; }
-  .arts .a > summary { cursor:pointer; padding:7px 10px; font-family:var(--mono); font-size:11px;
+  /* artifact "pills" — nested expandable <details> inside a spell */
+  .arts .cap-h { font-family:var(--mono); font-size:9.5px; color:var(--fg-dim); margin:12px 0 6px; display:flex; gap:8px; align-items:center; }
+  .arts .cap-h:first-child { margin-top:0; }
+  .arts .a { border:1px solid var(--line); border-radius:3px; margin-bottom:7px; overflow:hidden; }
+  .arts .a > summary { cursor:pointer; padding:6px 10px; font-family:var(--mono); font-size:10.5px;
                        display:flex; gap:10px; align-items:center; list-style:none; background:var(--bg2); }
   .arts .a > summary::-webkit-details-marker { display:none; }
   .arts .a > summary::before { content:"\25B8"; color:var(--fg-dim); transition:transform .1s; }
@@ -1542,14 +1561,31 @@ DASHBOARD_HTML = r"""<!doctype html>
   .arts .a > summary .k { color:var(--info); font-weight:600; }
   .arts .a > summary .when { color:var(--fg-faint); }
   .arts .a > summary .ins { color:var(--accent); }
+  .arts .a > summary .sz { color:var(--fg-faint); }
   .arts .a > summary .grep { margin-left:auto; }
   .arts .a > summary .grep input { background:var(--bg); border:1px solid var(--line); color:var(--fg);
-                                   font-family:var(--mono); font-size:10px; padding:1px 5px; width:120px; border-radius:2px; }
+                                   font-family:var(--mono); font-size:10px; padding:1px 6px; width:130px; border-radius:2px; }
   .arts .a pre { margin:0; padding:10px 12px; background:var(--bg); font-family:var(--mono); font-size:10.5px;
-                 line-height:1.5; overflow:auto; max-height:380px; white-space:pre-wrap; word-break:break-word; color:var(--fg); }
+                 line-height:1.5; overflow:auto; max-height:340px; white-space:pre-wrap; word-break:break-word; color:var(--fg); }
   .arts .a pre mark { background:rgba(224,168,46,.35); color:inherit; }
   .badge-cap { font-family:var(--mono); font-size:9px; color:var(--fg-dim);
                border:1px solid var(--line); border-radius:2px; padding:0 4px; }
+
+  /* --- spell detail drawer (still used by per-instance card clicks) --- */
+  #scrim { position:fixed; inset:0; background:rgba(0,0,0,.55); backdrop-filter:blur(2px);
+           opacity:0; pointer-events:none; transition:opacity .18s; z-index:90; }
+  #scrim.on { opacity:1; pointer-events:auto; }
+  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(880px,94vw); z-index:100;
+            background: var(--bg1); border-left:1px solid var(--line2);
+            box-shadow:-24px 0 60px rgba(0,0,0,.5); transform:translateX(100%);
+            transition: transform .22s cubic-bezier(.4,0,.2,1); display:flex; flex-direction:column; }
+  #drawer.on { transform:translateX(0); }
+  #drawer .dh { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
+  #drawer .dh h2 { margin:0; font-family:var(--mono); font-size:14px; font-weight:600; }
+  #drawer .dh .x { margin-left:auto; background:none; border:1px solid var(--line); color:var(--fg-dim);
+                   width:26px; height:26px; border-radius:3px; cursor:pointer; font-size:14px; line-height:1; }
+  #drawer .dh .x:hover { color:var(--fg); border-color:var(--line2); }
+  #drawer .db { overflow-y:auto; padding:16px 18px 40px; flex:1; }
 </style>
 </head>
 <body>
@@ -1579,6 +1615,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button id="reload">reload</button>
   </div>
 
+  <div id="statusbar" title="host status — click to jump to host metrics"></div>
+
   <div class="panel">
     <div class="ph"><h2>events</h2><span class="hint">all instances · tags / bucket</span></div>
     <div class="pb"><div class="global"><canvas id="globalChart"></canvas></div></div>
@@ -1605,7 +1643,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div class="panel">
     <div class="ph">
       <h2>error spells</h2>
-      <span class="hint">consensus_loss / fork / out_of_sync · click a block or row → snapshot &amp; metrics for that spell</span>
+      <span class="hint">consensus_loss / fork / out_of_sync · click a row to expand → host metrics &amp; journalctl/log artifacts for that spell</span>
     </div>
     <div class="pb">
       <div class="ribbon" id="ribbon"><div class="now"></div></div>
@@ -1616,9 +1654,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         <i class="l-end">ended</i>
         <span style="margin-left:auto" id="spellCount"></span>
       </div>
-      <table class="spells"><thead><tr>
-        <th>state</th><th>instance</th><th>started</th><th>dur</th><th>trigger</th><th class="msg">message</th><th>cap</th>
-      </tr></thead><tbody id="spellRows"></tbody></table>
+      <div class="spelllist" id="spellRows"></div>
     </div>
   </div>
 
@@ -1735,6 +1771,11 @@ function lineChart(id, datasets, opts) {
       },
     },
   };
+  // If a prior chart bound a now-stale canvas (drawer reopened / row re-rendered), drop it.
+  if (lineCharts[id] && lineCharts[id].canvas !== el) {
+    try { lineCharts[id].destroy(); } catch(e) {}
+    delete lineCharts[id];
+  }
   // Chart.js time scale needs adapters; fall back to category if 'time' fails.
   try {
     if (!lineCharts[id]) lineCharts[id] = new Chart(el, cfg);
@@ -1743,9 +1784,12 @@ function lineChart(id, datasets, opts) {
     // No time adapter loaded — degrade to a plain index axis.
     cfg.options.scales.x = { ticks:{display:false}, grid:{display:false} };
     cfg.data.datasets.forEach(d => d.data = d.data.map(p => p && p.y));
-    if (lineCharts[id]) lineCharts[id].destroy();
+    if (lineCharts[id]) { try { lineCharts[id].destroy(); } catch(_) {} }
     lineCharts[id] = new Chart(el, cfg);
   }
+}
+function destroyCharts(pred) {
+  for (const k of Object.keys(lineCharts)) if (pred(k)) { try { lineCharts[k].destroy(); } catch(e) {} delete lineCharts[k]; }
 }
 const xy = (rows, key) => rows.filter(r => r[key] != null).map(r => ({ x: r.ts*1000, y: r[key] }));
 const PAL = ['#3fb950','#58a6ff','#e0a82e','#b083ff','#ff5a52','#56d4dd','#d2a8ff'];
@@ -1753,6 +1797,8 @@ const PAL = ['#3fb950','#58a6ff','#e0a82e','#b083ff','#ff5a52','#56d4dd','#d2a8f
 let LAST_SPELLS = [];        // all spells (24h), cached for ribbon + per-card lists
 let LAST_PROC_LATEST = {};   // instance -> most recent per-process host_metrics row
 let CARD_SPELLS_ALL = {};    // instance -> bool: card showing all its spells vs first few
+let OPEN_SPELLS = new Set(); // spell_ids currently expanded in the spells panel (kept across refreshes)
+let SPELL_LIST_KEY = '';     // signature of the rendered spell list, to avoid needless rebuilds
 
 async function refreshHost(win) {
   let machine = [], procRows = [], spells = [];
@@ -1821,164 +1867,220 @@ async function refreshHost(win) {
   if (openHF.length) v.unshift(`${openHF.length} spell(s) OPEN now — ${openHF.map(s=>(s.instance||'').slice(0,12)).join(', ')} (4-node clusters tolerate only 1 fault — see HOTPOCKET_CONSENSUS_INVESTIGATION.md)`);
   document.getElementById('hostVerdict').innerHTML = v.length ? v.map(t=>'⚠ '+esc(t)).join('<br>') : '';
 
-  // ---- spell ribbon + table ----
+  // ---- status bar + spell ribbon + inline-expandable spell list ----
   LAST_SPELLS = spells;
-  renderRibbon(spells, win);
-  const tb = document.getElementById('spellRows'); tb.innerHTML = '';
-  document.getElementById('spellCount').textContent =
-    spells.length ? `${spells.length} in 24h · ${spells.filter(s=>s.state!=='recovered'&&s.state!=='ended').length} unresolved` : '';
-  if (!spells.length) {
-    tb.innerHTML = '<tr><td colspan="7" style="color:var(--fg-faint)">— no error spells in the last 24h —</td></tr>';
-  } else for (const s of spells) {
-    const cls = s.state==='recovered'?'recovered' : s.state==='active'?'active' : s.state==='hard_fork?'?'hardfork' : 'ended';
-    const tr = document.createElement('tr');
-    tr.className = cls; tr.dataset.sid = s.spell_id;
-    tr.innerHTML =
-      `<td>${s.state}</td><td>${esc((s.instance||'').slice(0,20))}</td>` +
-      `<td>${tsClock(s.start_ts)}</td><td>${fmtAge(s.duration_s)}</td>` +
-      `<td>${esc(s.trigger_tag||'')}</td><td class="msg">${esc((s.trigger_msg||'').slice(0,90))}</td>` +
-      `<td>${s.captures||0}</td>`;
-    tr.onclick = () => openSpellDrawer(s.spell_id);
-    tb.appendChild(tr);
-  }
+  const lastAge = last ? (Date.now()/1000 - last.ts) : null;
+  renderStatusBar(last, v, openHF, lastAge, byInst);
+  renderRibbon(spells);
+  renderSpellsPanel(spells);
 }
 
-function renderRibbon(spells, win) {
+// ---- host status bar (homescreen at-a-glance) -----------------------
+function renderStatusBar(m, verdictLines, openSpells, lastAge, byInst) {
+  const sb = document.getElementById('statusbar'); if (!sb) return;
+  const open = (openSpells || []).length;
+  let level, word;
+  if (open) { level = 'critical'; word = open + ' SPELL' + (open > 1 ? 'S' : '') + ' OPEN'; }
+  else if ((verdictLines || []).length) { level = 'watch'; word = 'WATCH'; }
+  else if (!m) { level = 'watch'; word = 'NO HOST DATA'; }
+  else { level = 'ok'; word = 'OK'; }
+  const cell = (l, val, cls) => `<div class="sx"><span class="l">${l}</span><span class="v ${cls || ''}">${val}</span></div>`;
+  const ninst = byInst ? Object.keys(byInst).length : 0;
+  let html = `<div class="sx stat ${level}"><span class="l">cluster · host</span><span class="v">${esc(word)}</span></div>`;
+  if (m) {
+    html += cell('disk free', m.disk_free_mb != null ? Math.round(m.disk_free_mb) + 'M' : '—', (m.disk_free_mb != null && m.disk_free_mb < 1024) ? 'bad' : '');
+    html += cell('mem used', m.mem_used_pct != null ? m.mem_used_pct + '%' : '—', (m.mem_used_pct || 0) > 92 ? 'bad' : '');
+    html += cell('cpu/steal', `${num(m.cpu_pct)}/${num(m.steal_pct)}`, (m.steal_pct || 0) > 10 ? 'warn' : '');
+    html += cell('load1', num(m.load1), (m.load1 || 0) > 8 ? 'warn' : '');
+    html += cell('ntp', m.ntp_synced === 0 ? 'NOSYNC' : (m.ntp_offset_ms != null ? num(m.ntp_offset_ms) + 'ms' : '—'), (m.ntp_synced === 0 || Math.abs(m.ntp_offset_ms || 0) > 1000) ? 'bad' : '');
+    html += cell('hp inst', String(ninst));
+    html += cell('sampled', lastAge != null ? fmtAge(lastAge) + ' ago' : '—', (lastAge != null && lastAge > 120) ? 'warn' : '');
+  }
+  html += cell('spells 24h', String((LAST_SPELLS || []).length), open ? 'bad' : '');
+  const notes = (verdictLines || []).slice();
+  html += `<div class="note">${notes.slice(0, 2).map(esc).join('  ·  ')}${notes.length > 2 ? '  ·  +' + (notes.length - 2) + ' more' : ''}</div>`;
+  sb.className = level === 'critical' ? 'critical' : '';
+  sb.innerHTML = html;
+  sb.onclick = () => { const el = document.getElementById('hostVerdict') || document.getElementById('m_disk'); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' }); };
+}
+
+// ---- 24h spell timeline ribbon --------------------------------------
+function renderRibbon(spells) {
   const rb = document.getElementById('ribbon');
   rb.querySelectorAll('.blk, .axl').forEach(e => e.remove());
-  const now = Date.now()/1000;
-  const span = 86400;                       // ribbon always shows last 24h
-  const t0 = now - span;
-  // axis ticks every 6h
+  const now = Date.now() / 1000, span = 86400, t0 = now - span;
   for (let h = 0; h <= 24; h += 6) {
-    const ax = document.createElement('div'); ax.className='axl';
-    ax.style.left = (100*h/24) + '%';
-    ax.textContent = h===0 ? '-24h' : (h===24 ? 'now' : '-'+(24-h)+'h');
+    const ax = document.createElement('div'); ax.className = 'axl';
+    ax.style.left = (100 * h / 24) + '%';
+    ax.textContent = h === 0 ? '-24h' : (h === 24 ? 'now' : '-' + (24 - h) + 'h');
     rb.appendChild(ax);
   }
   for (const s of spells) {
-    const a = Math.max(s.start_ts, t0);
-    const b = Math.min(s.end_ts || now, now);
+    const a = Math.max(s.start_ts, t0), b = Math.min(s.end_ts || now, now);
     if (b <= t0) continue;
-    const left = 100*(a - t0)/span;
-    const width = Math.max(0.25, 100*(b - a)/span);
-    const cls = s.state==='recovered'?'recovered' : s.state==='active'?'active' : s.state==='hard_fork?'?'hardfork' : 'ended';
     const blk = document.createElement('div');
-    blk.className = 'blk ' + cls;
-    blk.style.left = left + '%'; blk.style.width = width + '%';
-    blk.title = `${s.instance} · ${s.state} · ${tsClock(s.start_ts)} · ${fmtAge(s.duration_s)} · ${s.trigger_tag||''}`;
-    blk.onclick = () => openSpellDrawer(s.spell_id);
+    blk.className = 'blk ' + spellCls(s);
+    blk.style.left = (100 * (a - t0) / span) + '%';
+    blk.style.width = Math.max(0.25, 100 * (b - a) / span) + '%';
+    blk.title = `${s.instance} · ${s.state} · ${tsClock(s.start_ts)} · ${fmtAge(s.duration_s)} · ${s.trigger_tag || ''}`;
+    blk.onclick = () => expandSpellRow(s.spell_id);
     rb.appendChild(blk);
   }
 }
 
-// ---- spell detail drawer --------------------------------------------
-function closeDrawer(){ document.getElementById('drawer').classList.remove('on'); document.getElementById('scrim').classList.remove('on'); }
-document.getElementById('dwClose').onclick = closeDrawer;
-document.getElementById('scrim').onclick = closeDrawer;
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+function expandSpellRow(spellId) {
+  const it = document.querySelector(`.spell-item[data-sid="${CSS.escape(spellId)}"]`);
+  if (!it) { openSpellDrawer(spellId); return; }   // not in the panel list (e.g. clicked from a card) → drawer
+  if (!it.open) it.open = true;                     // toggle listener lazy-loads the body
+  it.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  it.style.outline = '1px solid var(--accent)';
+  setTimeout(() => { it.style.outline = ''; }, 1400);
+}
 
-const ARTIFACT_ORDER = ['logtail','journalctl','journalctl_agent','journalctl_units','dmesg','ps','free','vmstat','uptime','df','dfi','chronyc','du'];
+// ---- inline-expandable spell list (spells panel) --------------------
+const spellCls = s => s.state === 'recovered' ? 'recovered' : s.state === 'active' ? 'active' : s.state === 'hard_fork?' ? 'hardfork' : 'ended';
+const durBucket = s => String(Math.round((s.duration_s || 0) / 30));
+const spellPrefix = id => 'r' + String(id).replace(/[^a-zA-Z0-9]/g, '_');
+function spellSummaryHTML(s) {
+  return `<span class="st">${esc(s.state)}</span>` +
+    `<span class="ins">${esc((s.instance || '').slice(0, 22))}</span>` +
+    `<span class="tg">${esc(s.trigger_tag || '')}</span>` +
+    `<span class="ms">${esc((s.trigger_msg || '').slice(0, 220))}</span>` +
+    `<span class="tm">${tsClock(s.start_ts)} · ${fmtAge(s.duration_s)} · cap ${s.captures || 0}</span>`;
+}
 
-async function openSpellDrawer(spellId) {
-  document.querySelectorAll('table.spells tr.sel').forEach(t => t.classList.remove('sel'));
-  const row = document.querySelector(`table.spells tr[data-sid="${CSS.escape(spellId)}"]`);
-  if (row) row.classList.add('sel');
+function renderSpellsPanel(spells) {
+  const host = document.getElementById('spellRows');
+  document.getElementById('spellCount').textContent = spells.length
+    ? `${spells.length} in 24h · ${spells.filter(s => s.state !== 'recovered' && s.state !== 'ended').length} unresolved` : '';
+  // only rebuild when something an expanded row would care about changed
+  const key = spells.map(s => `${s.spell_id}|${s.state}|${durBucket(s)}|${s.captures || 0}`).join('~');
+  if (key === SPELL_LIST_KEY && host.childElementCount) return;   // unchanged → keep the DOM (and any expanded rows)
+  SPELL_LIST_KEY = key;
+  destroyCharts(k => k[0] === 'r');                 // tear down old inline-row charts before rebuilding
+  host.innerHTML = '';
+  if (!spells.length) { host.innerHTML = '<div class="empty-row">— no error spells in the last 24h —</div>'; return; }
+  for (const s of spells) {
+    const det = document.createElement('details');
+    det.className = 'spell-item ' + spellCls(s);
+    det.dataset.sid = s.spell_id;
+    det.innerHTML = `<summary>${spellSummaryHTML(s)}</summary>` +
+      `<div class="sd"><div style="color:var(--fg-dim);font-family:var(--mono);font-size:11px">expand to load host metrics &amp; journalctl/log artifacts…</div></div>`;
+    const sd = det.querySelector('.sd');
+    const loadDetail = () => {
+      const want = durBucket(s);
+      if (det.dataset.loadedDur === want) return;   // body already current
+      det.dataset.loadedDur = want;
+      renderSpellDetail(sd, s.spell_id, spellPrefix(s.spell_id));
+    };
+    det.addEventListener('toggle', () => {
+      if (det.open) { OPEN_SPELLS.add(s.spell_id); loadDetail(); }
+      else { OPEN_SPELLS.delete(s.spell_id); }
+    });
+    host.appendChild(det);
+    if (OPEN_SPELLS.has(s.spell_id)) { det.open = true; loadDetail(); }   // restore expansion across refreshes
+  }
+}
+
+// ---- shared spell-detail renderer (used by inline rows AND the drawer) ----
+const ARTIFACT_ORDER = ['logtail', 'journalctl', 'journalctl_agent', 'journalctl_units', 'dmesg', 'ps', 'free', 'vmstat', 'uptime', 'df', 'dfi', 'chronyc', 'du'];
+
+async function renderSpellDetail(container, spellId, prefix) {
   const meta = LAST_SPELLS.find(s => s.spell_id === spellId) || {};
-  document.getElementById('dwTitle').textContent = spellId;
-  const stEl = document.getElementById('dwState');
-  const stCls = meta.state==='recovered'?'ok' : meta.state==='ended'?'dim' : 'bad';
-  stEl.className = 'pill ' + stCls; stEl.textContent = meta.state || '—';
-  const body = document.getElementById('dwBody');
-  body.innerHTML = '<div style="color:var(--fg-dim);font-family:var(--mono)">loading…</div>';
-  document.getElementById('drawer').classList.add('on');
-  document.getElementById('scrim').classList.add('on');
-
-  const startTs = meta.start_ts || (Date.now()/1000 - 600);
-  const endTs   = meta.end_ts   || (Date.now()/1000);
-  const padded0 = startTs - 90, padded1 = endTs + 90;     // a little context either side
+  container.innerHTML = '<div style="color:var(--fg-dim);font-family:var(--mono);font-size:11px">loading…</div>';
+  const startTs = meta.start_ts || (Date.now() / 1000 - 600);
+  const endTs = meta.end_ts || (Date.now() / 1000);
+  const p0 = startTs - 90, p1 = endTs + 90;
   let arts = [], hm = [], evs = [];
   try {
     [arts, hm, evs] = await Promise.all([
       fetchJSON('/api/spell_artifacts?spell_id=' + encodeURIComponent(spellId)),
       fetchJSON(`/api/host_metrics?window=86400&limit=20000`),
-      fetchJSON(`/api/events?instance=${encodeURIComponent(meta.instance||'')}&since=${padded0}&until=${padded1}&limit=2000`),
+      fetchJSON(`/api/events?instance=${encodeURIComponent(meta.instance || '')}&since=${p0}&until=${p1}&limit=2000`),
     ]);
-  } catch (e) { body.innerHTML = '<div style="color:var(--bad)">error: ' + esc(e.message) + '</div>'; return; }
+  } catch (e) { container.innerHTML = '<div style="color:var(--bad)">error: ' + esc(e.message) + '</div>'; return; }
 
-  // host metrics restricted to the spell window (boosted samples live here too)
-  const win = hm.filter(r => r.ts >= padded0 && r.ts <= padded1);
-  const mach = win.filter(r => r.instance == null).sort((a,b)=>a.ts-b.ts);
+  const win = hm.filter(r => r.ts >= p0 && r.ts <= p1);
+  const mach = win.filter(r => r.instance == null).sort((a, b) => a.ts - b.ts);
   const procByInst = {};
   for (const r of win) if (r.instance && r.proc_rss_mb != null) (procByInst[r.instance] ||= []).push(r);
-
-  // header line
-  const dur = (meta.duration_s != null) ? fmtAge(meta.duration_s) : '—';
   const boosted = win.filter(r => r.during_spell === 1).length;
-  let html = `<div style="font-family:var(--mono);font-size:11px;color:var(--fg-dim);margin-bottom:4px">` +
-    `instance <b style="color:var(--fg)">${esc(meta.instance||'?')}</b> · ` +
-    `started ${esc(new Date(startTs*1000).toLocaleString())} · duration ${dur} · ` +
-    `trigger <b style="color:var(--bad)">${esc(meta.trigger_tag||'?')}</b> ${esc((meta.trigger_msg||'').slice(0,120))} · ` +
-    `${arts.length} artifacts · ${boosted} boosted samples</div>`;
+  const dur = meta.duration_s != null ? fmtAge(meta.duration_s) : '—';
+  const cid = k => `${prefix}_${k}`;
 
-  // metrics during the spell
-  html += `<h4>host metrics — spell window ±90s ${boosted? '(includes '+boosted+' boosted samples)':''}</h4>`;
-  html += `<div class="dgrid">
-    <div class="mc"><h3>disk free <span>MB</span></h3><canvas id="dw_disk"></canvas></div>
-    <div class="mc"><h3>mem used <span>%</span></h3><canvas id="dw_mem"></canvas></div>
-    <div class="mc"><h3>cpu / steal <span>%</span></h3><canvas id="dw_cpu"></canvas></div>
-    <div class="mc"><h3>load <span>1m</span></h3><canvas id="dw_load"></canvas></div>
-    <div class="mc"><h3>ntp offset <span>ms</span></h3><canvas id="dw_ntp"></canvas></div>
-    <div class="mc"><h3>hp rss <span>MB</span></h3><canvas id="dw_rss"></canvas></div>
-  </div>`;
+  let html = `<div class="spell-detail">`;
+  html += `<div class="hdrline">id <b>${esc(spellId)}</b> · instance <b>${esc(meta.instance || '?')}</b> · ` +
+    `state <b class="${(meta.state && meta.state !== 'recovered' && meta.state !== 'ended') ? 'bad' : ''}">${esc(meta.state || '?')}</b> · ` +
+    `started <b>${esc(new Date(startTs * 1000).toLocaleString())}</b> · duration <b>${dur}</b> · ` +
+    `trigger <b class="bad">${esc(meta.trigger_tag || '?')}</b> ${esc((meta.trigger_msg || '').slice(0, 160))}</div>` +
+    `<div class="hdrline">${arts.length} artifacts · ${boosted} boosted (3s) host samples · ${evs.length} log events in window</div>`;
 
-  // event timeline
+  html += `<h4>host metrics — spell window ±90s${boosted ? ` · ${boosted} boosted samples` : ''}</h4>`;
+  html += `<div class="dgrid">` +
+    `<div class="mc"><h3>disk free <span>MB</span></h3><canvas id="${cid('disk')}"></canvas></div>` +
+    `<div class="mc"><h3>mem used <span>%</span></h3><canvas id="${cid('mem')}"></canvas></div>` +
+    `<div class="mc"><h3>cpu / steal <span>%</span></h3><canvas id="${cid('cpu')}"></canvas></div>` +
+    `<div class="mc"><h3>load <span>1m</span></h3><canvas id="${cid('load')}"></canvas></div>` +
+    `<div class="mc"><h3>ntp offset <span>ms</span></h3><canvas id="${cid('ntp')}"></canvas></div>` +
+    `<div class="mc"><h3>hp rss <span>MB</span></h3><canvas id="${cid('rss')}"></canvas></div></div>`;
+
   html += `<h4>events around the spell (${evs.length})</h4>`;
   if (!evs.length) html += `<div style="color:var(--fg-faint);font-family:var(--mono);font-size:11px">no log events captured for this instance in the window</div>`;
   else {
-    const ord = evs.slice().sort((a,b)=>a.ts-b.ts);
+    const ord = evs.slice().sort((a, b) => a.ts - b.ts);
     html += `<div class="evtline">` + ord.map(e =>
-      `<div class="e ${esc(e.tag)}"><span class="t">${tsClock(e.ts)}</span><span class="g">${esc(e.tag)}</span><span class="m">${esc((e.msg||'').slice(0,300))}</span></div>`
+      `<div class="e ${esc(e.tag)}"><span class="t">${tsClock(e.ts)}</span><span class="g">${esc(e.tag)}</span><span class="m">${esc((e.msg || '').slice(0, 400))}</span></div>`
     ).join('') + `</div>`;
   }
 
-  // artifacts (grouped, collapsible, with a per-block grep box)
-  html += `<h4>captured snapshots (${arts.length})</h4>`;
-  if (!arts.length) html += `<div style="color:var(--fg-faint);font-family:var(--mono);font-size:11px">no artifacts — spell may be too new, or capture tools (ps/df/journalctl) unavailable on this host</div>`;
+  html += `<h4>captured snapshots — journalctl / dmesg / ps / df / chronyc / contract log (${arts.length}) — each is its own expandable pill with a grep box</h4>`;
+  if (!arts.length) html += `<div style="color:var(--fg-faint);font-family:var(--mono);font-size:11px">no artifacts yet — spell may be new, or capture tools (ps/df/journalctl) unavailable on this host</div>`;
   else {
-    const sorted = arts.slice().sort((a,b) => (a.ts-b.ts) || (ARTIFACT_ORDER.indexOf(a.kind)-ARTIFACT_ORDER.indexOf(b.kind)));
-    // group by capture timestamp (snapshots come in bursts)
+    const sorted = arts.slice().sort((a, b) => (a.ts - b.ts) || (ARTIFACT_ORDER.indexOf(a.kind) - ARTIFACT_ORDER.indexOf(b.kind)));
     const groups = [];
-    for (const a of sorted) {
-      let g = groups.find(g => Math.abs(g.ts - a.ts) < 5);
-      if (!g) { g = { ts: a.ts, items: [] }; groups.push(g); }
-      g.items.push(a);
-    }
+    for (const a of sorted) { let g = groups.find(g => Math.abs(g.ts - a.ts) < 5); if (!g) { g = { ts: a.ts, items: [] }; groups.push(g); } g.items.push(a); }
     html += `<div class="arts">` + groups.map((g, gi) =>
-      `<div style="font-family:var(--mono);font-size:10px;color:var(--fg-dim);margin:${gi?14:0}px 0 6px">` +
-      `<span class="badge-cap">capture ${gi+1}/${groups.length}</span> ${esc(new Date(g.ts*1000).toLocaleString())}</div>` +
+      `<div class="cap-h"><span class="badge-cap">capture ${gi + 1}/${groups.length}</span> ${esc(new Date(g.ts * 1000).toLocaleString())}</div>` +
       g.items.map((a, ai) => {
-        const id = `art_${gi}_${ai}`;
-        const openByDefault = ['logtail','journalctl_agent','journalctl','dmesg'].includes(a.kind) && gi === 0;
-        return `<details class="a"${openByDefault?' open':''}><summary>` +
-          `<span class="k">${esc(a.kind)}</span>` + (a.instance?`<span class="ins">${esc(a.instance.slice(0,18))}</span>`:'') +
-          `<span class="when">${tsClock(a.ts)}</span>` +
-          `<span class="grep"><input placeholder="grep…" data-tgt="${id}" oninput="grepArtifact(this)"></span>` +
-          `</summary><pre id="${id}" data-raw="${esc(a.content||'')}">${esc(a.content||'(empty)')}</pre></details>`;
+        const id = `${prefix}_art_${gi}_${ai}`;
+        const sz = (a.content || '').length;
+        const openDef = ['logtail', 'journalctl_agent', 'journalctl', 'dmesg'].includes(a.kind) && gi === 0;
+        return `<details class="a"${openDef ? ' open' : ''}><summary>` +
+          `<span class="k">${esc(a.kind)}</span>` + (a.instance ? `<span class="ins">${esc(a.instance.slice(0, 18))}</span>` : '') +
+          `<span class="when">${tsClock(a.ts)}</span><span class="sz">${sz > 2048 ? Math.round(sz / 1024) + 'K' : sz + 'B'}</span>` +
+          `<span class="grep"><input placeholder="grep…" data-tgt="${id}" oninput="grepArtifact(this)"></span></summary>` +
+          `<pre id="${id}" data-raw="${esc(a.content || '')}">${esc(a.content || '(empty)')}</pre></details>`;
       }).join('')
     ).join('') + `</div>`;
   }
-  body.innerHTML = html;
+  html += `</div>`;
+  container.innerHTML = html;
 
-  // draw the per-spell sparklines now that the canvases exist
-  lineChart('dw_disk', [{label:'free MB', color:PAL[0], points: xy(mach,'disk_free_mb'), fill:true}]);
-  lineChart('dw_mem',  [{label:'mem %', color:PAL[2], points: xy(mach,'mem_used_pct')}, {label:'swap MB', color:PAL[3], points: xy(mach,'swap_used_mb')}], {suggestedMax:100});
-  lineChart('dw_cpu',  [{label:'cpu %', color:PAL[1], points: xy(mach,'cpu_pct')}, {label:'steal %', color:PAL[4], points: xy(mach,'steal_pct')}], {suggestedMax:100});
-  lineChart('dw_load', [{label:'load1', color:PAL[5], points: xy(mach,'load1'), fill:true}]);
-  lineChart('dw_ntp',  [{label:'ntp ms', color:PAL[1], points: xy(mach,'ntp_offset_ms')}], {noZero:true});
-  const dwRss = Object.entries(procByInst).map(([n,rows],i)=>{ rows.sort((a,b)=>a.ts-b.ts);
-    return {label:n.slice(0,12), color:PAL[i%PAL.length], points: rows.map(r=>({x:r.ts*1000,y:r.proc_rss_mb}))}; });
-  lineChart('dw_rss', dwRss.length ? dwRss : [{label:'rss', color:'#3a4452', points:[]}]);
+  lineChart(cid('disk'), [{ label: 'free MB', color: PAL[0], points: xy(mach, 'disk_free_mb'), fill: true }]);
+  lineChart(cid('mem'), [{ label: 'mem %', color: PAL[2], points: xy(mach, 'mem_used_pct') }, { label: 'swap MB', color: PAL[3], points: xy(mach, 'swap_used_mb') }], { suggestedMax: 100 });
+  lineChart(cid('cpu'), [{ label: 'cpu %', color: PAL[1], points: xy(mach, 'cpu_pct') }, { label: 'steal %', color: PAL[4], points: xy(mach, 'steal_pct') }], { suggestedMax: 100 });
+  lineChart(cid('load'), [{ label: 'load1', color: PAL[5], points: xy(mach, 'load1'), fill: true }]);
+  lineChart(cid('ntp'), [{ label: 'ntp ms', color: PAL[1], points: xy(mach, 'ntp_offset_ms') }], { noZero: true });
+  const dwRss = Object.entries(procByInst).map(([n, rows], i) => { rows.sort((a, b) => a.ts - b.ts);
+    return { label: n.slice(0, 12), color: PAL[i % PAL.length], points: rows.map(r => ({ x: r.ts * 1000, y: r.proc_rss_mb })) }; });
+  lineChart(cid('rss'), dwRss.length ? dwRss : [{ label: 'rss', color: '#3a4452', points: [] }]);
+}
+
+// ---- spell detail drawer (kept for per-instance card clicks) --------
+function closeDrawer(){ document.getElementById('drawer').classList.remove('on'); document.getElementById('scrim').classList.remove('on'); }
+document.getElementById('dwClose').onclick = closeDrawer;
+document.getElementById('scrim').onclick = closeDrawer;
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
+
+async function openSpellDrawer(spellId) {
+  const meta = LAST_SPELLS.find(s => s.spell_id === spellId) || {};
+  document.getElementById('dwTitle').textContent = spellId;
+  const stEl = document.getElementById('dwState');
+  stEl.className = 'pill ' + (meta.state === 'recovered' ? 'ok' : meta.state === 'ended' ? 'dim' : 'bad');
+  stEl.textContent = meta.state || '—';
+  document.getElementById('drawer').classList.add('on');
+  document.getElementById('scrim').classList.add('on');
+  await renderSpellDetail(document.getElementById('dwBody'), spellId, 'dw');
 }
 
 function grepArtifact(inp) {
@@ -2033,7 +2135,7 @@ function renderCardSpells(card, name) {
   }).join('');
   if (mine.length > 5) html += `<div class="more" data-toggle="1">${showAll ? '▴ fewer' : '▾ +' + (mine.length - 5) + ' more'}</div>`;
   el.innerHTML = html;
-  el.querySelectorAll('.sp[data-sid]').forEach(d => d.onclick = () => openSpellDrawer(d.dataset.sid));
+  el.querySelectorAll('.sp[data-sid]').forEach(d => d.onclick = () => expandSpellRow(d.dataset.sid));
   const more = el.querySelector('.more[data-toggle]');
   if (more) more.onclick = () => { CARD_SPELLS_ALL[name] = !CARD_SPELLS_ALL[name]; renderCardSpells(card, name); };
 }
