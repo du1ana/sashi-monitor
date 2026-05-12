@@ -19,11 +19,13 @@ import re
 import select
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1338,6 +1340,313 @@ class SpellManager:
 
 
 # --------------------------------------------------------------------------
+# Comprehensive text report (for hand-off to an analyst / LLM)
+# --------------------------------------------------------------------------
+#
+# One plain-text document covering every HotPocket instance this monitor sees,
+# focused on error spells: spell metadata, the HotPocket/contract log around
+# the spell start, host metrics around it (including the 3s boosted samples),
+# and the captured journalctl/dmesg/ps/df/... snapshots. If --report-peers is
+# set, the report from each peer monitor is fetched and appended, so a multi-VM
+# cluster produces one document covering all nodes.
+
+_RULE = "=" * 80
+_RULE2 = "#" * 78
+
+
+def _iso(ts):
+    try:
+        return datetime.fromtimestamp(float(ts), timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    except Exception:
+        return str(ts)
+
+
+def _agewords(s):
+    if s is None:
+        return "—"
+    s = float(s)
+    if s < 60:
+        return f"{s:.0f}s"
+    if s < 3600:
+        return f"{s/60:.1f}m"
+    if s < 86400:
+        return f"{s/3600:.1f}h"
+    return f"{s/86400:.1f}d"
+
+
+def _clip(text, max_chars=40000):
+    if text is None:
+        return "(none)"
+    text = str(text)
+    if len(text) <= max_chars:
+        return text
+    head = text[: max_chars - 200]
+    return head + f"\n... [truncated — {len(text)-len(head)} more chars; full content is in the monitor DB / dashboard] ..."
+
+
+def _metrics_table(rows):
+    """rows = host_metrics rows (ASC). Returns an aligned text table."""
+    if not rows:
+        return "(no host-metric samples in this window — metrics disabled, or none recorded)"
+    cols = [
+        ("ts (UTC)", lambda r: _iso(r["ts"]), 26),
+        ("B", lambda r: "B" if r.get("during_spell") else "", 1),
+        ("cpu%", lambda r: _fmtnum(r.get("cpu_pct")), 6),
+        ("steal%", lambda r: _fmtnum(r.get("steal_pct")), 7),
+        ("load1", lambda r: _fmtnum(r.get("load1")), 6),
+        ("mem%", lambda r: _fmtnum(r.get("mem_used_pct")), 6),
+        ("memMB", lambda r: _fmtnum(r.get("mem_avail_mb"), 0), 8),
+        ("swapMB", lambda r: _fmtnum(r.get("swap_used_mb"), 0), 8),
+        ("diskFreeMB", lambda r: _fmtnum(r.get("disk_free_mb"), 0), 11),
+        ("inode%", lambda r: _fmtnum(r.get("inode_used_pct")), 7),
+        ("rxKB", lambda r: _fmtnum(r.get("net_rx_kbps"), 0), 7),
+        ("txKB", lambda r: _fmtnum(r.get("net_tx_kbps"), 0), 7),
+        ("sysFds", lambda r: _fmtnum(r.get("sys_open_fds"), 0), 8),
+        ("ntpMs", lambda r: _fmtnum(r.get("ntp_offset_ms")), 8),
+        ("sync", lambda r: ("" if r.get("ntp_synced") is None else str(int(r["ntp_synced"]))), 4),
+    ]
+    out = ["  ".join(name.ljust(w) for name, _, w in cols)]
+    for r in rows:
+        out.append("  ".join(str(fn(r)).ljust(w) for name, fn, w in cols))
+    return "\n".join(out)
+
+
+def _proc_metrics_table(rows):
+    rows = [r for r in rows if r.get("instance") is not None]
+    if not rows:
+        return "(no per-process samples — HP process not found, or metrics disabled)"
+    cols = [
+        ("ts (UTC)", lambda r: _iso(r["ts"]), 26),
+        ("B", lambda r: "B" if r.get("during_spell") else "", 1),
+        ("instance", lambda r: str(r.get("instance") or "")[:24], 24),
+        ("rss_mb", lambda r: _fmtnum(r.get("proc_rss_mb"), 0), 8),
+        ("open_fds", lambda r: _fmtnum(r.get("proc_open_fds"), 0), 9),
+        ("pid", lambda r: _fmtnum(r.get("proc_pid"), 0), 8),
+    ]
+    out = ["  ".join(name.ljust(w) for name, _, w in cols)]
+    for r in rows:
+        out.append("  ".join(str(fn(r)).ljust(w) for name, fn, w in cols))
+    return "\n".join(out)
+
+
+def _fmtnum(x, d=1):
+    if x is None:
+        return ""
+    try:
+        x = float(x)
+    except Exception:
+        return str(x)
+    if abs(x) >= 1000 or d == 0:
+        return str(int(round(x)))
+    return f"{x:.{d}f}"
+
+
+def _events_block(rows):
+    if not rows:
+        return "(no log events captured for this instance in this window)"
+    return "\n".join(
+        f"{_iso(r['ts'])} [{r.get('level') or '?'}][{r.get('module') or '?'}] ({r.get('tag') or '?'}) {r.get('msg') or ''}"
+        for r in rows
+    )
+
+
+# Order in which artifact kinds are printed within a capture burst.
+_REPORT_ARTIFACT_ORDER = [
+    "logtail", "journalctl", "journalctl_agent", "journalctl_units", "dmesg",
+    "ps", "free", "vmstat", "uptime", "df", "dfi", "chronyc", "du",
+]
+
+
+def _fetch_peer_report(url, window):
+    """Fetch /api/report?self=1 from a peer monitor. Returns text or an error note."""
+    u = url.rstrip("/") + f"/api/report?self=1&window={window}"
+    try:
+        req = urllib.request.Request(u, headers={"User-Agent": "sashimon-report"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return f"\n{_RULE}\nPEER {url}: UNREACHABLE — {e}\n{_RULE}\n"
+
+
+def build_report(store: Store, window_seconds: int, sashi_bin: str,
+                 hostname: str, report_peers=None, include_peers=True,
+                 roundtime_ms: int = DEFAULT_ROUNDTIME_MS) -> str:
+    now = time.time()
+    all_time = window_seconds <= 0
+    since = 0.0 if all_time else now - window_seconds
+    span_txt = "all recorded history" if all_time else f"last {window_seconds}s (since {_iso(since)})"
+    sashi_ver = (run_cmd([sashi_bin, "version"], timeout=4) or run_cmd([sashi_bin, "--version"], timeout=4) or "").strip().splitlines()
+    sashi_ver = sashi_ver[0] if sashi_ver else "(unknown)"
+
+    instances = store.list_instances()
+    summ = {s["name"]: s for s in store.summary(window_seconds, roundtime_ms)}
+    L = []
+    L.append(_RULE)
+    L.append("SASHIMON ERROR-SPELL REPORT")
+    L.append(f"generated   : {_iso(now)} (epoch {now:.0f})")
+    L.append(f"monitor host: {hostname}")
+    L.append(f"sashi       : {sashi_bin}   version: {sashi_ver}")
+    L.append(f"roundtime   : {roundtime_ms} ms (configured in this monitor; the cluster's effective value is in the HotPocket logs / 'getledger')")
+    L.append(f"window      : {span_txt}")
+    L.append(f"instances on this VM ({len(instances)}): {', '.join(i['name'] for i in instances) or '(none)'}")
+    L.append("")
+    L.append("NOTE: each sashimon instance sees only the HotPocket instances on its own VM. If your cluster")
+    L.append("spans multiple VMs, either run 'export report' on each VM and concatenate the files, or start")
+    L.append("the monitors with --report-peers so this export fetches and appends the others.")
+    if report_peers and include_peers:
+        L.append(f"report-peers configured: {', '.join(report_peers)} (their sections are appended below)")
+    L.append(_RULE)
+    L.append("")
+    L.append("READING GUIDE")
+    L.append("  - 'No consensus on last shard hash. won:X needed:Y' / 'Cannot close ledger. Possible fork")
+    L.append("    condition' = a vote split. Recoverable if one side >= ceil(threshold% x UNL); a hard fork")
+    L.append("    (no recovery) when no side reaches that, so look at X vs Y and which nodes are odd-one-out.")
+    L.append("  - For each spell below: the HotPocket/contract log just before & during it, host metrics around")
+    L.append("    it (rows marked 'B' are the 3-second boosted samples taken while the spell was active), and")
+    L.append("    the captured journalctl/dmesg/ps/df/chronyc/du/contract-log snapshots.")
+    L.append("  - Cross-correlate by the UTC timestamps + epoch seconds. Suspects for an unrecoverable hard")
+    L.append("    fork on a small cluster: a 2nd node faulting while a 1st is recovering; disk full (ledger")
+    L.append("    persist fails); OOM/restart; clock drift > 2x roundtime; CPU steal; a contract determinism")
+    L.append("    bug (different output/state hash).")
+    L.append("")
+
+    for inst in instances:
+        name = inst["name"]
+        s = summ.get(name, {})
+        c = s.get("counts", {}) or {}
+        latest = None
+        try:
+            hm = store.host_metrics_window(None, now - 600, now)   # last 10 min, machine rows
+            latest = next((r for r in hm if r.get("instance") is None), None)
+        except Exception:
+            latest = None
+        latest_proc = None
+        try:
+            pm = store.host_metrics_window(name, now - 600, now)
+            latest_proc = next((r for r in pm if r.get("instance") == name), None)
+        except Exception:
+            latest_proc = None
+
+        L.append("")
+        L.append(_RULE2)
+        L.append(f"# INSTANCE: {name}")
+        L.append(f"#   contract_id={inst.get('contract_id')}  tenant={inst.get('tenant')}  image={inst.get('image')}")
+        L.append(f"#   user_port={inst.get('user_port')}  peer_port={inst.get('peer_port')}  sashi_status={inst.get('status')}")
+        L.append(f"#   health={s.get('health','?')}  uptime_est(window)={s.get('uptime_pct','?')}%  "
+                 f"last_ledger={_agewords(s.get('last_ledger_age_s'))} ago  last_event={_agewords(s.get('last_event_age_s'))} ago")
+        L.append(f"#   event counts (window): " + (", ".join(f"{k}={v}" for k, v in sorted(c.items())) or "(none)"))
+        if latest:
+            L.append(f"#   latest host metrics (this VM, machine) @ {_iso(latest['ts'])}: "
+                     f"cpu={_fmtnum(latest.get('cpu_pct'))}% steal={_fmtnum(latest.get('steal_pct'))}% load1={_fmtnum(latest.get('load1'))} "
+                     f"mem={_fmtnum(latest.get('mem_used_pct'))}% memAvail={_fmtnum(latest.get('mem_avail_mb'),0)}MB "
+                     f"diskFree={_fmtnum(latest.get('disk_free_mb'),0)}MB inode={_fmtnum(latest.get('inode_used_pct'))}% "
+                     f"ntp={_fmtnum(latest.get('ntp_offset_ms'))}ms sync={latest.get('ntp_synced')} extra={latest.get('extra')}")
+        if latest_proc:
+            L.append(f"#   latest HP process @ {_iso(latest_proc['ts'])}: rss={_fmtnum(latest_proc.get('proc_rss_mb'),0)}MB "
+                     f"open_fds={_fmtnum(latest_proc.get('proc_open_fds'),0)} pid={latest_proc.get('proc_pid')}")
+        L.append(_RULE2)
+
+        # recent context: last 60 events (all tags)
+        L.append("")
+        L.append(f"----- recent log events on {name} (last 60, all tags) -----")
+        L.append(_events_block(store.recent_log_lines(name, limit=60)))
+
+        # spells for this instance, oldest first (so the doc reads chronologically)
+        try:
+            spells = sorted(store.spells_log_window(since, now, name, limit=1000), key=lambda x: x["start_ts"])
+        except Exception as e:
+            spells = []
+            L.append(f"(error loading spells: {e})")
+        if not spells:
+            L.append("")
+            L.append(f"(no error spells recorded for {name} in this window)")
+        for sp in spells:
+            sid = sp["spell_id"]
+            st0 = float(sp["start_ts"])
+            st1 = float(sp["end_ts"]) if sp.get("end_ts") else now
+            ev0, ev1 = st0 - 300, st1 + 60          # HotPocket log: 5 min before .. 1 min after
+            m0, m1 = st0 - 180, st1 + 60            # host metrics: 3 min before .. 1 min after
+            L.append("")
+            L.append("=" * 80)
+            L.append(f"ERROR SPELL  {sid}")
+            L.append(f"  instance : {name}")
+            L.append(f"  state    : {sp.get('state')}   recovered: {'yes' if sp.get('recovered') else ('no — STILL OPEN' if sp.get('end_ts') is None else 'no')}")
+            L.append(f"  start    : {_iso(st0)} (epoch {st0:.0f})")
+            L.append(f"  end      : {('(open, ' + _agewords(now - st0) + ' so far)') if sp.get('end_ts') is None else _iso(sp['end_ts']) + ' (epoch %.0f)' % float(sp['end_ts'])}")
+            L.append(f"  duration : {_agewords(sp.get('duration_s'))}")
+            L.append(f"  trigger  : {sp.get('trigger_tag')}  ::  {sp.get('trigger_msg')}")
+            L.append(f"  captures : {sp.get('captures', 0)}")
+            L.append("=" * 80)
+
+            try:
+                evs = sorted(store.events_window(name, ev0, ev1, None, 5000), key=lambda x: x["ts"])
+            except Exception as e:
+                evs = []
+                L.append(f"(error loading events: {e})")
+            L.append("")
+            L.append(f"--- HotPocket / contract log around the spell  ({name}, {_iso(ev0)} .. {_iso(ev1)}, {len(evs)} lines) ---")
+            L.append(_events_block(evs))
+
+            try:
+                hmw = sorted(store.host_metrics_window(None, m0, m1, 20000), key=lambda x: (x["ts"], 0 if x.get("instance") is None else 1))
+            except Exception as e:
+                hmw = []
+                L.append(f"(error loading host metrics: {e})")
+            mach_rows = [r for r in hmw if r.get("instance") is None]
+            proc_rows = [r for r in hmw if r.get("instance") is not None]
+            boosted_n = sum(1 for r in hmw if r.get("during_spell"))
+            L.append("")
+            L.append(f"--- host metrics around the spell  (machine, {_iso(m0)} .. {_iso(m1)}, {len(mach_rows)} samples, {boosted_n} boosted) ---")
+            L.append(_metrics_table(mach_rows))
+            if proc_rows:
+                L.append("")
+                L.append(f"--- per-process metrics around the spell  ({len(proc_rows)} samples) ---")
+                L.append(_proc_metrics_table(proc_rows))
+
+            # captured snapshots, grouped by capture burst
+            try:
+                arts = store.spell_artifacts(sid)
+            except Exception as e:
+                arts = []
+                L.append(f"(error loading artifacts: {e})")
+            if not arts:
+                L.append("")
+                L.append("--- captured snapshots: none (spell may be new, or capture tools unavailable on this host) ---")
+            else:
+                arts_sorted = sorted(arts, key=lambda a: (a["ts"], _REPORT_ARTIFACT_ORDER.index(a["kind"]) if a["kind"] in _REPORT_ARTIFACT_ORDER else 99))
+                groups = []
+                for a in arts_sorted:
+                    g = next((g for g in groups if abs(g["ts"] - a["ts"]) < 5), None)
+                    if not g:
+                        g = {"ts": a["ts"], "items": []}
+                        groups.append(g)
+                    g["items"].append(a)
+                for gi, g in enumerate(groups):
+                    L.append("")
+                    L.append(f"--- captured snapshot {gi+1}/{len(groups)}  @ {_iso(g['ts'])} ---")
+                    for a in g["items"]:
+                        ins = f"  ({a.get('instance')})" if a.get("instance") else ""
+                        L.append("")
+                        L.append(f"[{a['kind']}{ins}  captured {_iso(a['ts'])}]")
+                        L.append(_clip(a.get("content")))
+        L.append("")
+
+    L.append("")
+    L.append(_RULE)
+    L.append(f"END OF REPORT — {hostname}")
+    L.append(_RULE)
+
+    text = "\n".join(L) + "\n"
+
+    if report_peers and include_peers:
+        for peer in report_peers:
+            text += "\n\n" + ("#" * 80) + f"\n# PEER MONITOR: {peer}\n" + ("#" * 80) + "\n\n"
+            text += _fetch_peer_report(peer, window_seconds)
+
+    return text
+
+
+# --------------------------------------------------------------------------
 # Embedded HTTP dashboard
 # --------------------------------------------------------------------------
 
@@ -1634,6 +1943,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       </select>
     </label>
     <button id="reload">reload</button>
+    <span style="flex:1"></span>
+    <button id="export" title="download one plain-text report — every instance, every error spell, with the HotPocket log + journalctl + host metrics around each spell start; hand it to an analyst / LLM">export report</button>
   </div>
 
   <div id="statusbar" title="host status — click to jump to host metrics"></div>
@@ -2346,6 +2657,13 @@ function scheduleRefresh() {
 }
 
 document.getElementById('reload').onclick = refresh;
+document.getElementById('export').onclick = () => {
+  const btn = document.getElementById('export');
+  const prev = btn.textContent; btn.textContent = 'building…'; btn.disabled = true;
+  // navigating triggers the download; re-enable after a moment (we can't observe completion of a navigation download)
+  window.location = '/api/report?window=' + windowParam();
+  setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 4000);
+};
 function hardReload() {
   for (const k of Object.keys(charts)) { try { charts[k].destroy(); } catch(e) {} }
   charts = {}; LAST_INST_BUCKETS = {};
@@ -2384,16 +2702,22 @@ def _parse_window(raw: str | None) -> int:
 def make_handler(store: Store, static_html_path: str | None,
                  roundtime_ms: int = DEFAULT_ROUNDTIME_MS,
                  metrics: "MetricsCollector | None" = None,
-                 spell_manager: "SpellManager | None" = None):
+                 spell_manager: "SpellManager | None" = None,
+                 sashi_bin: str = "sashi",
+                 report_peers: list | None = None):
+    hostname = socket.gethostname()
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args) -> None:  # silence default logger
             pass
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str, extra_headers: dict | None = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for k, v in (extra_headers or {}).items():
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
@@ -2522,6 +2846,23 @@ def make_handler(store: Store, static_html_path: str | None,
                 self._json(store.open_spells())
                 return
 
+            if u.path == "/api/report":
+                window = _parse_window(qs.get("window", ["all"])[0])
+                self_only = qs.get("self", ["0"])[0] in ("1", "true", "yes")
+                try:
+                    text = build_report(
+                        store, window, sashi_bin, hostname,
+                        report_peers=(None if self_only else report_peers),
+                        include_peers=not self_only,
+                        roundtime_ms=roundtime_ms,
+                    )
+                except Exception as e:
+                    text = f"REPORT GENERATION FAILED on {hostname}: {e!r}\n"
+                fname = f"sashimon-report-{hostname}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.txt"
+                self._send(200, text.encode("utf-8"), "text/plain; charset=utf-8",
+                           {"Content-Disposition": f'attachment; filename="{fname}"'})
+                return
+
             if u.path == "/healthz":
                 self._json({"ok": True})
                 return
@@ -2596,9 +2937,16 @@ def main() -> None:
     ap.add_argument("--no-ntp", action="store_true",
                     default=(os.environ.get("SASHIMON_NO_NTP", "") not in ("", "0", "false")),
                     help="Skip the chronyc/timedatectl NTP probe in samples.")
+    ap.add_argument("--report-peers",
+                    default=os.environ.get("SASHIMON_REPORT_PEERS", ""),
+                    help="Comma-separated http://host:port of other sashimon "
+                         "monitors. When set, GET /api/report (the 'export "
+                         "report' button) fetches their reports too, so a "
+                         "multi-VM cluster yields one document for every node.")
     args = ap.parse_args()
 
     sashi_path = shutil.which(args.sashi) or args.sashi
+    report_peers = [p.strip() for p in (args.report_peers or "").split(",") if p.strip()]
     store = Store(args.db)
     stop = threading.Event()
     tails: dict[str, Tail] = {}
@@ -2638,12 +2986,14 @@ def main() -> None:
         (args.bind, args.port),
         make_handler(store, static_path or None,
                      roundtime_ms=args.roundtime_ms, metrics=metrics,
-                     spell_manager=spell_mgr),
+                     spell_manager=spell_mgr, sashi_bin=sashi_path,
+                     report_peers=report_peers),
     )
     print(f"[sashimon] db={args.db}  sashi={sashi_path}")
     print(f"[sashimon] static={static_path or '(embedded fallback)'}")
     print(f"[sashimon] roundtime={args.roundtime_ms}ms  "
-          f"metrics={'off' if args.no_metrics else f'{args.metrics_interval}s/{args.metrics_interval_boost}s'}")
+          f"metrics={'off' if args.no_metrics else f'{args.metrics_interval}s/{args.metrics_interval_boost}s'}"
+          f"  report-peers={report_peers or '(none)'}")
     print(f"[sashimon] dashboard http://{args.bind}:{args.port}")
     threading.Thread(target=server.serve_forever, daemon=True,
                      name="http").start()
