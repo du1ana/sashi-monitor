@@ -1945,6 +1945,7 @@ DASHBOARD_HTML = r"""<!doctype html>
     <button id="reload">reload</button>
     <span style="flex:1"></span>
     <button id="export" title="download one plain-text report — every instance, every error spell, with the HotPocket log + journalctl + host metrics around each spell start; hand it to an analyst / LLM">export report</button>
+    <button id="clearDb" class="danger" title="wipe ALL stored data: log events, host metrics, error spells & their artifacts, instances. Live tailing/sampling continues; history starts fresh.">clear dbs</button>
   </div>
 
   <div id="statusbar" title="host status — click to jump to host metrics"></div>
@@ -2664,11 +2665,32 @@ document.getElementById('export').onclick = () => {
   window.location = '/api/report?window=' + windowParam();
   setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 4000);
 };
+document.getElementById('clearDb').onclick = async () => {
+  if (!confirm('Wipe ALL stored data — log events, host metrics, error spells + their captured artifacts, instances?\\n\\nLive tailing & metric sampling keep running; history just starts fresh. This cannot be undone.')) return;
+  const btn = document.getElementById('clearDb');
+  const prev = btn.textContent; btn.textContent = 'clearing…'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/clear', { method: 'POST' });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+  } catch (e) {
+    alert('Clear failed: ' + e.message);
+    btn.textContent = prev; btn.disabled = false; return;
+  }
+  // reset client-side state and rebuild from the now-empty DB
+  OPEN_SPELLS.clear(); SPELL_LIST_KEY = '';
+  LAST_SPELLS = []; LAST_PROC_LATEST = {}; LAST_GLOBAL_BUCKETS = []; LAST_INST_BUCKETS = {};
+  closeDrawer();
+  hardReload();
+  btn.textContent = prev; btn.disabled = false;
+};
 function hardReload() {
   for (const k of Object.keys(charts)) { try { charts[k].destroy(); } catch(e) {} }
   charts = {}; LAST_INST_BUCKETS = {};
   if (globalChart) { try { globalChart.destroy(); } catch(e) {} globalChart = null; }
+  destroyCharts(() => true);                          // host-panel + inline-spell + drawer sparklines
   document.getElementById('cards').innerHTML = '';
+  document.getElementById('spellRows').innerHTML = '';
   refresh();
 }
 document.getElementById('window').onchange = hardReload;
@@ -2882,6 +2904,13 @@ def make_handler(store: Store, static_html_path: str | None,
                         pass
                 try:
                     result = store.clear_all()
+                    # Forget in-memory spell state so a currently-active fork
+                    # opens a fresh spells_log row on its next error tag.
+                    if spell_manager is not None:
+                        try:
+                            spell_manager.state.clear()
+                        except Exception:
+                            pass
                     self._json({"ok": True, **result})
                 except Exception as e:
                     self._json({"ok": False, "error": str(e)}, code=500)
