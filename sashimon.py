@@ -1423,6 +1423,35 @@ DASHBOARD_HTML = r"""<!doctype html>
   .global canvas { height: 200px !important; }
   .empty { text-align: center; color: var(--fg-dim); padding: 50px 0; font-family: var(--mono); }
 
+  /* --- per-instance card: current metrics + spell list --- */
+  .card .pmet { font-family: var(--mono); font-size: 10.5px; color: var(--fg-dim);
+                display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0 4px;
+                padding: 6px 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; }
+  .card .pmet b { color: var(--fg); font-weight: 600; }
+  .card .pmet b.alert { color: var(--bad); }
+  .card .pmet .lbl { color: var(--fg-faint); text-transform: uppercase; letter-spacing: .04em; }
+  .card .cspells { margin-top: 8px; }
+  .card .cspells .hdr { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase;
+                        letter-spacing: .06em; color: var(--fg-dim); margin-bottom: 4px; }
+  .card .sp { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 10.5px;
+              padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; margin-bottom: 3px;
+              cursor: pointer; transition: background .1s, border-color .1s; }
+  .card .sp:hover { background: var(--bg2); border-color: var(--line2); }
+  .card .sp::before { content: "\25CF"; }
+  .card .sp.recovered::before { color: var(--warn); }
+  .card .sp.active::before    { color: var(--bad); }
+  .card .sp.hardfork::before  { color: var(--bad); text-shadow: 0 0 6px var(--bad-dim); }
+  .card .sp.ended::before     { color: var(--fg-faint); }
+  .card .sp .st  { flex: 0 0 70px; color: var(--fg); }
+  .card .sp .tg  { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .sp .tm  { margin-left: auto; color: var(--fg-faint); white-space: nowrap; }
+  .card .sp.noclick { cursor: default; color: var(--fg-faint); }
+  .card .sp.noclick:hover { background: transparent; border-color: var(--line); }
+  .card .sp.noclick::before { content: ""; }
+  .card .cspells .more { font-family: var(--mono); font-size: 9.5px; color: var(--fg-faint);
+                         cursor: pointer; margin-top: 2px; }
+  .card .cspells .more:hover { color: var(--fg-dim); text-decoration: underline; }
+
   /* --- error-spell timeline ribbon --- */
   .ribbon { position:relative; height: 46px; background:
               repeating-linear-gradient(90deg, var(--line) 0 1px, transparent 1px 25%);
@@ -1721,7 +1750,9 @@ function lineChart(id, datasets, opts) {
 const xy = (rows, key) => rows.filter(r => r[key] != null).map(r => ({ x: r.ts*1000, y: r[key] }));
 const PAL = ['#3fb950','#58a6ff','#e0a82e','#b083ff','#ff5a52','#56d4dd','#d2a8ff'];
 
-let LAST_SPELLS = [];   // cached for the ribbon click handler
+let LAST_SPELLS = [];        // all spells (24h), cached for ribbon + per-card lists
+let LAST_PROC_LATEST = {};   // instance -> most recent per-process host_metrics row
+let CARD_SPELLS_ALL = {};    // instance -> bool: card showing all its spells vs first few
 
 async function refreshHost(win) {
   let machine = [], procRows = [], spells = [];
@@ -1759,7 +1790,9 @@ async function refreshHost(win) {
   lineChart('m_load', [{label:'load1', color:PAL[5], points: xy(machine,'load1'), fill:true}]);
   lineChart('m_ntp',  [{label:'ntp ms', color:PAL[1], points: xy(machine,'ntp_offset_ms')}], {noZero:true});
 
-  // per-instance HP-process RSS
+  // per-instance HP-process RSS (procRows arrives ts-DESC → first per inst = latest)
+  LAST_PROC_LATEST = {};
+  for (const r of procRows) if (r.instance && !(r.instance in LAST_PROC_LATEST)) LAST_PROC_LATEST[r.instance] = r;
   const byInst = {};
   for (const r of procRows) if (r.instance && r.proc_rss_mb != null) (byInst[r.instance] ||= []).push(r);
   const rssDs = Object.entries(byInst).map(([name, rows], i) => {
@@ -1962,6 +1995,49 @@ function grepArtifact(inp) {
   ).join('\n');
 }
 
+// ---- per-instance card: current metrics + clickable spell list ------
+function renderCardMetrics(card, name) {
+  const el = card.querySelector('[data-pmet]'); if (!el) return;
+  const m = LAST_PROC_LATEST[name];
+  if (!m) {
+    el.innerHTML = `<span class="lbl">host metrics</span><b>—</b>` +
+      `<span style="color:var(--fg-faint)">(hp process not found, or --no-metrics)</span>`;
+    return;
+  }
+  const age = fmtAge((Date.now()/1000) - m.ts);
+  const rssAlert = m.proc_rss_mb != null && m.proc_rss_mb > 700;
+  el.innerHTML =
+    `<span class="lbl">rss</span><b class="${rssAlert?'alert':''}">${m.proc_rss_mb!=null?Math.round(m.proc_rss_mb)+'MB':'—'}</b>` +
+    `<span class="lbl">open fds</span><b>${m.proc_open_fds!=null?m.proc_open_fds:'—'}</b>` +
+    `<span class="lbl">pid</span><b>${m.proc_pid!=null?m.proc_pid:'—'}</b>` +
+    `<span class="lbl">sampled</span><b>${age} ago</b>`;
+}
+
+function renderCardSpells(card, name) {
+  const el = card.querySelector('[data-spells]'); if (!el) return;
+  const mine = LAST_SPELLS.filter(s => s.instance === name).sort((a,b)=>b.start_ts-a.start_ts);
+  if (!mine.length) {
+    el.innerHTML = `<div class="hdr">error spells · 24h</div><div class="sp noclick">— clean —</div>`;
+    return;
+  }
+  const showAll = !!CARD_SPELLS_ALL[name];
+  const list = showAll ? mine : mine.slice(0, 5);
+  const unresolved = mine.filter(s => s.state === 'active' || s.state === 'hard_fork?').length;
+  let html = `<div class="hdr">error spells · 24h — ${mine.length}${unresolved ? ` · <b style="color:var(--bad)">${unresolved} open</b>` : ''} · click → expand</div>`;
+  html += list.map(s => {
+    const cls = s.state==='recovered'?'recovered' : s.state==='active'?'active' : s.state==='hard_fork?'?'hardfork' : 'ended';
+    return `<div class="sp ${cls}" data-sid="${esc(s.spell_id)}" title="${esc(s.state)} · ${esc(s.trigger_tag||'')} · ${esc(new Date(s.start_ts*1000).toLocaleString())}">` +
+      `<span class="st">${esc(s.state)}</span>` +
+      `<span class="tg">${esc(s.trigger_tag||'')}${s.trigger_msg?' · '+esc((s.trigger_msg||'').slice(0,38)):''}</span>` +
+      `<span class="tm">${tsClock(s.start_ts)} · ${fmtAge(s.duration_s)} · cap ${s.captures||0}</span></div>`;
+  }).join('');
+  if (mine.length > 5) html += `<div class="more" data-toggle="1">${showAll ? '▴ fewer' : '▾ +' + (mine.length - 5) + ' more'}</div>`;
+  el.innerHTML = html;
+  el.querySelectorAll('.sp[data-sid]').forEach(d => d.onclick = () => openSpellDrawer(d.dataset.sid));
+  const more = el.querySelector('.more[data-toggle]');
+  if (more) more.onclick = () => { CARD_SPELLS_ALL[name] = !CARD_SPELLS_ALL[name]; renderCardSpells(card, name); };
+}
+
 async function refresh() {
   const window = +document.getElementById('window').value;
   const bucketSec = window <= 900 ? 30 : window <= 3600 ? 60 : window <= 21600 ? 300 : 900;
@@ -1970,7 +2046,9 @@ async function refresh() {
     fetchJSON('/api/summary?window=' + window),
     fetchJSON(`/api/histogram?window=${window}&bucket=${bucketSec}`),
   ]);
-  refreshHost(window).catch(e => { document.getElementById('hostMeta').textContent = 'host: ' + e.message; });
+  // populate the host panel + LAST_SPELLS / LAST_PROC_LATEST before rendering cards
+  try { await refreshHost(window); }
+  catch (e) { document.getElementById('hostMeta').textContent = 'host: ' + e.message; }
 
   // Global chart
   const gData = buildDatasets(globalBuckets, bucketSec);
@@ -2003,7 +2081,9 @@ async function refresh() {
         <h2>${inst.name}</h2>
         <div class="sub" data-sub></div>
         <div class="stats" data-stats></div>
-        <canvas id="ch-${inst.name}"></canvas>`;
+        <div class="pmet" data-pmet></div>
+        <canvas id="ch-${inst.name}"></canvas>
+        <div class="cspells" data-spells></div>`;
       cards.appendChild(card);
     }
     card.querySelector('[data-sub]').innerHTML =
@@ -2017,6 +2097,8 @@ async function refresh() {
       <span>Fork warnings</span><span>${c.fork_warn || 0}</span>
       <span>Errors</span><span>${c.error || 0}</span>
       <span>Uptime est.</span><span>${inst.uptime_pct}%</span>`;
+    renderCardMetrics(card, inst.name);
+    renderCardSpells(card, inst.name);
 
     const buckets = await fetchJSON(
       `/api/histogram?window=${window}&bucket=${bucketSec}&instance=${encodeURIComponent(inst.name)}`);
