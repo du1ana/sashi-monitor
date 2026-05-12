@@ -1404,6 +1404,18 @@ DASHBOARD_HTML = r"""<!doctype html>
                     letter-spacing:.08em; text-transform: uppercase; color: var(--fg); }
   .panel > .ph .hint { font-family: var(--mono); font-size:10px; color: var(--fg-dim); }
   .panel > .pb { padding: 14px; }
+  /* --- tag filter chips (above the error-events chart) --- */
+  .tagchips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; font-family:var(--mono); font-size:10px; align-items:center; }
+  .tagchips .lbl { color:var(--fg-faint); text-transform:uppercase; letter-spacing:.06em; margin-right:2px; }
+  .tagchips .c { cursor:pointer; padding:2px 8px; border-radius:2px; border:1px solid var(--line);
+                 color:var(--fg-dim); background:transparent; user-select:none; display:inline-flex; align-items:center; gap:5px; }
+  .tagchips .c::before { content:""; width:8px; height:8px; border-radius:2px; background:currentColor; opacity:.35; }
+  .tagchips .c.on { color:var(--cc, var(--fg)); border-color:currentColor; background:rgba(255,255,255,.04); }
+  .tagchips .c.on::before { opacity:1; }
+  .tagchips .c:hover { border-color:var(--line2); }
+  .tagchips .q { cursor:pointer; padding:2px 8px; border-radius:2px; border:1px solid var(--line); color:var(--fg-dim); background:var(--bg2); }
+  .tagchips .q:hover { color:var(--fg); border-color:var(--line2); }
+  .tagchips .q.danger { color:var(--bad); border-color:var(--bad-dim); }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
   .card { background: var(--bg1); border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; }
   .card h2 { margin: 0 0 4px; font-size: 12px; font-family: var(--mono); word-break: break-all; }
@@ -1596,12 +1608,21 @@ DASHBOARD_HTML = r"""<!doctype html>
 </header>
 <main>
   <div class="controls">
-    <label>window
+    <label>timeline
       <select id="window">
         <option value="900">15m</option>
-        <option value="3600" selected>1h</option>
+        <option value="3600">1h</option>
         <option value="21600">6h</option>
         <option value="86400">24h</option>
+        <option value="all" selected>all</option>
+      </select>
+    </label>
+    <label>granularity
+      <select id="bucket">
+        <option value="30">30s</option>
+        <option value="60" selected>1 min</option>
+        <option value="300">5 min</option>
+        <option value="3600">1 hour</option>
       </select>
     </label>
     <label>auto
@@ -1618,8 +1639,14 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div id="statusbar" title="host status — click to jump to host metrics"></div>
 
   <div class="panel">
-    <div class="ph"><h2>events</h2><span class="hint">all instances · tags / bucket</span></div>
-    <div class="pb"><div class="global"><canvas id="globalChart"></canvas></div></div>
+    <div class="ph">
+      <h2>error events</h2>
+      <span class="hint" id="globalHint">all instances · errors per minute · whole timeline</span>
+    </div>
+    <div class="pb">
+      <div class="tagchips" id="tagChips"></div>
+      <div class="global"><canvas id="globalChart"></canvas></div>
+    </div>
   </div>
 
   <div class="panel">
@@ -1671,28 +1698,30 @@ DASHBOARD_HTML = r"""<!doctype html>
   <div class="db" id="dwBody"></div>
 </aside>
 <script>
-const TAG_COLORS = {
-  ledger_created:   '#3fb950',
-  contract_running: '#1f6feb',
-  consensus_lost:   '#d29922',
-  fork_warn:        '#f85149',
-  out_of_sync:      '#bc8cff',
-  error:            '#ff7b72',
-  warning:          '#e3b341',
-  hp_started:       '#79c0ff',
-  hp_stopped:       '#8b949e',
-  role_change:      '#56d4dd',
-  info_other:       '#484f58',
-};
-const TAG_ORDER = [
-  'ledger_created','contract_running','consensus_lost','fork_warn',
-  'out_of_sync','error','warning','hp_started','hp_stopped',
-  'role_change','info_other'
+// All event tags, in render order. `err` marks the ones shown by default.
+const TAGS = [
+  { id:'fork_warn',        label:'fork',            color:'#f85149', err:true  },
+  { id:'consensus_lost',   label:'consensus lost',  color:'#d29922', err:true  },
+  { id:'out_of_sync',      label:'out of sync',     color:'#bc8cff', err:true  },
+  { id:'error',            label:'error',           color:'#ff7b72', err:true  },
+  { id:'warning',          label:'warning',         color:'#e3b341', err:false },
+  { id:'ledger_created',   label:'ledger created',  color:'#3fb950', err:false },
+  { id:'contract_running', label:'contract run',    color:'#1f6feb', err:false },
+  { id:'hp_started',       label:'hp started',      color:'#79c0ff', err:false },
+  { id:'hp_stopped',       label:'hp stopped',      color:'#8b949e', err:false },
+  { id:'role_change',      label:'role change',     color:'#56d4dd', err:false },
+  { id:'info_other',       label:'info / other',    color:'#484f58', err:false },
 ];
+const TAG_BY_ID = Object.fromEntries(TAGS.map(t => [t.id, t]));
+const TAG_COLORS = Object.fromEntries(TAGS.map(t => [t.id, t.color]));   // legacy refs (per-instance bars)
+let VISIBLE_TAGS = new Set(TAGS.filter(t => t.err).map(t => t.id));      // default: error tags only
 
 let charts = {};
 let globalChart = null;
 let timer = null;
+let LAST_GLOBAL_BUCKETS = [];
+let LAST_GLOBAL_BUCKETSEC = 60;
+let LAST_INST_BUCKETS = {};
 
 function fmtAge(s) {
   if (s == null) return '—';
@@ -1700,6 +1729,8 @@ function fmtAge(s) {
   if (s < 3600) return (s/60).toFixed(1) + 'm';
   return (s/3600).toFixed(1) + 'h';
 }
+function bucketLabel(sec) { return sec >= 86400 ? 'day' : sec >= 3600 ? 'hour' : sec >= 60 ? 'minute' : 'tick'; }
+function hexA(hex, a) { const n = parseInt(hex.replace('#',''),16); return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`; }
 
 async function fetchJSON(url) {
   const r = await fetch(url);
@@ -1707,29 +1738,109 @@ async function fetchJSON(url) {
   return r.json();
 }
 
-function buildDatasets(buckets, bucketSec) {
-  const labels = buckets.map(b => new Date(b.bucket_start * 1000)
-    .toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}));
-  const datasets = TAG_ORDER
-    .filter(tag => buckets.some(b => (b[tag] || 0) > 0))
-    .map(tag => ({
-      label: tag,
-      data: buckets.map(b => b[tag] || 0),
-      backgroundColor: TAG_COLORS[tag] || '#888',
-      stack: 'a',
-    }));
-  return { labels, datasets };
+// --- tag filter chips ---
+function renderTagChips() {
+  const host = document.getElementById('tagChips'); if (!host) return;
+  let html = `<span class="lbl">show</span>`;
+  for (const t of TAGS) {
+    const on = VISIBLE_TAGS.has(t.id);
+    html += `<span class="c${on?' on':''}" data-tag="${t.id}" style="--cc:${t.color}">${esc(t.label)}</span>`;
+  }
+  html += `<span style="flex:1"></span>` +
+    `<span class="q danger" data-quick="err">errors only</span>` +
+    `<span class="q" data-quick="all">all</span>` +
+    `<span class="q" data-quick="none">none</span>`;
+  host.innerHTML = html;
+  host.querySelectorAll('.c[data-tag]').forEach(c => c.onclick = () => {
+    const id = c.dataset.tag;
+    if (VISIBLE_TAGS.has(id)) VISIBLE_TAGS.delete(id); else VISIBLE_TAGS.add(id);
+    renderTagChips(); renderGlobalChart(); rerenderInstanceCharts();
+  });
+  host.querySelectorAll('.q[data-quick]').forEach(q => q.onclick = () => {
+    const m = q.dataset.quick;
+    VISIBLE_TAGS = m === 'all' ? new Set(TAGS.map(t=>t.id))
+                 : m === 'none' ? new Set()
+                 : new Set(TAGS.filter(t=>t.err).map(t=>t.id));
+    renderTagChips(); renderGlobalChart(); rerenderInstanceCharts();
+  });
 }
 
-function chartOpts(stacked = true) {
-  return {
-    responsive: true, maintainAspectRatio: false, animation: false,
-    plugins: { legend: { display: stacked, labels: { color:'#c9d1d9', font:{size:10} } } },
-    scales: {
-      x: { stacked, ticks:{color:'#8b949e', font:{size:10}}, grid:{display:false} },
-      y: { stacked, ticks:{color:'#8b949e', font:{size:10}}, grid:{color:'#21262d'} },
+// --- the main "error events" line chart ---
+function lineDatasets(buckets, tagIds, fill) {
+  return tagIds.filter(id => buckets.some(b => (b[id]||0) > 0)).map(id => {
+    const t = TAG_BY_ID[id] || { color:'#888', label:id };
+    return {
+      label: t.label,
+      data: buckets.map(b => ({ x: b.bucket_start*1000, y: b[id] || 0 })),
+      borderColor: t.color, backgroundColor: fill ? hexA(t.color, 0.16) : 'transparent',
+      fill: !!fill, tension: 0.3, borderWidth: 1.8, pointRadius: 0, pointHoverRadius: 3, spanGaps: true,
+    };
+  });
+}
+function renderGlobalChart() {
+  const el = document.getElementById('globalChart'); if (!el) return;
+  const buckets = LAST_GLOBAL_BUCKETS, sec = LAST_GLOBAL_BUCKETSEC;
+  const vis = TAGS.filter(t => VISIBLE_TAGS.has(t.id)).map(t => t.id);
+  const ds = lineDatasets(buckets, vis, true);
+  const cfg = {
+    type: 'line',
+    data: { datasets: ds.length ? ds : [{ label:'(no matching events)', data:[], borderColor:'#3a4452' }] },
+    options: {
+      responsive:true, maintainAspectRatio:false, animation:false, parsing:false, normalized:true,
+      interaction:{ mode:'index', intersect:false },
+      plugins:{
+        legend:{ display:true, position:'bottom',
+          labels:{ color:'#8b949e', font:{family:"'IBM Plex Mono', monospace", size:10}, usePointStyle:true, boxWidth:8, boxHeight:8, padding:10 } },
+        tooltip:{ titleFont:{family:"'IBM Plex Mono', monospace", size:10}, bodyFont:{family:"'IBM Plex Mono', monospace", size:10},
+          callbacks:{ title:items => items.length ? new Date(items[0].parsed.x).toLocaleString() : '' } },
+      },
+      scales:{
+        x:{ type:'time', time:{ unit: sec>=86400?'day':sec>=3600?'hour':'minute',
+              displayFormats:{ minute:'HH:mm', hour:'MMM d HH:mm', day:'MMM d' } },
+            ticks:{ color:'#6b7989', font:{family:"'IBM Plex Mono', monospace", size:9}, maxRotation:0, autoSkipPadding:18 },
+            grid:{ display:false } },
+        y:{ beginAtZero:true, ticks:{ color:'#6b7989', font:{family:"'IBM Plex Mono', monospace", size:9}, maxTicksLimit:5, precision:0 },
+            grid:{ color:'rgba(255,255,255,.05)' } },
+      },
     },
   };
+  try {
+    if (globalChart && globalChart.canvas !== el) { try{globalChart.destroy();}catch(e){} globalChart = null; }
+    if (!globalChart) globalChart = new Chart(el, cfg);
+    else { globalChart.data = cfg.data; globalChart.options = cfg.options; globalChart.update('none'); }
+  } catch(e) {
+    cfg.options.scales.x = { ticks:{display:false}, grid:{display:false} };
+    cfg.data.datasets.forEach(d => d.data = d.data.map(p => p && p.y));
+    cfg.data.labels = buckets.map(b => tsLabel(b.bucket_start));
+    if (globalChart) { try{globalChart.destroy();}catch(_){} }
+    globalChart = new Chart(el, cfg);
+  }
+}
+
+// --- per-instance card mini-charts: small bars, same tag filter ---
+function buildBarDatasets(buckets) {
+  const vis = TAGS.filter(t => VISIBLE_TAGS.has(t.id)).map(t => t.id);
+  const labels = buckets.map(b => tsLabel(b.bucket_start));
+  const datasets = vis.filter(id => buckets.some(b => (b[id]||0) > 0)).map(id => ({
+    label: (TAG_BY_ID[id]||{}).label || id, data: buckets.map(b => b[id] || 0),
+    backgroundColor: (TAG_BY_ID[id]||{}).color || '#888', stack:'a',
+  }));
+  return { labels, datasets };
+}
+function barOpts() {
+  return { responsive:true, maintainAspectRatio:false, animation:false,
+    plugins:{ legend:{ display:false } },
+    scales:{ x:{ stacked:true, ticks:{color:'#4a5765', font:{family:"'IBM Plex Mono', monospace", size:8}, maxTicksLimit:4}, grid:{display:false} },
+             y:{ stacked:true, ticks:{color:'#4a5765', font:{family:"'IBM Plex Mono', monospace", size:8}, maxTicksLimit:3, precision:0}, grid:{color:'rgba(255,255,255,.04)'} } } };
+}
+function rerenderInstanceCharts() {
+  for (const [name, buckets] of Object.entries(LAST_INST_BUCKETS)) {
+    const cv = document.getElementById('ch-' + name); if (!cv) continue;
+    const data = buildBarDatasets(buckets);
+    if (!charts[name]) charts[name] = new Chart(cv, { type:'bar', data, options: barOpts() });
+    else { charts[name].data = data; charts[name].update('none'); }
+  }
+  if (typeof updateGlobalHint === 'function') updateGlobalHint();
 }
 
 // ---- host metrics + error-spell console -----------------------------
@@ -2140,28 +2251,35 @@ function renderCardSpells(card, name) {
   if (more) more.onclick = () => { CARD_SPELLS_ALL[name] = !CARD_SPELLS_ALL[name]; renderCardSpells(card, name); };
 }
 
+function windowParam() {
+  const raw = document.getElementById('window').value;
+  return raw === 'all' ? 'all' : (+raw || 3600);
+}
+function updateGlobalHint() {
+  const w = document.getElementById('window');
+  const wt = (w.value === 'all') ? 'whole timeline' : (w.selectedOptions[0] ? w.selectedOptions[0].text : w.value);
+  const onlyErr = VISIBLE_TAGS.size === TAGS.filter(t=>t.err).length && [...VISIBLE_TAGS].every(id => (TAG_BY_ID[id]||{}).err);
+  const what = VISIBLE_TAGS.size === 0 ? 'nothing selected' : onlyErr ? 'errors' : (VISIBLE_TAGS.size === TAGS.length ? 'all tags' : VISIBLE_TAGS.size + ' tags');
+  document.getElementById('globalHint').textContent = `all instances · ${what} per ${bucketLabel(LAST_GLOBAL_BUCKETSEC)} · ${wt}`;
+}
+
 async function refresh() {
-  const window = +document.getElementById('window').value;
-  const bucketSec = window <= 900 ? 30 : window <= 3600 ? 60 : window <= 21600 ? 300 : 900;
+  const wp = windowParam();
+  const bucketSec = +document.getElementById('bucket').value || 60;
 
   const [summary, globalBuckets] = await Promise.all([
-    fetchJSON('/api/summary?window=' + window),
-    fetchJSON(`/api/histogram?window=${window}&bucket=${bucketSec}`),
+    fetchJSON('/api/summary?window=' + wp),
+    fetchJSON(`/api/histogram?window=${wp}&bucket=${bucketSec}`),
   ]);
   // populate the host panel + LAST_SPELLS / LAST_PROC_LATEST before rendering cards
-  try { await refreshHost(window); }
+  try { await refreshHost(wp); }
   catch (e) { document.getElementById('hostMeta').textContent = 'host: ' + e.message; }
 
-  // Global chart
-  const gData = buildDatasets(globalBuckets, bucketSec);
-  if (!globalChart) {
-    globalChart = new Chart(document.getElementById('globalChart'), {
-      type: 'bar', data: gData, options: chartOpts(true),
-    });
-  } else {
-    globalChart.data = gData;
-    globalChart.update();
-  }
+  // Main "error events" line chart (default tags = errors; toggle via chips)
+  LAST_GLOBAL_BUCKETS = globalBuckets; LAST_GLOBAL_BUCKETSEC = bucketSec;
+  renderTagChips();
+  renderGlobalChart();
+  updateGlobalHint();
 
   // Per-instance cards
   const cards = document.getElementById('cards');
@@ -2194,7 +2312,7 @@ async function refresh() {
     card.querySelector('[data-stats]').innerHTML = `
       <span>Last ledger</span><span>${fmtAge(inst.last_ledger_age_s)} ago</span>
       <span>Last event</span><span>${fmtAge(inst.last_event_age_s)} ago</span>
-      <span>Ledgers (win)</span><span>${c.ledger_created || 0}</span>
+      <span>Ledgers</span><span>${c.ledger_created || 0}</span>
       <span>Consensus loss</span><span>${c.consensus_lost || 0}</span>
       <span>Fork warnings</span><span>${c.fork_warn || 0}</span>
       <span>Errors</span><span>${c.error || 0}</span>
@@ -2203,28 +2321,22 @@ async function refresh() {
     renderCardSpells(card, inst.name);
 
     const buckets = await fetchJSON(
-      `/api/histogram?window=${window}&bucket=${bucketSec}&instance=${encodeURIComponent(inst.name)}`);
-    const data = buildDatasets(buckets, bucketSec);
-    if (!charts[inst.name]) {
-      charts[inst.name] = new Chart(document.getElementById('ch-' + inst.name), {
-        type: 'bar', data, options: chartOpts(false),
-      });
-    } else {
-      charts[inst.name].data = data;
-      charts[inst.name].update();
-    }
+      `/api/histogram?window=${wp}&bucket=${bucketSec}&instance=${encodeURIComponent(inst.name)}`);
+    LAST_INST_BUCKETS[inst.name] = buckets;
+    const data = buildBarDatasets(buckets);
+    if (!charts[inst.name]) charts[inst.name] = new Chart(document.getElementById('ch-' + inst.name), { type:'bar', data, options: barOpts() });
+    else { charts[inst.name].data = data; charts[inst.name].update('none'); }
   }
-  // Drop cards for vanished instances
+  // Drop cards / charts for vanished instances
   for (const k of Object.keys(charts)) {
     if (!seen.has(k)) {
       const el = document.getElementById('c-' + k);
       if (el) el.remove();
-      charts[k].destroy();
-      delete charts[k];
+      try { charts[k].destroy(); } catch(e) {}
+      delete charts[k]; delete LAST_INST_BUCKETS[k];
     }
   }
-  document.getElementById('lastUpdate').textContent =
-    'updated ' + new Date().toLocaleTimeString();
+  document.getElementById('lastUpdate').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
 function scheduleRefresh() {
@@ -2234,18 +2346,20 @@ function scheduleRefresh() {
 }
 
 document.getElementById('reload').onclick = refresh;
-document.getElementById('window').onchange = () => {
-  for (const k of Object.keys(charts)) { charts[k].destroy(); }
-  charts = {};
-  if (globalChart) { globalChart.destroy(); globalChart = null; }
+function hardReload() {
+  for (const k of Object.keys(charts)) { try { charts[k].destroy(); } catch(e) {} }
+  charts = {}; LAST_INST_BUCKETS = {};
+  if (globalChart) { try { globalChart.destroy(); } catch(e) {} globalChart = null; }
   document.getElementById('cards').innerHTML = '';
   refresh();
-};
+}
+document.getElementById('window').onchange = hardReload;
+document.getElementById('bucket').onchange = hardReload;
 document.getElementById('refresh').onchange = scheduleRefresh;
 
+renderTagChips();
 refresh().catch(e => {
-  document.getElementById('cards').innerHTML =
-    '<div class="empty">Error: ' + e.message + '</div>';
+  document.getElementById('cards').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
 });
 scheduleRefresh();
 </script>
