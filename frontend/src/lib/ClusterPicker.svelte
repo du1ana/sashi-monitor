@@ -84,6 +84,8 @@
           {lastDiscover.instances_seen ?? 0} nodes · {lastDiscover.clusters_seen ?? 0} clusters
           {#if lastDiscover.tails_started}· +{lastDiscover.tails_started} tailed{/if}
           {#if lastDiscover.tails_reaped}· -{lastDiscover.tails_reaped} dropped{/if}
+          {#if lastDiscover.purged?.instances}· purged {lastDiscover.purged.instances} stale{/if}
+          {#if lastDiscover.empty_clusters_dropped}· -{lastDiscover.empty_clusters_dropped} empty clusters{/if}
         </span>
       {/if}
       <button class="pri-btn" onclick={discover} disabled={busy} title="Run `sashi list` now">

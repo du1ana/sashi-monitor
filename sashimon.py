@@ -1079,6 +1079,67 @@ class Store:
             self.conn.execute("DELETE FROM instances WHERE name=?", (name,))
             self.conn.commit()
 
+    def purge_instances(self, names_to_keep: set[str]) -> dict:
+        """Remove every trace of instances NOT in `names_to_keep`. Called from
+        Discoverer after a successful `sashi list` to age out expired tenants.
+        Returns counts so the caller can log the cleanup."""
+        with self.lock:
+            existing = {r[0] for r in self.conn.execute(
+                "SELECT name FROM instances"
+            )}
+            stale = existing - (names_to_keep or set())
+            if not stale:
+                return {"instances": 0, "events": 0, "host_metrics": 0,
+                        "spells": 0, "artifacts": 0}
+            placeholders = ",".join("?" * len(stale))
+            args = tuple(stale)
+            spell_ids = [r[0] for r in self.conn.execute(
+                f"SELECT spell_id FROM spells_log WHERE instance IN ({placeholders})",
+                args,
+            )]
+            counts = {"instances": 0, "events": 0, "host_metrics": 0,
+                      "spells": 0, "artifacts": 0}
+            counts["events"] = self.conn.execute(
+                f"DELETE FROM events WHERE instance IN ({placeholders})", args
+            ).rowcount
+            counts["host_metrics"] = self.conn.execute(
+                f"DELETE FROM host_metrics WHERE instance IN ({placeholders})", args
+            ).rowcount
+            counts["spells"] = self.conn.execute(
+                f"DELETE FROM spells_log WHERE instance IN ({placeholders})", args
+            ).rowcount
+            if spell_ids:
+                sp_ph = ",".join("?" * len(spell_ids))
+                counts["artifacts"] = self.conn.execute(
+                    f"DELETE FROM spell_artifacts WHERE spell_id IN ({sp_ph})",
+                    tuple(spell_ids),
+                ).rowcount
+            counts["instances"] = self.conn.execute(
+                f"DELETE FROM instances WHERE name IN ({placeholders})", args
+            ).rowcount
+            self.conn.commit()
+            return counts
+
+    def purge_empty_clusters(self, contract_ids_to_keep: set[str]) -> int:
+        """Drop cluster rows whose contract_id is not in the keep-set AND has
+        no remaining instances. Returns rows removed."""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT c.contract_id FROM clusters c "
+                "LEFT JOIN instances i ON i.contract_id = c.contract_id "
+                "GROUP BY c.contract_id HAVING COUNT(i.name) = 0"
+            ).fetchall()
+            to_drop = [r[0] for r in rows if r[0] not in (contract_ids_to_keep or set())]
+            if not to_drop:
+                return 0
+            placeholders = ",".join("?" * len(to_drop))
+            n = self.conn.execute(
+                f"DELETE FROM clusters WHERE contract_id IN ({placeholders})",
+                tuple(to_drop),
+            ).rowcount
+            self.conn.commit()
+            return n
+
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         with self.lock:
             row = self.conn.execute(
@@ -1400,11 +1461,25 @@ class Discoverer(threading.Thread):
                 reaped += 1
                 print(f"[discover] dropped tail {name[:16]} (cluster {(cid or '?')[:12]} unmonitored)")
 
+        # Age out any instances + clusters no longer present in `sashi list`.
+        # Only runs after a successful parse — a failed/empty-due-to-error
+        # poll returned early above, so we never nuke history on a transient
+        # sashi hiccup.
+        purged = self.store.purge_instances(seen_instances)
+        empty_clusters = self.store.purge_empty_clusters(seen_clusters)
+        if any(purged.values()) or empty_clusters:
+            print(f"[discover] purged stale: instances={purged['instances']} "
+                  f"events={purged['events']} host_metrics={purged['host_metrics']} "
+                  f"spells={purged['spells']} artifacts={purged['artifacts']} "
+                  f"empty_clusters={empty_clusters}")
+
         return {
             "clusters_seen":  len(seen_clusters),
             "instances_seen": len(seen_instances),
             "tails_started":  started,
             "tails_reaped":   reaped,
+            "purged":         purged,
+            "empty_clusters_dropped": empty_clusters,
         }
 
     def run(self) -> None:
