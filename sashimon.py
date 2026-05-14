@@ -57,6 +57,56 @@ ERROR_TAGS = ("fork_warn", "consensus_lost", "out_of_sync", "error")
 ALWAYS_SAMPLE_MOUNTS = ("/", "/var/lib")
 
 # --------------------------------------------------------------------------
+# Severity + tracking policy
+# --------------------------------------------------------------------------
+# Treat fork conditions as high-impact (boost metrics + snapshot + always
+# track events). Consensus-loss / out-of-sync / plain warnings are low-impact
+# noise that bloats the DB during a spell — keep the spell row, but drop
+# the per-event flood and skip metric boost.
+TAG_SEVERITY = {
+    "fork_warn":      "high",
+    "error":          "high",
+    "out_of_sync":    "low",
+    "consensus_lost": "low",
+    "warning":        "low",
+}
+
+# Default settings — overridable at runtime via /api/policy (persisted in the
+# `settings` table). `policy_mode` picks one of the presets below.
+DEFAULT_POLICY_MODE = "balanced"
+
+POLICY_MODES = {
+    # Legacy behaviour: track every event, boost metrics + snapshot for every
+    # spell regardless of severity.
+    "full": {
+        "low":  {"events": True,  "boost": True,  "snapshot": True},
+        "high": {"events": True,  "boost": True,  "snapshot": True},
+    },
+    # Default — only fork-class spells get the heavy treatment. Low-severity
+    # spells (consensus_lost, out_of_sync, warning) skip metric boost +
+    # snapshots, and during the spell their event-flood is dropped.
+    "balanced": {
+        "low":  {"events": False, "boost": False, "snapshot": False},
+        "high": {"events": True,  "boost": True,  "snapshot": True},
+    },
+    # Most aggressive — only track ledger_created + high-severity events;
+    # never boost metrics or snapshot.
+    "minimal": {
+        "low":  {"events": False, "boost": False, "snapshot": False},
+        "high": {"events": True,  "boost": False, "snapshot": False},
+    },
+}
+
+# Tags that are ALWAYS persisted regardless of policy gating (so we can still
+# tell healthy from forked, and so a spell can open from its trigger event).
+ALWAYS_TRACK_TAGS = {"ledger_created", "fork_warn", "error",
+                     "hp_started", "hp_stopped"}
+
+
+def tag_severity(tag: str) -> str:
+    return TAG_SEVERITY.get(tag, "high" if tag in ERROR_TAGS else "low")
+
+# --------------------------------------------------------------------------
 # Log parsing
 # --------------------------------------------------------------------------
 #
@@ -408,6 +458,13 @@ CREATE TABLE IF NOT EXISTS spell_artifacts (
     content   TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_spell ON spell_artifacts(spell_id, ts);
+
+-- Runtime settings (tracking policy, etc.). Single-row key/value store so the
+-- frontend can flip the DB-tracking mode without restarting the daemon.
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 
@@ -850,6 +907,32 @@ class Store:
             self.conn.commit()
             return cur.rowcount
 
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT value FROM settings WHERE key=?", (key,)
+            ).fetchone()
+        return row[0] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, value),
+            )
+            self.conn.commit()
+
+    def db_size_bytes(self) -> int:
+        """Sum of the SQLite main file + its -wal and -shm sidecars (best-effort)."""
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                total += os.path.getsize(self.path + suffix)
+            except OSError:
+                pass
+        return total
+
     def clear_all(self) -> dict:
         """Wipe all events and instance rows. Tail threads keep running;
         the next discovery poll will re-upsert live instances."""
@@ -873,15 +956,64 @@ class Store:
 # Tail worker (one per instance)
 # --------------------------------------------------------------------------
 
+class PolicyManager:
+    """Resolves the current event-tracking + spell-handling policy.
+
+    Backed by the `settings` table so the dashboard can flip the mode at
+    runtime; reads are cheap (hits SQLite per call but only on the ingest
+    path, which is already DB-bound).
+    """
+
+    def __init__(self, store: Store, default_mode: str = DEFAULT_POLICY_MODE):
+        self.store = store
+        self.default = default_mode if default_mode in POLICY_MODES else "balanced"
+        if self.store.get_setting("policy_mode") is None:
+            self.store.set_setting("policy_mode", self.default)
+
+    def mode(self) -> str:
+        m = self.store.get_setting("policy_mode", self.default) or self.default
+        return m if m in POLICY_MODES else self.default
+
+    def set_mode(self, mode: str) -> str:
+        if mode not in POLICY_MODES:
+            raise ValueError(f"unknown policy mode: {mode}")
+        self.store.set_setting("policy_mode", mode)
+        return mode
+
+    def spell_actions(self, severity: str) -> dict:
+        """Return {events, boost, snapshot} bools for a spell of given severity
+        under the current mode."""
+        return POLICY_MODES[self.mode()].get(
+            severity, POLICY_MODES[self.mode()]["high"]
+        )
+
+    def should_track_event(self, spell_mgr, instance: str, tag: str) -> bool:
+        """Apply the per-event gate. ALWAYS_TRACK_TAGS bypass everything."""
+        if tag in ALWAYS_TRACK_TAGS:
+            return True
+        mode = self.mode()
+        if mode == "full":
+            return True
+        sev = tag_severity(tag)
+        if mode == "minimal":
+            return sev == "high"
+        # balanced: only gate while the instance is in a low-severity spell.
+        spell = spell_mgr.current_spell(instance) if spell_mgr else None
+        if spell is None:
+            return True
+        return POLICY_MODES["balanced"][spell["severity"]]["events"]
+
+
 class Tail(threading.Thread):
     def __init__(self, instance: str, store: Store, stop_event: threading.Event,
-                 sashi_bin: str, spell_manager=None):
+                 sashi_bin: str, spell_manager=None, policy: "PolicyManager | None" = None):
         super().__init__(daemon=True, name=f"tail-{instance[:12]}")
         self.instance = instance
         self.store = store
         self.stop_event = stop_event
         self.sashi_bin = sashi_bin
         self.spell_manager = spell_manager
+        self.policy = policy
         self.proc: subprocess.Popen | None = None
         self.master_fd: int | None = None
 
@@ -920,16 +1052,26 @@ class Tail(threading.Thread):
                         text = line.decode("utf-8", errors="replace")
                         ev = parse_log_line(text, time.time())
                         if ev:
-                            try:
-                                self.store.insert_event(self.instance, ev)
-                            except Exception as e:
-                                print(f"[tail {self.instance[:12]}] db: {e}",
-                                      file=sys.stderr)
+                            # Spell tracking always runs (so spells open/close
+                            # regardless of event-storage policy).
                             if self.spell_manager is not None:
                                 try:
                                     self.spell_manager.on_event(self.instance, ev)
                                 except Exception as e:
                                     print(f"[tail {self.instance[:12]}] spell: {e}",
+                                          file=sys.stderr)
+                            track = True
+                            if self.policy is not None:
+                                try:
+                                    track = self.policy.should_track_event(
+                                        self.spell_manager, self.instance, ev["tag"])
+                                except Exception:
+                                    track = True
+                            if track:
+                                try:
+                                    self.store.insert_event(self.instance, ev)
+                                except Exception as e:
+                                    print(f"[tail {self.instance[:12]}] db: {e}",
                                           file=sys.stderr)
             except FileNotFoundError:
                 print(f"[tail {self.instance[:12]}] '{self.sashi_bin}' not found",
@@ -973,7 +1115,8 @@ class Tail(threading.Thread):
 class Discoverer(threading.Thread):
     def __init__(self, store: Store, tails: dict[str, Tail],
                  stop_event: threading.Event, sashi_bin: str,
-                 interval: int = DISCOVER_INTERVAL, spell_manager=None):
+                 interval: int = DISCOVER_INTERVAL, spell_manager=None,
+                 policy: "PolicyManager | None" = None):
         super().__init__(daemon=True, name="discover")
         self.store = store
         self.tails = tails
@@ -981,6 +1124,7 @@ class Discoverer(threading.Thread):
         self.sashi_bin = sashi_bin
         self.interval = interval
         self.spell_manager = spell_manager
+        self.policy = policy
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -998,7 +1142,8 @@ class Discoverer(threading.Thread):
                     self.store.upsert_instance(ins)
                     if name not in self.tails:
                         t = Tail(name, self.store, self.stop_event, self.sashi_bin,
-                                 spell_manager=self.spell_manager)
+                                 spell_manager=self.spell_manager,
+                                 policy=self.policy)
                         self.tails[name] = t
                         t.start()
                         print(f"[discover] tailing {name[:16]}")
@@ -1235,7 +1380,8 @@ class SpellManager:
                  metrics: MetricsCollector | None, instances_ref: dict,
                  boost_cooldown: float = METRICS_BOOST_COOLDOWN,
                  recapture_s: float = SNAPSHOT_RECAPTURE,
-                 max_captures: int = SNAPSHOT_MAX_CAPTURES):
+                 max_captures: int = SNAPSHOT_MAX_CAPTURES,
+                 policy: "PolicyManager | None" = None):
         self.store = store
         self.stop = stop_event
         self.sashi_bin = sashi_bin
@@ -1244,6 +1390,7 @@ class SpellManager:
         self.boost_cooldown = boost_cooldown
         self.recapture_s = recapture_s
         self.max_captures = max_captures
+        self.policy = policy
         self.lock = threading.Lock()
         self.state: dict[str, dict] = {}
         # Re-attach to spells left open by a previous run.
@@ -1253,9 +1400,25 @@ class SpellManager:
                     "in_spell": True, "spell_id": r["spell_id"],
                     "start_ts": r["start_ts"], "last_error_ts": r["start_ts"],
                     "last_ledger_ts": 0.0,
+                    "severity": tag_severity(r.get("trigger_tag", "")),
+                    "trigger_tag": r.get("trigger_tag"),
                 }
         except Exception:
             pass
+
+    def current_spell(self, instance: str) -> dict | None:
+        """Return a snapshot of the active spell for `instance`, or None.
+        Used by PolicyManager to decide whether to gate event inserts."""
+        with self.lock:
+            s = self.state.get(instance)
+            if not s or not s.get("in_spell"):
+                return None
+            return {
+                "spell_id":    s.get("spell_id"),
+                "severity":    s.get("severity", "high"),
+                "trigger_tag": s.get("trigger_tag"),
+                "start_ts":    s.get("start_ts"),
+            }
 
     def _st(self, instance: str) -> dict:
         return self.state.setdefault(instance, {
@@ -1284,17 +1447,25 @@ class SpellManager:
             if s["in_spell"]:
                 return
             sid = f"{instance}-{int(ts)}"
+            severity = tag_severity(tag)
             s["in_spell"] = True
             s["spell_id"] = sid
             s["start_ts"] = ts
+            s["severity"] = severity
+            s["trigger_tag"] = tag
             self.store.open_spell(sid, instance, ts, tag, ev.get("msg", ""))
+            actions = (self.policy.spell_actions(severity)
+                       if self.policy is not None
+                       else {"boost": True, "snapshot": True, "events": True})
             print(f"[spell] {instance[:16]}: ENTERED spell {sid} [{tag}] "
+                  f"severity={severity} actions={actions} "
                   f"{(ev.get('msg') or '')[:90]}")
-            if self.metrics:
+            if self.metrics and actions.get("boost", True):
                 self.metrics.boost(sid, self.boost_cooldown)
                 self.metrics.sample_now(spell_id=sid, during_spell=1)
-            threading.Thread(target=self._snapshot_loop, args=(sid, instance),
-                             daemon=True, name=f"snap-{sid[-12:]}").start()
+            if actions.get("snapshot", True):
+                threading.Thread(target=self._snapshot_loop, args=(sid, instance),
+                                 daemon=True, name=f"snap-{sid[-12:]}").start()
 
     def is_active(self, spell_id: str) -> bool:
         with self.lock:
@@ -1705,6 +1876,15 @@ DASHBOARD_HTML = r"""<!doctype html>
   button { cursor: pointer; }
   button:hover, select:hover { border-color: var(--line2); }
   button.danger { color: var(--bad); border-color: var(--bad-dim); }
+  button.danger .dbsz { color: var(--fg-faint); font-weight: 500; margin-left: 4px;
+                        font-variant-numeric: tabular-nums; }
+  button.danger:hover .dbsz { color: var(--bad-dim); }
+  .policy-ctl { display:inline-flex; align-items:center; gap:6px; padding:0;
+                color: var(--fg-dim); font-family: var(--mono); font-size: 10.5px;
+                text-transform: uppercase; letter-spacing: .05em; }
+  .policy-ctl select { color: var(--accent); border-color: var(--line2);
+                       text-transform: lowercase; letter-spacing: 0; }
+  .policy-ctl select:disabled { opacity: .55; cursor: progress; }
   .panel { margin-bottom: 18px; background: var(--bg1); border: 1px solid var(--line);
            border-radius: 4px; }
   .panel > .ph { padding: 9px 14px; border-bottom: 1px solid var(--line);
@@ -1944,8 +2124,15 @@ DASHBOARD_HTML = r"""<!doctype html>
     </label>
     <button id="reload">reload</button>
     <span style="flex:1"></span>
+    <label class="policy-ctl" id="policyLabel" title="DB tracking policy. Balanced (default): low-impact spells (consensus_lost, out_of_sync, warning) skip metric-boost + snapshots, and during the spell their event flood is dropped. Forks still get full treatment. Full: track everything always. Minimal: only fork-class events.">tracking
+      <select id="policy" disabled>
+        <option value="balanced">balanced</option>
+        <option value="full">full</option>
+        <option value="minimal">minimal</option>
+      </select>
+    </label>
     <button id="export" title="download one plain-text report — every instance, every error spell, with the HotPocket log + journalctl + host metrics around each spell start; hand it to an analyst / LLM">export report</button>
-    <button id="clearDb" class="danger" title="wipe ALL stored data: log events, host metrics, error spells & their artifacts, instances. Live tailing/sampling continues; history starts fresh.">clear dbs</button>
+    <button id="clearDb" class="danger" title="wipe ALL stored data: log events, host metrics, error spells & their artifacts, instances. Live tailing/sampling continues; history starts fresh.">clear dbs <span class="dbsz" id="dbSize">(—)</span></button>
   </div>
 
   <div id="statusbar" title="host status — click to jump to host metrics"></div>
@@ -2657,6 +2844,47 @@ function scheduleRefresh() {
   if (ms > 0) timer = setInterval(refresh, ms);
 }
 
+// ---- DB tracking policy + db-size badge -----------------------------
+async function loadPolicy() {
+  try {
+    const p = await fetchJSON('/api/policy');
+    const sel = document.getElementById('policy');
+    sel.innerHTML = '';
+    const modes = (p.modes && p.modes.length) ? p.modes : ['balanced','full','minimal'];
+    for (const m of modes) {
+      const o = document.createElement('option');
+      o.value = m; o.textContent = m;
+      sel.appendChild(o);
+    }
+    sel.value = p.mode || 'balanced';
+    sel.disabled = false;
+    sel.onchange = async () => {
+      sel.disabled = true;
+      try {
+        const r = await fetch('/api/policy', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({mode: sel.value}),
+        });
+        const j = await r.json().catch(()=>({}));
+        if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP '+r.status));
+      } catch (e) {
+        alert('Policy save failed: ' + e.message);
+        try { await loadPolicy(); } catch {}
+      } finally { sel.disabled = false; }
+    };
+  } catch (e) { /* leave dropdown disabled */ }
+}
+async function loadDbSize() {
+  try {
+    const s = await fetchJSON('/api/db_size');
+    const el = document.getElementById('dbSize');
+    if (el) el.textContent = '(' + (s.human || '—') + ')';
+  } catch {}
+}
+loadPolicy(); loadDbSize();
+setInterval(loadDbSize, 15000);
+
 document.getElementById('reload').onclick = refresh;
 document.getElementById('export').onclick = () => {
   const btn = document.getElementById('export');
@@ -2666,23 +2894,29 @@ document.getElementById('export').onclick = () => {
   setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 4000);
 };
 document.getElementById('clearDb').onclick = async () => {
-  if (!confirm('Wipe ALL stored data — log events, host metrics, error spells + their captured artifacts, instances?\\n\\nLive tailing & metric sampling keep running; history just starts fresh. This cannot be undone.')) return;
+  const sz = (document.getElementById('dbSize') || {}).textContent || '';
+  if (!confirm('Wipe ALL stored data ' + sz + ' — log events, host metrics, error spells + their captured artifacts, instances?\\n\\nLive tailing & metric sampling keep running; history just starts fresh. This cannot be undone.')) return;
   const btn = document.getElementById('clearDb');
-  const prev = btn.textContent; btn.textContent = 'clearing…'; btn.disabled = true;
+  const prev = btn.innerHTML; btn.textContent = 'clearing…'; btn.disabled = true;
   try {
     const r = await fetch('/api/clear', { method: 'POST' });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
+    if (j.db_size_human) {
+      const el = document.getElementById('dbSize');
+      if (el) el.textContent = '(' + j.db_size_human + ')';
+    }
   } catch (e) {
     alert('Clear failed: ' + e.message);
-    btn.textContent = prev; btn.disabled = false; return;
+    btn.innerHTML = prev; btn.disabled = false; return;
   }
   // reset client-side state and rebuild from the now-empty DB
   OPEN_SPELLS.clear(); SPELL_LIST_KEY = '';
   LAST_SPELLS = []; LAST_PROC_LATEST = {}; LAST_GLOBAL_BUCKETS = []; LAST_INST_BUCKETS = {};
   closeDrawer();
   hardReload();
-  btn.textContent = prev; btn.disabled = false;
+  btn.innerHTML = prev; btn.disabled = false;
+  loadDbSize();
 };
 function hardReload() {
   for (const k of Object.keys(charts)) { try { charts[k].destroy(); } catch(e) {} }
@@ -2708,6 +2942,23 @@ scheduleRefresh();
 """
 
 
+def _human_bytes(n: int) -> str:
+    """Compact size — 1.2 MB / 850 KB / 12 B."""
+    try:
+        n = int(n)
+    except Exception:
+        return "?"
+    units = ("B", "KB", "MB", "GB", "TB")
+    i = 0
+    f = float(n)
+    while f >= 1024.0 and i < len(units) - 1:
+        f /= 1024.0
+        i += 1
+    if i == 0:
+        return f"{int(f)} {units[i]}"
+    return f"{f:.1f} {units[i]}"
+
+
 def _parse_window(raw: str | None) -> int:
     """Returns seconds. 0 means 'all-time'."""
     if raw is None:
@@ -2726,7 +2977,8 @@ def make_handler(store: Store, static_html_path: str | None,
                  metrics: "MetricsCollector | None" = None,
                  spell_manager: "SpellManager | None" = None,
                  sashi_bin: str = "sashi",
-                 report_peers: list | None = None):
+                 report_peers: list | None = None,
+                 policy: "PolicyManager | None" = None):
     hostname = socket.gethostname()
 
     class Handler(BaseHTTPRequestHandler):
@@ -2885,6 +3137,25 @@ def make_handler(store: Store, static_html_path: str | None,
                            {"Content-Disposition": f'attachment; filename="{fname}"'})
                 return
 
+            if u.path == "/api/db_size":
+                size = store.db_size_bytes()
+                self._json({
+                    "bytes": size,
+                    "human": _human_bytes(size),
+                    "path":  store.path,
+                })
+                return
+
+            if u.path == "/api/policy":
+                self._json({
+                    "mode":        policy.mode() if policy else DEFAULT_POLICY_MODE,
+                    "modes":       sorted(POLICY_MODES.keys()),
+                    "severity":    TAG_SEVERITY,
+                    "always_track": sorted(ALWAYS_TRACK_TAGS),
+                    "actions":     POLICY_MODES,
+                })
+                return
+
             if u.path == "/healthz":
                 self._json({"ok": True})
                 return
@@ -2893,6 +3164,39 @@ def make_handler(store: Store, static_html_path: str | None,
 
         def do_POST(self) -> None:  # noqa: N802
             u = urlparse(self.path)
+
+            if u.path == "/api/policy":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = b""
+                if length > 0:
+                    try:
+                        raw = self.rfile.read(length)
+                    except Exception:
+                        raw = b""
+                mode = None
+                # Accept either application/json {"mode":"balanced"} or form body.
+                ctype = (self.headers.get("Content-Type") or "").lower()
+                try:
+                    if "application/json" in ctype and raw:
+                        body = json.loads(raw.decode("utf-8") or "{}")
+                        mode = body.get("mode")
+                    else:
+                        body = parse_qs(raw.decode("utf-8")) if raw else {}
+                        mode = (body.get("mode") or [None])[0]
+                except Exception:
+                    mode = None
+                if not mode:
+                    mode = (parse_qs(u.query).get("mode") or [None])[0]
+                if not policy:
+                    self._json({"ok": False, "error": "policy disabled"}, code=500)
+                    return
+                try:
+                    policy.set_mode(mode)
+                except ValueError as e:
+                    self._json({"ok": False, "error": str(e)}, code=400)
+                    return
+                self._json({"ok": True, "mode": policy.mode()})
+                return
 
             if u.path == "/api/clear":
                 # Drain any request body to keep the connection clean.
@@ -2911,7 +3215,13 @@ def make_handler(store: Store, static_html_path: str | None,
                             spell_manager.state.clear()
                         except Exception:
                             pass
-                    self._json({"ok": True, **result})
+                    sz = store.db_size_bytes()
+                    self._json({
+                        "ok": True,
+                        "db_size_bytes": sz,
+                        "db_size_human": _human_bytes(sz),
+                        **result,
+                    })
                 except Exception as e:
                     self._json({"ok": False, "error": str(e)}, code=500)
                 return
@@ -2972,6 +3282,27 @@ def main() -> None:
                          "monitors. When set, GET /api/report (the 'export "
                          "report' button) fetches their reports too, so a "
                          "multi-VM cluster yields one document for every node.")
+    ap.add_argument("--policy-mode",
+                    default=os.environ.get("SASHIMON_POLICY_MODE", DEFAULT_POLICY_MODE),
+                    choices=sorted(POLICY_MODES.keys()),
+                    help="DB tracking policy. 'full' tracks everything; "
+                         "'balanced' (default) drops low-severity event floods "
+                         "during a spell and skips metric boost/snapshot for "
+                         "low-impact spells (consensus_lost, out_of_sync, "
+                         "warning); 'minimal' only stores fork-class events.")
+    ap.add_argument("--tls-cert",
+                    default=os.environ.get("SASHIMON_TLS_CERT", ""),
+                    help="Path to TLS certificate (PEM). When set together "
+                         "with --tls-key, the dashboard is served over HTTPS.")
+    ap.add_argument("--tls-key",
+                    default=os.environ.get("SASHIMON_TLS_KEY", ""),
+                    help="Path to TLS private key (PEM).")
+    ap.add_argument("--tls-auto", action="store_true",
+                    default=(os.environ.get("SASHIMON_TLS_AUTO", "") not in ("", "0", "false")),
+                    help="If --tls-cert/--tls-key are blank, try the Sashimono "
+                         "contract template defaults "
+                         "(/etc/sashimono/contract_template/cfg/tls{cert,key}.pem). "
+                         "Silently falls back to plain HTTP if those don't exist.")
     args = ap.parse_args()
 
     sashi_path = shutil.which(args.sashi) or args.sashi
@@ -2979,6 +3310,7 @@ def main() -> None:
     store = Store(args.db)
     stop = threading.Event()
     tails: dict[str, Tail] = {}
+    policy = PolicyManager(store, default_mode=args.policy_mode)
 
     static_path = args.static.strip() or str(
         Path(__file__).resolve().parent / "index.html"
@@ -3003,12 +3335,14 @@ def main() -> None:
     spell_mgr = SpellManager(
         store, stop, sashi_path, metrics, tails,
         boost_cooldown=args.metrics_boost_cooldown,
+        policy=policy,
     )
     if metrics is not None:
         metrics.tick_cb = spell_mgr.tick
         metrics.start()
 
-    Discoverer(store, tails, stop, sashi_path, spell_manager=spell_mgr).start()
+    Discoverer(store, tails, stop, sashi_path, spell_manager=spell_mgr,
+               policy=policy).start()
     Pruner(store, stop, args.retention_days).start()
 
     server = ThreadingHTTPServer(
@@ -3016,14 +3350,38 @@ def main() -> None:
         make_handler(store, static_path or None,
                      roundtime_ms=args.roundtime_ms, metrics=metrics,
                      spell_manager=spell_mgr, sashi_bin=sashi_path,
-                     report_peers=report_peers),
+                     report_peers=report_peers, policy=policy),
     )
+
+    # ---- TLS wrap (optional) ------------------------------------------
+    tls_cert = (args.tls_cert or "").strip()
+    tls_key = (args.tls_key or "").strip()
+    if not tls_cert and not tls_key and args.tls_auto:
+        c = "/etc/sashimono/contract_template/cfg/tlscert.pem"
+        k = "/etc/sashimono/contract_template/cfg/tlskey.pem"
+        if os.path.isfile(c) and os.path.isfile(k):
+            tls_cert, tls_key = c, k
+    scheme = "http"
+    if tls_cert and tls_key:
+        try:
+            import ssl
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(tls_cert, tls_key)
+            server.socket = ctx.wrap_socket(server.socket, server_side=True)
+            scheme = "https"
+            print(f"[sashimon] TLS enabled  cert={tls_cert}  key={tls_key}")
+        except Exception as e:
+            print(f"[sashimon] TLS init failed ({e}) — falling back to HTTP",
+                  file=sys.stderr)
+            scheme = "http"
+
     print(f"[sashimon] db={args.db}  sashi={sashi_path}")
     print(f"[sashimon] static={static_path or '(embedded fallback)'}")
+    print(f"[sashimon] policy={policy.mode()}")
     print(f"[sashimon] roundtime={args.roundtime_ms}ms  "
           f"metrics={'off' if args.no_metrics else f'{args.metrics_interval}s/{args.metrics_interval_boost}s'}"
           f"  report-peers={report_peers or '(none)'}")
-    print(f"[sashimon] dashboard http://{args.bind}:{args.port}")
+    print(f"[sashimon] dashboard {scheme}://{args.bind}:{args.port}")
     threading.Thread(target=server.serve_forever, daemon=True,
                      name="http").start()
     try:

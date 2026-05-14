@@ -17,6 +17,13 @@ INSTALL_DIR="${SASHIMON_INSTALL_DIR:-/opt/sashimon}"
 DATA_DIR="${SASHIMON_DATA_DIR:-/var/lib/sashimon}"
 PORT="${SASHIMON_PORT:-8765}"
 BIND="${SASHIMON_BIND:-0.0.0.0}"
+# Optional TLS — if a Sashimono contract-template cert/key exists, sashimon
+# auto-serves HTTPS. Override with SASHIMON_TLS_CERT/SASHIMON_TLS_KEY, or
+# disable with SASHIMON_TLS_AUTO=0.
+TLS_AUTO="${SASHIMON_TLS_AUTO:-1}"
+TLS_CERT="${SASHIMON_TLS_CERT:-}"
+TLS_KEY="${SASHIMON_TLS_KEY:-}"
+POLICY_MODE="${SASHIMON_POLICY_MODE:-balanced}"
 SERVICE_FILE="/etc/systemd/system/sashimon.service"
 
 if [[ $EUID -ne 0 ]]; then
@@ -66,6 +73,13 @@ if [[ -f "$INSTALL_DIR/index.html" ]]; then
 fi
 
 # 4. systemd unit
+EXTRA_FLAGS="--policy-mode $POLICY_MODE"
+if [[ -n "$TLS_CERT" && -n "$TLS_KEY" ]]; then
+  EXTRA_FLAGS="$EXTRA_FLAGS --tls-cert $TLS_CERT --tls-key $TLS_KEY"
+elif [[ "$TLS_AUTO" != "0" && "$TLS_AUTO" != "false" ]]; then
+  EXTRA_FLAGS="$EXTRA_FLAGS --tls-auto"
+fi
+
 echo "[sashimon] writing $SERVICE_FILE"
 cat >"$SERVICE_FILE" <<UNIT
 [Unit]
@@ -75,7 +89,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PY $INSTALL_DIR/sashimon.py --db $DATA_DIR/events.db --port $PORT --bind $BIND
+ExecStart=$PY $INSTALL_DIR/sashimon.py --db $DATA_DIR/events.db --port $PORT --bind $BIND $EXTRA_FLAGS
 Restart=always
 RestartSec=5
 User=root

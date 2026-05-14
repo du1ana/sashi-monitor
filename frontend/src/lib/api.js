@@ -33,4 +33,16 @@ export const api = {
     if (!r.ok) throw new Error('/api/clear ' + r.status);
     return r.json();
   },
+  policy:    () => j('/api/policy'),
+  setPolicy: async (mode) => {
+    const r = await fetch('/api/policy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+      cache: 'no-store',
+    });
+    if (!r.ok) throw new Error('/api/policy ' + r.status);
+    return r.json();
+  },
+  dbSize:    () => j('/api/db_size'),
 };

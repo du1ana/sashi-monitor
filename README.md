@@ -87,6 +87,34 @@ sudo python3 /opt/sashimon/sashimon.py \
 | `--bind`            | `SASHIMON_BIND`              | `0.0.0.0`                     |
 | `--sashi`           | `SASHIMON_SASHI`             | `sashi` (resolved via PATH)   |
 | `--retention-days`  | `SASHIMON_RETENTION_DAYS`    | `14`                          |
+| `--policy-mode`     | `SASHIMON_POLICY_MODE`       | `balanced`                    |
+| `--tls-cert`        | `SASHIMON_TLS_CERT`          | (none)                        |
+| `--tls-key`         | `SASHIMON_TLS_KEY`           | (none)                        |
+| `--tls-auto`        | `SASHIMON_TLS_AUTO`          | `1` (via install.sh)          |
+
+### DB tracking policy
+
+`policy_mode` controls how much the daemon records, especially during error
+spells. Persisted in the SQLite `settings` table; the dashboard exposes a
+dropdown next to the *clear dbs* button to flip it without restarting.
+
+| Mode       | Low-severity spell (consensus_lost / out_of_sync / warning)        | High-severity spell (fork_warn / error)           |
+|------------|---------------------------------------------------------------------|---------------------------------------------------|
+| `full`     | events stored, metrics boosted, diagnostic snapshots captured       | events stored, metrics boosted, snapshots         |
+| `balanced` | event flood dropped during spell; no metric boost; no snapshots     | events stored, metrics boosted, snapshots         |
+| `minimal`  | only ledger + fork-class events stored; no boost; no snapshots      | events stored, but no boost and no snapshots      |
+
+`ledger_created`, `fork_warn`, `error`, `hp_started`, `hp_stopped` are always
+persisted regardless of the gate, so health classification still works.
+Spells are still *opened* on every error tag — only what's stored on top of
+them changes.
+
+### TLS
+
+Pass `--tls-cert` / `--tls-key` (PEM) to serve HTTPS. With `--tls-auto`
+(default when installed via `install.sh`), if those flags are blank the
+daemon tries `/etc/sashimono/contract_template/cfg/tlscert.pem` +
+`tlskey.pem`; if either is missing it falls back to plain HTTP.
 
 ## HTTP API
 

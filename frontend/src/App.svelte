@@ -53,10 +53,61 @@
   let clearing = $state(false);
   let timer;
 
+  // Tracking policy + DB size.
+  // `full`: keep every event during every spell. `balanced` (default): drop
+  // low-severity event floods during a spell; only fork-class spells trigger
+  // metric boost + diagnostic snapshots. `minimal`: only store fork-class
+  // events; never boost or snapshot.
+  let policyMode    = $state('balanced');
+  let policyModes   = $state(['balanced', 'full', 'minimal']);
+  let dbSizeHuman   = $state('—');
+  let dbSizeBytes   = $state(0);
+  let policySaving  = $state(false);
+
+  async function loadPolicy() {
+    try {
+      const p = await api.policy();
+      policyMode  = p.mode || 'balanced';
+      policyModes = Array.isArray(p.modes) && p.modes.length ? p.modes : ['balanced', 'full', 'minimal'];
+    } catch {}
+  }
+  async function loadDbSize() {
+    try {
+      const s = await api.dbSize();
+      dbSizeHuman = s.human || '—';
+      dbSizeBytes = s.bytes || 0;
+    } catch {}
+  }
+  async function changePolicy(next) {
+    if (next === policyMode || policySaving) return;
+    const prev = policyMode;
+    policyMode = next;
+    policySaving = true;
+    try {
+      await api.setPolicy(next);
+    } catch (e) {
+      policyMode = prev;
+      err = 'policy: ' + (e.message || e);
+    } finally {
+      policySaving = false;
+    }
+  }
+
+  const POLICY_LABELS = {
+    full:     'Full — record everything',
+    balanced: 'Balanced — slim low-impact spells',
+    minimal:  'Minimal — fork-class only',
+  };
+  const POLICY_HINTS = {
+    full:     'Every event stored; every spell boosts metrics + captures diagnostic snapshots.',
+    balanced: 'Default. Low-impact spells (consensus_lost, out_of_sync, warning) drop their event flood and skip metric-boost + snapshots. Forks get the full treatment.',
+    minimal:  'Only ledger + fork-class events are stored. Never boosts metrics, never captures snapshots.',
+  };
+
   async function clearDb() {
     if (clearing) return;
     const ok = typeof confirm === 'function' && confirm(
-      'Clear all monitoring data?\n\n' +
+      `Clear all monitoring data (${dbSizeHuman})?\n\n` +
       'This wipes every event and instance row from the database. ' +
       'Tail processes keep running, so live instances reappear within ~30s.\n\n' +
       'This cannot be undone.'
@@ -64,14 +115,15 @@
     if (!ok) return;
     clearing = true;
     try {
-      await api.clearAll();
+      const result = await api.clearAll();
+      if (result && result.db_size_human) dbSizeHuman = result.db_size_human;
       // Reset client state so cards/charts vanish immediately.
       summary = [];
       globalBuckets = [];
       perInstanceBuckets = {};
       perInstanceSpells = {};
       err = '';
-      await refresh();
+      await Promise.all([refresh(), loadDbSize()]);
     } catch (e) {
       err = String(e.message || e);
     } finally {
@@ -150,8 +202,16 @@
   onMount(() => {
     refresh();
     reschedule();
+    loadPolicy();
+    loadDbSize();
   });
   onDestroy(() => clearInterval(timer));
+
+  // Refresh DB size on the same cadence as the main refresh (cheap stat call).
+  $effect(() => {
+    void lastUpdate;
+    loadDbSize();
+  });
 
   // Re-run when window or granularity changes.
   $effect(() => {
@@ -176,6 +236,20 @@
     <div class="hdr-meta dim">
       {#if lastUpdate}updated {fmtTime(lastUpdate / 1000)}{:else}—{/if}
       {#if err}<span class="err-pill" title={err}>error</span>{/if}
+      <label class="policy" title={POLICY_HINTS[policyMode] || ''}>
+        <span class="policy-k">Tracking</span>
+        <select
+          class="policy-sel"
+          value={policyMode}
+          onchange={(e) => changePolicy(e.currentTarget.value)}
+          disabled={policySaving}
+          aria-label="DB tracking policy"
+        >
+          {#each policyModes as m}
+            <option value={m}>{POLICY_LABELS[m] || m}</option>
+          {/each}
+        </select>
+      </label>
       <button
         class="danger-btn"
         onclick={clearDb}
@@ -190,6 +264,7 @@
           <path d="M10 11v6"/><path d="M14 11v6"/>
         </svg>
         <span>{clearing ? 'Clearing…' : 'Clear DB'}</span>
+        <span class="db-size" aria-label="current db size">({dbSizeHuman})</span>
       </button>
     </div>
   </header>
@@ -371,6 +446,45 @@
   .danger-btn:active:not(:disabled) { transform: scale(0.97); }
   .danger-btn:disabled { opacity: 0.55; cursor: progress; }
   .danger-btn svg { color: var(--fg-dim); }
+  .db-size {
+    margin-left: 2px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 500;
+    color: var(--fg-dim);
+    font-size: 10.5px;
+    letter-spacing: 0.01em;
+  }
+  .danger-btn:hover:not(:disabled) .db-size { color: #ff97a2; opacity: 0.85; }
+
+  .policy {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 8px 4px 10px;
+    background: var(--bg-2);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    font-size: 10.5px;
+    color: var(--fg-muted);
+    transition: border-color .15s, background .15s;
+  }
+  .policy:hover { border-color: var(--line-2, var(--line)); }
+  .policy-k {
+    font-size: 9.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--fg-dim);
+  }
+  .policy-sel {
+    background: transparent;
+    color: var(--fg);
+    border: 0;
+    padding: 1px 4px 1px 0;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    outline: none;
+    font-family: inherit;
+  }
+  .policy-sel:disabled { opacity: 0.55; cursor: progress; }
+  .policy-sel option { background: var(--bg-1); color: var(--fg); }
 
   /* ---- KPIs ---- */
   .kpis {
