@@ -11,6 +11,12 @@ Designed to run as root via systemd. No external Python deps required;
 stdlib only.
 """
 
+# Make all PEP-604 (`X | Y`) annotations lazy strings so this file imports
+# cleanly on Python 3.8 / 3.9 (e.g. Ubuntu 20.04, which is the default
+# Sashimono host OS). Runtime type checks here use isinstance/get(), never
+# the annotation objects themselves, so PEP 563 is safe.
+from __future__ import annotations
+
 import argparse
 import json
 import os
