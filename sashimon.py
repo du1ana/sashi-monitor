@@ -465,7 +465,22 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Discovered clusters (grouping of instances by Sashimono contract_id). The
+-- daemon only tails instances whose cluster is marked monitored=1; everything
+-- else is still listed (so the operator can opt in from the dashboard) but
+-- not consuming pty resources.
+CREATE TABLE IF NOT EXISTS clusters (
+    contract_id  TEXT PRIMARY KEY,
+    label        TEXT,
+    monitored    INTEGER NOT NULL DEFAULT 0,
+    first_seen   REAL,
+    last_seen    REAL
+);
 """
+
+# Sentinel contract id for instances missing a real contract_id field.
+NO_CONTRACT_ID = "_unknown"
 
 
 class Store:
@@ -533,12 +548,16 @@ class Store:
         until: float | None = None,
         tag: str | None = None,
         limit: int = 5000,
+        contract_id: str | None = None,
     ) -> list[dict]:
         q = ("SELECT instance, ts, level, module, tag, msg "
              "FROM events WHERE 1=1")
         args: list = []
         if instance:
             q += " AND instance=?"; args.append(instance)
+        if contract_id:
+            q += " AND instance IN (SELECT name FROM instances WHERE contract_id=?)"
+            args.append(contract_id)
         if since is not None:
             q += " AND ts>=?";       args.append(since)
         if until is not None:
@@ -638,6 +657,7 @@ class Store:
         since: float,
         until: float,
         bucket_seconds: int,
+        contract_id: str | None = None,
     ) -> list[dict]:
         """Tag counts per time bucket for charting."""
         q = (
@@ -648,6 +668,9 @@ class Store:
         if instance:
             q += "AND instance=? "
             args.append(instance)
+        if contract_id:
+            q += "AND instance IN (SELECT name FROM instances WHERE contract_id=?) "
+            args.append(contract_id)
         q += "GROUP BY bkt, tag ORDER BY bkt"
         with self.lock:
             rows = self.conn.execute(q, args).fetchall()
@@ -657,18 +680,27 @@ class Store:
             slot[tag] = cnt
         return [out[k] for k in sorted(out)]
 
-    def summary(self, window_seconds: int = 3600, roundtime_ms: int = DEFAULT_ROUNDTIME_MS) -> list[dict]:
+    def summary(self, window_seconds: int = 3600,
+                roundtime_ms: int = DEFAULT_ROUNDTIME_MS,
+                contract_id: str | None = None) -> list[dict]:
         """window_seconds=0 means all-time. roundtime_ms drives the uptime-%
-        denominator (one ledger expected per roundtime)."""
+        denominator (one ledger expected per roundtime). Optional contract_id
+        scopes the summary to a single cluster."""
         now = time.time()
         round_s = max(0.5, roundtime_ms / 1000.0)
         all_time = (window_seconds <= 0)
         since = 0.0 if all_time else now - window_seconds
         results: list[dict] = []
         with self.lock:
-            inst_rows = self.conn.execute(
-                "SELECT name, status FROM instances ORDER BY name"
-            ).fetchall()
+            if contract_id:
+                inst_rows = self.conn.execute(
+                    "SELECT name, status FROM instances "
+                    "WHERE contract_id=? ORDER BY name", (contract_id,)
+                ).fetchall()
+            else:
+                inst_rows = self.conn.execute(
+                    "SELECT name, status FROM instances ORDER BY name"
+                ).fetchall()
             for name, sashi_status in inst_rows:
                 cnt_rows = self.conn.execute(
                     "SELECT tag, COUNT(*) FROM events "
@@ -843,13 +875,17 @@ class Store:
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     def spells_log_window(self, since: float, until: float | None = None,
-                          instance: str | None = None, limit: int = 500) -> list[dict]:
+                          instance: str | None = None, limit: int = 500,
+                          contract_id: str | None = None) -> list[dict]:
         if until is None:
             until = time.time()
         q = "SELECT * FROM spells_log WHERE start_ts>=? AND start_ts<=?"
         args: list = [since, until]
         if instance:
             q += " AND instance=?"; args.append(instance)
+        if contract_id:
+            q += " AND instance IN (SELECT name FROM instances WHERE contract_id=?)"
+            args.append(contract_id)
         q += " ORDER BY start_ts DESC LIMIT ?"; args.append(limit)
         now = time.time()
         with self.lock:
@@ -906,6 +942,99 @@ class Store:
                 "DELETE FROM spells_log WHERE COALESCE(end_ts, start_ts) < ?", (cutoff,))
             self.conn.commit()
             return cur.rowcount
+
+    # ---- clusters -----------------------------------------------------
+
+    def upsert_cluster(self, contract_id: str, label: str | None = None) -> None:
+        """Record a cluster the daemon has seen. `monitored` defaults to 0
+        for any newly-discovered cluster; the operator opts in from the UI."""
+        now = time.time()
+        with self.lock:
+            self.conn.execute(
+                """
+                INSERT INTO clusters (contract_id, label, monitored, first_seen, last_seen)
+                VALUES (?, ?, 0, ?, ?)
+                ON CONFLICT(contract_id) DO UPDATE SET
+                  label     = COALESCE(excluded.label, clusters.label),
+                  last_seen = excluded.last_seen
+                """,
+                (contract_id, label, now, now),
+            )
+            self.conn.commit()
+
+    def set_cluster_monitored(self, contract_id: str, monitored: bool) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE clusters SET monitored=? WHERE contract_id=?",
+                (1 if monitored else 0, contract_id),
+            )
+            self.conn.commit()
+
+    def cluster_monitored_set(self) -> set[str]:
+        with self.lock:
+            return {r[0] for r in self.conn.execute(
+                "SELECT contract_id FROM clusters WHERE monitored=1"
+            )}
+
+    def list_clusters(self) -> list[dict]:
+        """Return clusters with rolled-up instance metadata. Cheaper than a
+        join via the dashboard because this runs once on demand."""
+        with self.lock:
+            cluster_rows = self.conn.execute(
+                "SELECT contract_id, label, monitored, first_seen, last_seen "
+                "FROM clusters ORDER BY monitored DESC, last_seen DESC"
+            ).fetchall()
+            inst_rows = self.conn.execute(
+                "SELECT name, contract_id, tenant, image, status, last_seen "
+                "FROM instances ORDER BY name"
+            ).fetchall()
+        by_cid: dict[str, list[dict]] = {}
+        for name, cid, tenant, image, status, last_seen in inst_rows:
+            by_cid.setdefault(cid or NO_CONTRACT_ID, []).append({
+                "name": name, "tenant": tenant, "image": image,
+                "status": status, "last_seen": last_seen,
+            })
+        out = []
+        seen_cids = set()
+        for cid, label, monitored, first_seen, last_seen in cluster_rows:
+            seen_cids.add(cid)
+            insts = by_cid.get(cid, [])
+            tenants = sorted({i["tenant"] for i in insts if i.get("tenant")})
+            images  = sorted({i["image"]  for i in insts if i.get("image")})
+            out.append({
+                "contract_id": cid,
+                "label":       label,
+                "monitored":   bool(monitored),
+                "first_seen":  first_seen,
+                "last_seen":   last_seen,
+                "node_count":  len(insts),
+                "tenants":     tenants,
+                "images":      images,
+                "instances":   insts,
+            })
+        # Surface instances whose contract_id has no row in `clusters` yet
+        # (race condition between upserts) so the UI never hides them.
+        for cid, insts in by_cid.items():
+            if cid in seen_cids:
+                continue
+            out.append({
+                "contract_id": cid,
+                "label":       None,
+                "monitored":   False,
+                "first_seen":  None,
+                "last_seen":   max((i.get("last_seen") or 0) for i in insts) if insts else None,
+                "node_count":  len(insts),
+                "tenants":     sorted({i["tenant"] for i in insts if i.get("tenant")}),
+                "images":      sorted({i["image"]  for i in insts if i.get("image")}),
+                "instances":   insts,
+            })
+        return out
+
+    def instance_names_for_cluster(self, contract_id: str) -> list[str]:
+        with self.lock:
+            return [r[0] for r in self.conn.execute(
+                "SELECT name FROM instances WHERE contract_id=?", (contract_id,)
+            )]
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         with self.lock:
@@ -1006,16 +1135,25 @@ class PolicyManager:
 
 class Tail(threading.Thread):
     def __init__(self, instance: str, store: Store, stop_event: threading.Event,
-                 sashi_bin: str, spell_manager=None, policy: "PolicyManager | None" = None):
+                 sashi_bin: str, spell_manager=None, policy: "PolicyManager | None" = None,
+                 contract_id: str | None = None):
         super().__init__(daemon=True, name=f"tail-{instance[:12]}")
         self.instance = instance
+        self.contract_id = contract_id
         self.store = store
+        # `stop_event` is the global daemon stop; `local_stop` is set when this
+        # tail alone should die (cluster un-monitored at runtime). Either one
+        # exits the loop.
         self.stop_event = stop_event
+        self.local_stop = threading.Event()
         self.sashi_bin = sashi_bin
         self.spell_manager = spell_manager
         self.policy = policy
         self.proc: subprocess.Popen | None = None
         self.master_fd: int | None = None
+
+    def _should_stop(self) -> bool:
+        return self.stop_event.is_set() or self.local_stop.is_set()
 
     def _start_proc(self) -> None:
         master, slave = pty.openpty()
@@ -1029,12 +1167,12 @@ class Tail(threading.Thread):
 
     def run(self) -> None:
         backoff = 1.0
-        while not self.stop_event.is_set():
+        while not self._should_stop():
             try:
                 self._start_proc()
                 buf = b""
                 backoff = 1.0
-                while not self.stop_event.is_set():
+                while not self._should_stop():
                     rlist, _, _ = select.select([self.master_fd], [], [], 1.0)
                     if not rlist:
                         if self.proc.poll() is not None:
@@ -1082,8 +1220,11 @@ class Tail(threading.Thread):
             finally:
                 self._cleanup()
 
-            if not self.stop_event.is_set():
+            if not self._should_stop():
+                # Honour whichever signal trips first.
                 self.stop_event.wait(backoff)
+                if self.local_stop.is_set():
+                    break
                 backoff = min(backoff * 2, 30.0)
 
     def _cleanup(self) -> None:
@@ -1105,6 +1246,7 @@ class Tail(threading.Thread):
             self.master_fd = None
 
     def shutdown(self) -> None:
+        self.local_stop.set()
         self._cleanup()
 
 
@@ -1116,7 +1258,8 @@ class Discoverer(threading.Thread):
     def __init__(self, store: Store, tails: dict[str, Tail],
                  stop_event: threading.Event, sashi_bin: str,
                  interval: int = DISCOVER_INTERVAL, spell_manager=None,
-                 policy: "PolicyManager | None" = None):
+                 policy: "PolicyManager | None" = None,
+                 auto_monitor_new: bool = False):
         super().__init__(daemon=True, name="discover")
         self.store = store
         self.tails = tails
@@ -1125,36 +1268,115 @@ class Discoverer(threading.Thread):
         self.interval = interval
         self.spell_manager = spell_manager
         self.policy = policy
+        self.auto_monitor_new = auto_monitor_new
+        self._wake = threading.Event()
+
+    def trigger(self) -> None:
+        """Force the next discovery pass immediately. Called by /api/discover_now
+        and when the user toggles a cluster's monitored state from the UI."""
+        self._wake.set()
+
+    def discover_once(self) -> dict:
+        """Run one discovery pass; return {clusters_seen, instances_seen,
+        tails_started, tails_reaped}."""
+        try:
+            out = subprocess.check_output(
+                [self.sashi_bin, "list"], text=True, timeout=15,
+            )
+        except FileNotFoundError:
+            print(f"[discover] '{self.sashi_bin}' not found in PATH",
+                  file=sys.stderr)
+            return {"error": "sashi not found"}
+        except Exception as e:
+            print(f"[discover] {e}", file=sys.stderr)
+            return {"error": str(e)}
+
+        try:
+            instances = json.loads(out)
+        except Exception as e:
+            print(f"[discover] bad json: {e}", file=sys.stderr)
+            return {"error": f"bad json: {e}"}
+
+        seen_clusters: set[str] = set()
+        seen_instances: set[str] = set()
+        # First pass: persist everything we saw, so the UI can show all
+        # clusters even before they're monitored.
+        for ins in instances:
+            name = ins.get("name")
+            if not name:
+                continue
+            cid = ins.get("contract_id") or NO_CONTRACT_ID
+            seen_clusters.add(cid)
+            seen_instances.add(name)
+            self.store.upsert_instance(ins)
+            self.store.upsert_cluster(cid)
+
+        # Optionally flip newly-seen clusters to monitored=1 (initial-install
+        # convenience; off by default).
+        if self.auto_monitor_new and seen_clusters:
+            currently_monitored = self.store.cluster_monitored_set()
+            for cid in seen_clusters:
+                if cid not in currently_monitored:
+                    self.store.set_cluster_monitored(cid, True)
+
+        # Map instance->contract_id so we know which tails to keep.
+        inst_to_cid: dict[str, str] = {}
+        for ins in instances:
+            n = ins.get("name")
+            if n:
+                inst_to_cid[n] = ins.get("contract_id") or NO_CONTRACT_ID
+
+        monitored = self.store.cluster_monitored_set()
+        started = 0
+        reaped = 0
+
+        # Start tails for monitored, not-yet-tailed instances.
+        for name in seen_instances:
+            cid = inst_to_cid.get(name)
+            if cid in monitored and name not in self.tails:
+                t = Tail(name, self.store, self.stop_event, self.sashi_bin,
+                         spell_manager=self.spell_manager,
+                         policy=self.policy,
+                         contract_id=cid)
+                self.tails[name] = t
+                t.start()
+                started += 1
+                print(f"[discover] tailing {name[:16]} (cluster {cid[:12]})")
+
+        # Reap tails whose cluster is no longer monitored (or whose instance
+        # has vanished from `sashi list`).
+        for name in list(self.tails.keys()):
+            cid = inst_to_cid.get(name, self.tails[name].contract_id)
+            keep = (cid in monitored) and (name in seen_instances)
+            if not keep:
+                try:
+                    self.tails[name].shutdown()
+                except Exception:
+                    pass
+                self.tails.pop(name, None)
+                reaped += 1
+                print(f"[discover] dropped tail {name[:16]} (cluster {(cid or '?')[:12]} unmonitored)")
+
+        return {
+            "clusters_seen":  len(seen_clusters),
+            "instances_seen": len(seen_instances),
+            "tails_started":  started,
+            "tails_reaped":   reaped,
+        }
 
     def run(self) -> None:
         while not self.stop_event.is_set():
             try:
-                out = subprocess.check_output(
-                    [self.sashi_bin, "list"], text=True, timeout=15,
-                )
-                instances = json.loads(out)
-                seen = set()
-                for ins in instances:
-                    name = ins.get("name")
-                    if not name:
-                        continue
-                    seen.add(name)
-                    self.store.upsert_instance(ins)
-                    if name not in self.tails:
-                        t = Tail(name, self.store, self.stop_event, self.sashi_bin,
-                                 spell_manager=self.spell_manager,
-                                 policy=self.policy)
-                        self.tails[name] = t
-                        t.start()
-                        print(f"[discover] tailing {name[:16]}")
-                # We intentionally don't reap stopped instances' tails;
-                # they self-exit via the retry loop.
-            except FileNotFoundError:
-                print(f"[discover] '{self.sashi_bin}' not found in PATH",
-                      file=sys.stderr)
+                self.discover_once()
             except Exception as e:
                 print(f"[discover] {e}", file=sys.stderr)
-            self.stop_event.wait(self.interval)
+            # Sleep until interval elapses OR a manual trigger wakes us.
+            self._wake.clear()
+            waited = 0.0
+            step = 0.5
+            while waited < self.interval and not self.stop_event.is_set() and not self._wake.is_set():
+                self.stop_event.wait(step)
+                waited += step
 
 
 # --------------------------------------------------------------------------
@@ -1885,6 +2107,53 @@ DASHBOARD_HTML = r"""<!doctype html>
   .policy-ctl select { color: var(--accent); border-color: var(--line2);
                        text-transform: lowercase; letter-spacing: 0; }
   .policy-ctl select:disabled { opacity: .55; cursor: progress; }
+
+  /* --- cluster picker + filter --- */
+  #clusterPanel .pb { padding: 12px; }
+  .ph { display:flex; align-items:center; gap:10px; }
+  .clist { display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap:8px; }
+  .crow { display:flex; align-items:stretch; gap:0; background: var(--bg2);
+          border:1px solid var(--line); border-radius:5px; overflow:hidden;
+          font-family: var(--mono); transition: border-color .12s; }
+  .crow.mon { border-color: var(--ok-dim); }
+  .crow.act { border-color: var(--ok); box-shadow: inset 0 0 0 1px var(--ok); }
+  .crow .tg { flex:0 0 auto; display:flex; align-items:center; padding:0 12px;
+              background: var(--bg3); border-right:1px solid var(--line); cursor:pointer; }
+  .crow .tg input { display:none; }
+  .crow .tg .sw { width:30px; height:16px; border-radius:999px; background: var(--line);
+                  position:relative; transition: background .15s; }
+  .crow .tg .sw::after { content:''; position:absolute; left:2px; top:2px; width:12px; height:12px;
+                         border-radius:50%; background: var(--fg-dim); transition: transform .15s, background .15s; }
+  .crow .tg input:checked + .sw { background: var(--ok-dim); }
+  .crow .tg input:checked + .sw::after { transform: translateX(14px); background: var(--ok); }
+  .crow .info { flex:1 1 auto; padding:9px 12px; min-width:0; cursor:pointer; }
+  .crow .info:hover { background: rgba(255,255,255,.02); }
+  .crow .info:disabled, .crow .info.dis { cursor: default; opacity: .55; }
+  .crow .id-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap;
+                  font-size:11px; font-weight:600; color: var(--fg); }
+  .crow .id-row .cid { background:var(--bg); padding:1px 6px; border-radius:3px;
+                       font-size:10.5px; color:var(--fg); }
+  .crow .id-row .np  { font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px;
+                       background: rgba(91,102,122,.25); color: var(--fg-dim); }
+  .crow .id-row .np.hot { background: rgba(63,185,80,.18); color: var(--ok); }
+  .crow .meta-row { margin-top:3px; font-size:10px; color:var(--fg-dim); display:flex; gap:4px 12px; flex-wrap:wrap; }
+  .crow .meta-row b { font-size:9px; color:var(--fg-faint); text-transform:uppercase;
+                      letter-spacing:.05em; font-weight:700; margin-right:3px; }
+  .all-row { grid-column: 1 / -1; }
+  .all-row .info::before { content:"●"; color: var(--ok); margin-right:8px; }
+  .cluster-banner { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+                    padding:8px 12px; margin-bottom:14px;
+                    background: rgba(63,185,80,.06);
+                    border:1px solid var(--ok-dim); border-radius:4px;
+                    font-family: var(--mono); font-size: 11px; }
+  .cluster-banner .lbl { font-size:9px; color:var(--fg-dim); text-transform:uppercase;
+                         letter-spacing:.07em; }
+  .cluster-banner .cid { background: var(--bg); padding:2px 7px; border-radius:3px;
+                         color: var(--fg); word-break: break-all; }
+  .cluster-banner .clr { margin-left:auto; cursor:pointer; background:none;
+                         border:1px solid var(--line); color: var(--fg-dim);
+                         padding:2px 9px; border-radius:3px; font-family:inherit; font-size:10px; }
+  .cluster-banner .clr:hover { color: var(--fg); border-color: var(--line2); }
   .panel { margin-bottom: 18px; background: var(--bg1); border: 1px solid var(--line);
            border-radius: 4px; }
   .panel > .ph { padding: 9px 14px; border-bottom: 1px solid var(--line);
@@ -2133,6 +2402,23 @@ DASHBOARD_HTML = r"""<!doctype html>
     </label>
     <button id="export" title="download one plain-text report — every instance, every error spell, with the HotPocket log + journalctl + host metrics around each spell start; hand it to an analyst / LLM">export report</button>
     <button id="clearDb" class="danger" title="wipe ALL stored data: log events, host metrics, error spells & their artifacts, instances. Live tailing/sampling continues; history starts fresh.">clear dbs <span class="dbsz" id="dbSize">(—)</span></button>
+  </div>
+
+  <div id="clusterBanner" class="cluster-banner" style="display:none;">
+    <span class="lbl">viewing cluster</span>
+    <code class="cid" id="cbId"></code>
+    <span id="cbMeta"></span>
+    <button class="clr" id="cbClear">view all monitored ×</button>
+  </div>
+
+  <div class="panel" id="clusterPanel">
+    <div class="ph">
+      <h2>clusters</h2>
+      <span class="hint" id="clusterHint">discovered Sashimono clusters on this VM. tick to monitor; click row to scope dashboard.</span>
+      <span style="flex:1"></span>
+      <button id="discoverBtn" title="run `sashi list` now to refresh the cluster list">discover</button>
+    </div>
+    <div class="pb" id="clusterList"></div>
   </div>
 
   <div id="statusbar" title="host status — click to jump to host metrics"></div>
@@ -2416,7 +2702,7 @@ async function refreshHost(win) {
     [machine, procRows, spells] = await Promise.all([
       fetchJSON(`/api/host_metrics?instance=machine&window=${win}`),
       fetchJSON(`/api/host_metrics?window=${win}&limit=20000`),
-      fetchJSON(`/api/spells_log?window=86400`),
+      fetchJSON(`/api/spells_log?window=86400` + clusterQS()),
     ]);
   } catch (e) { document.getElementById('hostMeta').textContent = 'host: ' + e.message; return; }
   machine = machine.slice().reverse();                 // API returns DESC
@@ -2767,8 +3053,8 @@ async function refresh() {
   const bucketSec = +document.getElementById('bucket').value || 60;
 
   const [summary, globalBuckets] = await Promise.all([
-    fetchJSON('/api/summary?window=' + wp),
-    fetchJSON(`/api/histogram?window=${wp}&bucket=${bucketSec}`),
+    fetchJSON('/api/summary?window=' + wp + clusterQS()),
+    fetchJSON(`/api/histogram?window=${wp}&bucket=${bucketSec}` + clusterQS()),
   ]);
   // populate the host panel + LAST_SPELLS / LAST_PROC_LATEST before rendering cards
   try { await refreshHost(wp); }
@@ -2820,7 +3106,7 @@ async function refresh() {
     renderCardSpells(card, inst.name);
 
     const buckets = await fetchJSON(
-      `/api/histogram?window=${wp}&bucket=${bucketSec}&instance=${encodeURIComponent(inst.name)}`);
+      `/api/histogram?window=${wp}&bucket=${bucketSec}&instance=${encodeURIComponent(inst.name)}` + clusterQS());
     LAST_INST_BUCKETS[inst.name] = buckets;
     const data = buildBarDatasets(buckets);
     if (!charts[inst.name]) charts[inst.name] = new Chart(document.getElementById('ch-' + inst.name), { type:'bar', data, options: barOpts() });
@@ -2843,6 +3129,149 @@ function scheduleRefresh() {
   const ms = +document.getElementById('refresh').value;
   if (ms > 0) timer = setInterval(refresh, ms);
 }
+
+// ---- cluster picker + filter ----------------------------------------
+let ACTIVE_CLUSTER = (function(){
+  try { const v = localStorage.getItem('sashimon.cluster'); return (v && v !== '__all__') ? v : null; }
+  catch { return null; }
+})();
+let CLUSTERS = [];
+
+function clusterQS() { return ACTIVE_CLUSTER ? ('&contract_id=' + encodeURIComponent(ACTIVE_CLUSTER)) : ''; }
+
+function shortCid(id) {
+  if (!id) return '—';
+  if (id === '_unknown') return '(no contract_id)';
+  return id.length > 16 ? id.slice(0,8) + '…' + id.slice(-4) : id;
+}
+function shortHash(s) {
+  if (!s) return '—';
+  return s.length > 14 ? s.slice(0,6) + '…' + s.slice(-4) : s;
+}
+function shortImage(s) {
+  if (!s) return '';
+  return s.replace(/^evernode(?:dev)?\//, '');
+}
+
+function setActiveCluster(cid) {
+  ACTIVE_CLUSTER = cid || null;
+  try { localStorage.setItem('sashimon.cluster', ACTIVE_CLUSTER || ''); } catch {}
+  updateClusterBanner();
+  renderClusters();
+  hardReload();
+}
+
+function updateClusterBanner() {
+  const banner = document.getElementById('clusterBanner');
+  if (!banner) return;
+  if (!ACTIVE_CLUSTER) { banner.style.display = 'none'; return; }
+  const c = CLUSTERS.find(x => x.contract_id === ACTIVE_CLUSTER);
+  banner.style.display = '';
+  document.getElementById('cbId').textContent = ACTIVE_CLUSTER;
+  document.getElementById('cbMeta').textContent = c
+    ? `· ${c.node_count} node${c.node_count===1?'':'s'}${c.images && c.images.length ? ' · ' + shortImage(c.images[0]) : ''}`
+    : '';
+}
+
+async function loadClusters() {
+  try {
+    CLUSTERS = await fetchJSON('/api/clusters');
+    // If active cluster vanished or is unmonitored, fall back to All.
+    if (ACTIVE_CLUSTER) {
+      const c = CLUSTERS.find(x => x.contract_id === ACTIVE_CLUSTER);
+      if (!c || !c.monitored) ACTIVE_CLUSTER = null;
+    }
+    renderClusters();
+    updateClusterBanner();
+  } catch (e) {
+    const host = document.getElementById('clusterList');
+    if (host) host.innerHTML = '<div style="color:var(--bad);font-family:var(--mono);font-size:11px">' + esc(e.message || String(e)) + '</div>';
+  }
+}
+
+function renderClusters() {
+  const host = document.getElementById('clusterList');
+  if (!host) return;
+  if (!CLUSTERS.length) {
+    host.innerHTML = '<div style="color:var(--fg-dim);font-family:var(--mono);font-size:11px">no clusters discovered yet — click <b>discover</b> above</div>';
+    return;
+  }
+  const sorted = CLUSTERS.slice().sort((a,b) =>
+    (Number(b.monitored)-Number(a.monitored)) || (b.node_count-a.node_count)
+    || ((b.last_seen||0)-(a.last_seen||0))
+  );
+  const monNodes = sorted.filter(c=>c.monitored).reduce((a,c)=>a+(c.node_count||0),0);
+  const monCount = sorted.filter(c=>c.monitored).length;
+  let html = '<div class="clist">';
+  html += `<div class="crow all-row${ACTIVE_CLUSTER==null?' act':''}">` +
+    `<div class="info" data-cid="" title="show every monitored cluster">` +
+    `<div class="id-row"><b>All monitored</b><span class="np${monNodes>0?' hot':''}">${monCount} clusters · ${monNodes} nodes</span></div>` +
+    `</div></div>`;
+  for (const c of sorted) {
+    const cls = (c.monitored?'mon ':'') + (ACTIVE_CLUSTER===c.contract_id?'act':'');
+    const tenants = (c.tenants||[]).map(shortHash).join(', ');
+    const images  = (c.images||[]).map(shortImage).join(', ');
+    const seen = c.last_seen ? new Date(c.last_seen*1000).toLocaleString() : '';
+    html += `<div class="crow ${cls}">` +
+      `<label class="tg" data-cid="${esc(c.contract_id)}" title="${c.monitored?'stop monitoring':'start monitoring'}">` +
+        `<input type="checkbox"${c.monitored?' checked':''}><span class="sw"></span></label>` +
+      `<div class="info${c.monitored?'':' dis'}" data-cid="${esc(c.contract_id)}" title="${c.monitored?'scope dashboard to this cluster':'monitor this cluster first'}">` +
+        `<div class="id-row">` +
+          `<span class="cid">${esc(shortCid(c.contract_id))}</span>` +
+          `<span class="np${c.node_count>0?' hot':''}">${c.node_count} node${c.node_count===1?'':'s'}</span>` +
+        `</div>` +
+        `<div class="meta-row">` +
+          (tenants?`<span><b>tenant</b>${esc(tenants)}</span>`:'') +
+          (images?`<span><b>image</b>${esc(images)}</span>`:'') +
+          (seen?`<span><b>seen</b>${esc(seen)}</span>`:'') +
+        `</div>` +
+      `</div></div>`;
+  }
+  html += '</div>';
+  host.innerHTML = html;
+  host.querySelectorAll('.tg input').forEach(inp => {
+    inp.onchange = async (e) => {
+      const cid = inp.closest('.tg').dataset.cid;
+      const want = inp.checked;
+      inp.disabled = true;
+      try {
+        await fetch('/api/clusters/monitor', {
+          method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({contract_id: cid, monitored: want}),
+        });
+        await loadClusters();
+        if (!want && ACTIVE_CLUSTER === cid) setActiveCluster(null);
+        else hardReload();
+      } catch (err) {
+        alert('cluster toggle failed: ' + err.message);
+        inp.checked = !want;
+      } finally { inp.disabled = false; }
+    };
+  });
+  host.querySelectorAll('.info[data-cid]').forEach(el => {
+    el.onclick = () => {
+      const cid = el.dataset.cid;
+      if (cid && el.classList.contains('dis')) return;
+      setActiveCluster(cid || null);
+    };
+  });
+}
+
+document.getElementById('discoverBtn').onclick = async () => {
+  const btn = document.getElementById('discoverBtn');
+  const prev = btn.textContent; btn.textContent = 'discovering…'; btn.disabled = true;
+  try {
+    const r = await fetch('/api/discover_now', { method:'POST' });
+    await r.json().catch(()=>({}));
+    await loadClusters();
+    hardReload();
+  } catch (e) { alert('discover failed: ' + e.message); }
+  btn.textContent = prev; btn.disabled = false;
+};
+document.getElementById('cbClear').onclick = () => setActiveCluster(null);
+
+loadClusters();
+setInterval(loadClusters, 30000);
 
 // ---- DB tracking policy + db-size badge -----------------------------
 async function loadPolicy() {
@@ -2978,7 +3407,8 @@ def make_handler(store: Store, static_html_path: str | None,
                  spell_manager: "SpellManager | None" = None,
                  sashi_bin: str = "sashi",
                  report_peers: list | None = None,
-                 policy: "PolicyManager | None" = None):
+                 policy: "PolicyManager | None" = None,
+                 discoverer: "Discoverer | None" = None):
     hostname = socket.gethostname()
 
     class Handler(BaseHTTPRequestHandler):
@@ -3023,9 +3453,14 @@ def make_handler(store: Store, static_html_path: str | None,
                 self._json(store.list_instances())
                 return
 
+            if u.path == "/api/clusters":
+                self._json(store.list_clusters())
+                return
+
             if u.path == "/api/summary":
                 w = _parse_window(qs.get("window", [None])[0])
-                self._json(store.summary(w, roundtime_ms))
+                cid = qs.get("contract_id", [None])[0]
+                self._json(store.summary(w, roundtime_ms, contract_id=cid))
                 return
 
             if u.path == "/api/events":
@@ -3034,20 +3469,24 @@ def make_handler(store: Store, static_html_path: str | None,
                 until = float(qs["until"][0]) if "until" in qs else None
                 tag = qs.get("tag", [None])[0]
                 limit = int(qs.get("limit", ["2000"])[0])
-                self._json(store.events_window(inst, since, until, tag, limit))
+                cid = qs.get("contract_id", [None])[0]
+                self._json(store.events_window(inst, since, until, tag, limit,
+                                               contract_id=cid))
                 return
 
             if u.path == "/api/histogram":
                 inst = qs.get("instance", [None])[0]
                 window = _parse_window(qs.get("window", [None])[0])
                 bucket = int(qs.get("bucket", ["60"])[0])
+                cid = qs.get("contract_id", [None])[0]
                 until = time.time()
                 if window <= 0:
                     earliest = store.earliest_event_ts(inst)
                     since = earliest if earliest is not None else until - 60
                 else:
                     since = until - window
-                self._json(store.histogram(inst, since, until, bucket))
+                self._json(store.histogram(inst, since, until, bucket,
+                                           contract_id=cid))
                 return
 
             if u.path == "/api/spells":
@@ -3102,10 +3541,12 @@ def make_handler(store: Store, static_html_path: str | None,
             if u.path == "/api/spells_log":
                 inst = qs.get("instance", [None])[0]
                 window = _parse_window(qs.get("window", [None])[0])
+                cid = qs.get("contract_id", [None])[0]
                 until = time.time()
                 since = (until - 86400.0) if window <= 0 else (until - window)
                 limit = int(qs.get("limit", ["500"])[0])
-                self._json(store.spells_log_window(since, until, inst, limit))
+                self._json(store.spells_log_window(since, until, inst, limit,
+                                                   contract_id=cid))
                 return
 
             if u.path == "/api/spell_artifacts":
@@ -3164,6 +3605,49 @@ def make_handler(store: Store, static_html_path: str | None,
 
         def do_POST(self) -> None:  # noqa: N802
             u = urlparse(self.path)
+
+            if u.path == "/api/clusters/monitor":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except Exception:
+                    self._json({"ok": False, "error": "bad json body"}, code=400)
+                    return
+                # Accept either { contract_id, monitored } or { contract_ids:[...], monitored }
+                cids = body.get("contract_ids")
+                if not cids:
+                    cid = body.get("contract_id")
+                    cids = [cid] if cid else []
+                if not cids:
+                    self._json({"ok": False, "error": "no contract_id(s)"}, code=400)
+                    return
+                monitored = bool(body.get("monitored", True))
+                for cid in cids:
+                    if not isinstance(cid, str):
+                        continue
+                    store.upsert_cluster(cid)
+                    store.set_cluster_monitored(cid, monitored)
+                # Trigger an immediate discover pass so tails spawn/reap now.
+                if discoverer is not None:
+                    discoverer.trigger()
+                self._json({"ok": True, "monitored": monitored,
+                            "contract_ids": cids})
+                return
+
+            if u.path == "/api/discover_now":
+                # Drain any body.
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 0:
+                    try: self.rfile.read(length)
+                    except Exception: pass
+                if discoverer is None:
+                    self._json({"ok": False, "error": "discoverer disabled"},
+                               code=500)
+                    return
+                result = discoverer.discover_once()
+                self._json({"ok": "error" not in result, **result})
+                return
 
             if u.path == "/api/policy":
                 length = int(self.headers.get("Content-Length") or 0)
@@ -3303,6 +3787,12 @@ def main() -> None:
                          "contract template defaults "
                          "(/etc/sashimono/contract_template/cfg/tls{cert,key}.pem). "
                          "Silently falls back to plain HTTP if those don't exist.")
+    ap.add_argument("--auto-monitor-new", action="store_true",
+                    default=(os.environ.get("SASHIMON_AUTO_MONITOR_NEW", "") not in ("", "0", "false")),
+                    help="Automatically start monitoring newly-discovered "
+                         "clusters. Default off: operator opts in per cluster "
+                         "from the dashboard. Existing installs that want the "
+                         "old 'tail everything' behaviour can set this.")
     args = ap.parse_args()
 
     sashi_path = shutil.which(args.sashi) or args.sashi
@@ -3341,8 +3831,10 @@ def main() -> None:
         metrics.tick_cb = spell_mgr.tick
         metrics.start()
 
-    Discoverer(store, tails, stop, sashi_path, spell_manager=spell_mgr,
-               policy=policy).start()
+    discoverer = Discoverer(store, tails, stop, sashi_path,
+                            spell_manager=spell_mgr, policy=policy,
+                            auto_monitor_new=args.auto_monitor_new)
+    discoverer.start()
     Pruner(store, stop, args.retention_days).start()
 
     server = ThreadingHTTPServer(
@@ -3350,7 +3842,8 @@ def main() -> None:
         make_handler(store, static_path or None,
                      roundtime_ms=args.roundtime_ms, metrics=metrics,
                      spell_manager=spell_mgr, sashi_bin=sashi_path,
-                     report_peers=report_peers, policy=policy),
+                     report_peers=report_peers, policy=policy,
+                     discoverer=discoverer),
     )
 
     # ---- TLS wrap (optional) ------------------------------------------

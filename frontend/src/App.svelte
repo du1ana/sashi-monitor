@@ -7,6 +7,7 @@
   import TagFilter from './lib/TagFilter.svelte';
   import WindowPicker from './lib/WindowPicker.svelte';
   import EventDrawer from './lib/EventDrawer.svelte';
+  import ClusterPicker from './lib/ClusterPicker.svelte';
   import { fmtNum, fmtTime } from './lib/format.js';
 
   let windowVal = $state(
@@ -93,6 +94,44 @@
     }
   }
 
+  // Cluster discovery / monitoring.
+  function _initialCluster() {
+    if (typeof localStorage === 'undefined') return null;
+    const v = localStorage.getItem('sashimon.cluster');
+    return v && v !== '__all__' ? v : null;
+  }
+  let clusters = $state([]);
+  let activeCluster = $state(_initialCluster());
+  let clustersLoaded = $state(false);
+
+  async function loadClusters() {
+    try {
+      clusters = await api.clusters();
+      // If the previously-selected cluster is gone (or now unmonitored), fall
+      // back to "all monitored".
+      if (activeCluster) {
+        const c = clusters.find(x => x.contract_id === activeCluster);
+        if (!c || !c.monitored) activeCluster = null;
+      }
+    } catch (e) {
+      err = 'clusters: ' + (e.message || e);
+    } finally {
+      clustersLoaded = true;
+    }
+  }
+
+  function onClusterChange() {
+    // Toggle/select happened in ClusterPicker — refresh data + persist filter.
+    try { localStorage.setItem('sashimon.cluster', activeCluster || ''); } catch {}
+    loadClusters();
+    refresh();
+  }
+
+  let monitoredClusters = $derived(clusters.filter(c => c.monitored));
+  let activeClusterMeta = $derived(
+    activeCluster ? clusters.find(c => c.contract_id === activeCluster) : null
+  );
+
   const POLICY_LABELS = {
     full:     'Full — record everything',
     balanced: 'Balanced — slim low-impact spells',
@@ -143,17 +182,37 @@
   async function refresh() {
     try {
       const w = windowVal;
+      const cid = activeCluster || undefined;
       const [s, gb] = await Promise.all([
-        api.summary(w),
-        api.histogram(w, bucketSec),
+        api.summary(w, cid),
+        api.histogram(w, bucketSec, undefined, cid),
       ]);
-      summary = s;
+      // Scope to monitored clusters only — when no cluster filter is set,
+      // the backend's /api/summary returns *every* instance (including ones
+      // whose cluster is unmonitored but still in the `instances` table).
+      // Filter those out client-side so the "All monitored" view is honest.
+      let s2 = s;
+      if (!cid) {
+        const monitoredIds = new Set(clusters.filter(c => c.monitored).map(c => c.contract_id));
+        // If we don't know cluster→instance mapping (no clusters loaded yet), keep all.
+        if (monitoredIds.size) {
+          const nameToCid = new Map();
+          for (const c of clusters) {
+            for (const i of (c.instances || [])) nameToCid.set(i.name, c.contract_id);
+          }
+          s2 = s.filter(inst => {
+            const cidOf = nameToCid.get(inst.name);
+            return cidOf == null || monitoredIds.has(cidOf);
+          });
+        }
+      }
+      summary = s2;
       globalBuckets = gb;
 
       // Per-instance histograms + spells (parallel per-instance, parallel per-call).
       const nextB = {};
       const nextS = {};
-      await Promise.all(s.map(async (inst) => {
+      await Promise.all(s2.map(async (inst) => {
         const [b, sp] = await Promise.all([
           api.histogram(w, bucketSec, inst.name),
           api.spells({ instance: inst.name, window: w }),
@@ -199,7 +258,8 @@
   let totalLedgers = $derived(aggCounts.ledger_created || 0);
   let totalErrors  = $derived((aggCounts.error || 0) + (aggCounts.fork_warn || 0) + (aggCounts.consensus_lost || 0));
 
-  onMount(() => {
+  onMount(async () => {
+    await loadClusters();
     refresh();
     reschedule();
     loadPolicy();
@@ -221,6 +281,11 @@
   });
   $effect(() => { void granularity; refresh(); });
   $effect(() => { void refreshMs; reschedule(); });
+  $effect(() => {
+    void activeCluster;
+    try { localStorage.setItem('sashimon.cluster', activeCluster || ''); } catch {}
+    refresh();
+  });
 </script>
 
 <div class="app">
@@ -268,6 +333,20 @@
       </button>
     </div>
   </header>
+
+  <ClusterPicker bind:clusters bind:activeId={activeCluster} onChange={onClusterChange} />
+
+  {#if activeClusterMeta}
+    <div class="cluster-banner">
+      <span class="cb-label">Viewing cluster</span>
+      <code class="cb-id">{activeClusterMeta.contract_id}</code>
+      <span class="cb-meta dim">
+        {activeClusterMeta.node_count} node{activeClusterMeta.node_count === 1 ? '' : 's'}
+        {#if activeClusterMeta.images?.length} · {activeClusterMeta.images[0]}{/if}
+      </span>
+      <button class="cb-clear" onclick={() => { activeCluster = null; }}>view all monitored ×</button>
+    </div>
+  {/if}
 
   <section class="kpis">
     <div class="kpi">
@@ -371,8 +450,16 @@
       {/each}
     {:else if summary.length === 0}
       <div class="empty">
-        <h3>No Sashimono instances detected yet.</h3>
-        <p class="dim">Confirm <code>sashi list</code> works on this VM. The daemon polls every 30 seconds.</p>
+        {#if clusters.length === 0}
+          <h3>No Sashimono instances detected yet.</h3>
+          <p class="dim">Confirm <code>sashi list</code> works on this VM, or click <b>Discover</b> above.</p>
+        {:else if monitoredClusters.length === 0}
+          <h3>No clusters are being monitored.</h3>
+          <p class="dim">Toggle a cluster on above to start tailing its instances. {clusters.length} cluster{clusters.length === 1 ? '' : 's'} available.</p>
+        {:else}
+          <h3>No events yet for the selected scope.</h3>
+          <p class="dim">Monitored clusters are still warming up; events appear within ~30 s.</p>
+        {/if}
       </div>
     {:else}
       {#each summary as inst (inst.name)}
@@ -485,6 +572,41 @@
   }
   .policy-sel:disabled { opacity: 0.55; cursor: progress; }
   .policy-sel option { background: var(--bg-1); color: var(--fg); }
+
+  /* ---- active-cluster banner ---- */
+  .cluster-banner {
+    display: flex; align-items: center; gap: 12px;
+    padding: 9px 14px; margin-bottom: 14px;
+    background: color-mix(in srgb, var(--green) 8%, var(--bg-1));
+    border: 1px solid color-mix(in srgb, var(--green) 35%, var(--line));
+    border-radius: var(--radius);
+    flex-wrap: wrap;
+  }
+  .cb-label {
+    font-size: 9.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--fg-dim);
+  }
+  .cb-id {
+    font-family: var(--mono); font-size: 11px;
+    background: var(--bg-3);
+    padding: 2px 8px; border-radius: 4px;
+    color: var(--fg); font-weight: 600;
+    word-break: break-all;
+  }
+  .cb-meta { font-size: 11px; font-variant-numeric: tabular-nums; }
+  .cb-clear {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--line);
+    color: var(--fg-muted);
+    border-radius: 9px;
+    font-size: 10.5px; font-weight: 600;
+    padding: 3px 10px;
+    cursor: pointer;
+    transition: color .15s, border-color .15s;
+  }
+  .cb-clear:hover { color: var(--fg); border-color: var(--fg-dim); }
 
   /* ---- KPIs ---- */
   .kpis {

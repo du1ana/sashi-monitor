@@ -109,6 +109,23 @@ persisted regardless of the gate, so health classification still works.
 Spells are still *opened* on every error tag — only what's stored on top of
 them changes.
 
+### Clusters (opt-in monitoring)
+
+Sashimono can host instances from several **contracts** on the same VM. Each
+instance carries a `contract_id`; sashimon groups them and only tails the
+instances belonging to clusters the operator has opted in to. New clusters
+appear in the dashboard's **Clusters** panel with a toggle; flipping it
+spawns the tails on the next discovery pass (or instantly via *Discover*).
+
+- `/api/clusters` — list discovered clusters + node counts + monitored flag
+- `POST /api/clusters/monitor` `{contract_id, monitored}` — opt in/out
+- `POST /api/discover_now` — force a `sashi list` pass
+- `?contract_id=<id>` — filter `summary`, `histogram`, `events`, `spells`,
+  `spells_log` to a single cluster
+
+Pass `--auto-monitor-new` (`SASHIMON_AUTO_MONITOR_NEW=1`) to fall back to
+the legacy "tail everything" behaviour for newly-discovered clusters.
+
 ### TLS
 
 Pass `--tls-cert` / `--tls-key` (PEM) to serve HTTPS. With `--tls-auto`
