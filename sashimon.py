@@ -2766,7 +2766,7 @@ async function refreshHost(win) {
       if (a>0 && b>a*2 && b-a>100) v.push(`${name.slice(0,16)} RSS ${Math.round(a)}→${Math.round(b)}MB this window — possible leak → eventual OOM`); }
   }
   const openHF = spells.filter(s => s.state === 'hard_fork?' || s.state === 'active');
-  if (openHF.length) v.unshift(`${openHF.length} spell(s) OPEN now — ${openHF.map(s=>(s.instance||'').slice(0,12)).join(', ')} (4-node clusters tolerate only 1 fault — see HOTPOCKET_CONSENSUS_INVESTIGATION.md)`);
+  if (openHF.length) v.unshift(`${openHF.length} spell(s) OPEN now — ${openHF.map(s=>(s.instance||'').slice(0,12)).join(', ')}`);
   document.getElementById('hostVerdict').innerHTML = v.length ? v.map(t=>'⚠ '+esc(t)).join('<br>') : '';
 
   // ---- status bar + spell ribbon + inline-expandable spell list ----
