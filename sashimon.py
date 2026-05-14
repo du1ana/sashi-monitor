@@ -23,6 +23,8 @@ import os
 import pty
 import re
 import select
+import shlex
+from shlex import quote as shlex_quote
 import shutil
 import signal
 import socket
@@ -1000,6 +1002,7 @@ class Store:
                 "name": name, "tenant": tenant, "image": image,
                 "status": status, "last_seen": last_seen,
             })
+        hard_set = self.hard_forked_clusters()
         out = []
         seen_cids = set()
         for cid, label, monitored, first_seen, last_seen in cluster_rows:
@@ -1017,6 +1020,7 @@ class Store:
                 "tenants":     tenants,
                 "images":      images,
                 "instances":   insts,
+                "hard_forked": cid in hard_set,
             })
         # Surface instances whose contract_id has no row in `clusters` yet
         # (race condition between upserts) so the UI never hides them.
@@ -1033,6 +1037,7 @@ class Store:
                 "tenants":     sorted({i["tenant"] for i in insts if i.get("tenant")}),
                 "images":      sorted({i["image"]  for i in insts if i.get("image")}),
                 "instances":   insts,
+                "hard_forked": cid in hard_set,
             })
         return out
 
@@ -1041,6 +1046,38 @@ class Store:
             return [r[0] for r in self.conn.execute(
                 "SELECT name FROM instances WHERE contract_id=?", (contract_id,)
             )]
+
+    def hard_forked_clusters(self, hard_fork_after: float = HARD_FORK_AFTER
+                             ) -> set[str]:
+        """Return the set of contract_ids that currently have an open spell
+        whose age exceeds `hard_fork_after` (i.e. no recovery ledger has
+        arrived since the spell started). Used to gate destructive actions
+        in the UI."""
+        cutoff = time.time() - hard_fork_after
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT i.contract_id FROM spells_log s "
+                "JOIN instances i ON i.name = s.instance "
+                "WHERE s.end_ts IS NULL AND s.start_ts <= ? "
+                "  AND i.contract_id IS NOT NULL",
+                (cutoff,),
+            ).fetchall()
+        return {r[0] for r in rows if r[0]}
+
+    def cluster_for_instance(self, name: str) -> str | None:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT contract_id FROM instances WHERE name=?", (name,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def remove_instance(self, name: str) -> None:
+        """Drop an instance row + its events after a successful `evernode
+        delete`. Keep host_metrics and spells_log for audit."""
+        with self.lock:
+            self.conn.execute("DELETE FROM events WHERE instance=?", (name,))
+            self.conn.execute("DELETE FROM instances WHERE name=?", (name,))
+            self.conn.commit()
 
     def get_setting(self, key: str, default: str | None = None) -> str | None:
         with self.lock:
@@ -1586,6 +1623,75 @@ def capture_snapshot(store: Store, spell_id: str, sashi_bin: str,
     add("chronyc",    run_cmd(["sh", "-c", "chronyc tracking 2>/dev/null; echo '---'; chronyc sources 2>/dev/null; echo '---'; timedatectl 2>/dev/null"], timeout=8))
     add("du",         run_cmd(["sh", "-c", "du -sh /var/lib/sashimono/* 2>/dev/null; du -sh /home/sashi*/.* 2>/dev/null | tail -n 40; du -sh /home/sashi* 2>/dev/null"], timeout=25))
 
+    # --- Network captures (spell-only) ----------------------------------
+    # Discover peer_ports for this host's HotPocket instances so per-port
+    # filters target the actual peer mesh instead of every TCP socket.
+    peer_ports: list[int] = []
+    try:
+        for row in store.list_instances():
+            p = row.get("peer_port")
+            if isinstance(p, int) and p > 0:
+                peer_ports.append(p)
+    except Exception:
+        pass
+    peer_ports = sorted(set(peer_ports))
+    pp_filter = " or ".join(f"sport = :{p} or dport = :{p}" for p in peer_ports) if peer_ports else ""
+    pp_expr = f"'( {pp_filter} )'" if pp_filter else ""
+
+    # Full TCP socket info incl. RTT / retransmits / cwnd / rto.
+    add("ss_tcp_info", run_cmd(["sh", "-c",
+        "ss -tnpi --no-header 2>/dev/null | head -n 400"], timeout=8))
+    # Connections matching the HotPocket peer ports (the consensus mesh).
+    if pp_expr:
+        add("ss_peer_mesh", run_cmd(["sh", "-c",
+            f"echo '=== established ==='; ss -tnpi state established {pp_expr} 2>/dev/null; "
+            f"echo; echo '=== non-established (syn/fin/close-wait/time-wait) ==='; "
+            f"ss -tnpi state syn-sent state syn-recv state fin-wait-1 state fin-wait-2 "
+            f"state close-wait state last-ack state time-wait {pp_expr} 2>/dev/null"], timeout=10))
+        add("ss_peer_listen", run_cmd(["sh", "-c",
+            f"ss -lntp {pp_expr} 2>/dev/null"], timeout=6))
+    # Aggregate socket counters + TCP stats / drop counters.
+    add("ss_summary", run_cmd(["sh", "-c",
+        "ss -s 2>/dev/null; echo; echo '=== nstat -az ==='; nstat -az 2>/dev/null | head -n 200"], timeout=8))
+    add("proc_net_snmp", run_cmd(["sh", "-c",
+        "cat /proc/net/snmp 2>/dev/null; echo; echo '=== /proc/net/netstat ==='; cat /proc/net/netstat 2>/dev/null"], timeout=4))
+    # Per-iface error counters (rx errs/drop/fifo/frame/crc, tx errs/drop/fifo/coll/carrier).
+    add("ip_link_stats", run_cmd(["sh", "-c",
+        "ip -s -s link 2>/dev/null || cat /proc/net/dev 2>/dev/null"], timeout=5))
+    # NAT table — slirp4netns and host conntrack can run out / drop entries.
+    add("conntrack", run_cmd(["sh", "-c",
+        "(conntrack -L 2>/dev/null || cat /proc/net/nf_conntrack 2>/dev/null) | head -n 300; "
+        "echo; echo '=== conntrack -S (per-cpu stats: drops, invalid, search_restart) ==='; "
+        "conntrack -S 2>/dev/null; "
+        "echo; echo '=== /proc/sys/net/netfilter/nf_conntrack_count / _max ==='; "
+        "cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null; "
+        "cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null"], timeout=10))
+    # Firewall counters (UFW chains include drop counts → useful if peer ports got blocked).
+    add("iptables", run_cmd(["sh", "-c",
+        "echo '=== filter ==='; iptables -L -nv 2>/dev/null | head -n 200; "
+        "echo; echo '=== nat ==='; iptables -t nat -L -nv 2>/dev/null | head -n 200; "
+        "echo; echo '=== ufw ==='; ufw status verbose 2>/dev/null || echo '(ufw unavailable)'"], timeout=10))
+    # Kernel-only journal — separates conntrack/nf/slirp4netns/OOM-net from app noise.
+    add("journalctl_kernel", run_cmd(["sh", "-c",
+        "journalctl -k --since '-5 min' -n 400 --no-pager 2>/dev/null || dmesg -T 2>/dev/null | tail -n 200"], timeout=10))
+    # MTU / routing / neighbour cache (catches ARP flaps, blackhole routes).
+    add("ip_route_neigh", run_cmd(["sh", "-c",
+        "echo '=== ip route ==='; ip route 2>/dev/null; "
+        "echo; echo '=== ip -6 route ==='; ip -6 route 2>/dev/null; "
+        "echo; echo '=== ip neigh ==='; ip neigh 2>/dev/null; "
+        "echo; echo '=== ip addr ==='; ip -br addr 2>/dev/null"], timeout=6))
+    # Per-peer reachability: pull established peer remote IPs from ss, then
+    # send 3 quick ICMP probes each (1s deadline) to measure round-trip jitter
+    # at spell moment. Cheap, only runs during a spell snapshot.
+    if pp_expr:
+        add("peer_ping", run_cmd(["sh", "-c",
+            f"peers=$(ss -tn state established {pp_expr} 2>/dev/null "
+            f"  | awk 'NR>1 {{print $4}}' | sed 's/:[0-9]*$//' | sort -u); "
+            f"for p in $peers; do "
+            f"  echo \"=== $p ===\"; "
+            f"  ping -c 3 -W 1 -i 0.3 \"$p\" 2>&1 | tail -n 4; "
+            f"done"], timeout=20))
+
     for name in (instances or []):
         try:
             lines = store.recent_log_lines(name, limit=200)
@@ -1851,8 +1957,13 @@ def _events_block(rows):
 
 # Order in which artifact kinds are printed within a capture burst.
 _REPORT_ARTIFACT_ORDER = [
-    "logtail", "journalctl", "journalctl_agent", "journalctl_units", "dmesg",
+    "logtail", "journalctl", "journalctl_agent", "journalctl_units",
+    "journalctl_kernel", "dmesg",
     "ps", "free", "vmstat", "uptime", "df", "dfi", "chronyc", "du",
+    # Network captures (only added on spell open; see capture_snapshot).
+    "ss_peer_mesh", "ss_peer_listen", "ss_tcp_info", "ss_summary",
+    "proc_net_snmp", "ip_link_stats", "ip_route_neigh",
+    "conntrack", "iptables", "peer_ping",
 ]
 
 
@@ -1906,7 +2017,27 @@ def build_report(store: Store, window_seconds: int, sashi_bin: str,
     L.append("  - Cross-correlate by the UTC timestamps + epoch seconds. Suspects for an unrecoverable hard")
     L.append("    fork on a small cluster: a 2nd node faulting while a 1st is recovering; disk full (ledger")
     L.append("    persist fails); OOM/restart; clock drift > 2x roundtime; CPU steal; a contract determinism")
-    L.append("    bug (different output/state hash).")
+    L.append("    bug (different output/state hash); cross-host peer-link jitter (see network captures).")
+    L.append("  - Network captures (only taken at spell open):")
+    L.append("      * ss_peer_mesh    — TCP state for HotPocket peer-port connections (RTT, retransmits,")
+    L.append("                          cwnd, rto, lost). High retrans or unestablished sessions to a peer")
+    L.append("                          right before the spell = that peer's link was the trigger.")
+    L.append("      * ss_tcp_info     — same fields for every TCP socket on the host (broader view).")
+    L.append("      * ss_summary      — ss -s totals + nstat -az (TCPRetransSegs, TCPLostRetransmit,")
+    L.append("                          TCPSynRetrans, TCPTimeouts deltas).")
+    L.append("      * proc_net_snmp   — /proc/net/snmp + /proc/net/netstat (same counters, raw).")
+    L.append("      * ip_link_stats   — per-interface rx/tx errs/drop/fifo/frame/crc counters. Non-zero")
+    L.append("                          drop counters on the egress NIC = local NIC/driver issue.")
+    L.append("      * ip_route_neigh  — routes + ARP/ND cache (catches blackhole routes, ARP flaps).")
+    L.append("      * conntrack       — NAT table (slirp4netns sits on rootless conntrack). Look for")
+    L.append("                          'table full', 'drop' or 'invalid' counts; nf_conntrack_count near")
+    L.append("                          nf_conntrack_max = peer sessions getting evicted.")
+    L.append("      * iptables        — filter+nat chains with packet counters; UFW status. Non-zero drop")
+    L.append("                          counters on input chain or peer ports denied = firewall caused it.")
+    L.append("      * journalctl_kernel — kernel-only journal: catches nf_conntrack/TCP/slirp4netns errors")
+    L.append("                            that the system-wide journalctl can bury under app noise.")
+    L.append("      * peer_ping       — 3 ICMP probes per established peer at spell moment. High RTT")
+    L.append("                          variance or packet loss here = cross-host link is the trigger.")
     L.append("")
 
     for inst in instances:
@@ -2160,6 +2291,57 @@ DASHBOARD_HTML = r"""<!doctype html>
                          border:1px solid var(--line); color: var(--fg-dim);
                          padding:2px 9px; border-radius:3px; font-family:inherit; font-size:10px; }
   .cluster-banner .clr:hover { color: var(--fg); border-color: var(--line2); }
+
+  /* --- per-card delete + modal --- */
+  .card .card-actions { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; }
+  .card .del-btn {
+    font-family: var(--mono); font-size: 10.5px;
+    padding: 3px 9px; border-radius: 3px;
+    background: rgba(255,90,82,.08);
+    color: var(--bad); border: 1px solid var(--bad-dim);
+    cursor: pointer;
+    display: inline-flex; align-items: center; gap: 5px;
+  }
+  .card .del-btn:hover { background: rgba(255,90,82,.18); border-color: var(--bad); }
+  .card .del-btn:disabled { opacity:.55; cursor: progress; }
+  .modal { position: fixed; inset: 0; z-index: 200; display: flex;
+           align-items: center; justify-content: center; }
+  .modal .modal-bg { position: absolute; inset: 0; background: rgba(0,0,0,.62);
+                     backdrop-filter: blur(2px); }
+  .modal .modal-box { position: relative; width: min(640px, 94vw);
+                      max-height: 86vh; overflow: auto;
+                      background: var(--bg1); border: 1px solid var(--line2);
+                      border-radius: 5px; box-shadow: 0 20px 60px rgba(0,0,0,.55);
+                      font-family: var(--mono); }
+  .modal .modal-h { display:flex; align-items:center; padding: 10px 14px;
+                    border-bottom: 1px solid var(--line); gap: 10px; }
+  .modal .modal-h h2 { margin:0; font-size:12px; font-weight:700;
+                       text-transform: uppercase; letter-spacing: .08em; color: var(--fg); }
+  .modal .modal-h .x { margin-left:auto; background:none; border:1px solid var(--line);
+                       color: var(--fg-dim); width:24px; height:24px; border-radius:3px;
+                       cursor:pointer; line-height:1; font-size:14px; }
+  .modal .modal-h .x:hover { color: var(--fg); border-color: var(--line2); }
+  .modal .modal-body { padding: 12px 14px; font-size: 11.5px; line-height: 1.55; color: var(--fg); }
+  .modal .modal-body pre { background: var(--bg); padding: 10px 12px;
+                           border: 1px solid var(--line); border-radius: 3px;
+                           max-height: 320px; overflow: auto;
+                           font-size: 10.5px; white-space: pre-wrap; word-break: break-word; }
+  .modal .modal-body .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+                            margin-bottom: 10px; font-size: 11px; }
+  .modal .modal-body code { background: var(--bg); padding: 1px 6px; border-radius: 3px;
+                            color: var(--fg); font-size: 10.5px; }
+  .modal .modal-body .actions { display:flex; gap:8px; margin-top: 12px; justify-content: flex-end; }
+  .modal .modal-body button { font-family: var(--mono); font-size: 11px; padding: 5px 12px;
+                              border-radius: 3px; cursor: pointer; }
+  .modal .modal-body button.go { background: var(--bad-dim); color: #fff; border: 1px solid var(--bad); }
+  .modal .modal-body button.go:hover { background: var(--bad); }
+  .modal .modal-body button.go:disabled { opacity:.55; cursor: progress; }
+  .modal .modal-body button.cancel { background: var(--bg2); color: var(--fg-dim);
+                                     border: 1px solid var(--line); }
+  .modal .modal-body button.cancel:hover { color: var(--fg); border-color: var(--line2); }
+  .modal .modal-body .status-line { font-size: 11px; color: var(--warn); margin-top: 8px; }
+  .modal .modal-body .status-line.ok { color: var(--ok); }
+  .modal .modal-body .status-line.bad { color: var(--bad); }
   .panel { margin-bottom: 18px; background: var(--bg1); border: 1px solid var(--line);
            border-radius: 4px; }
   .panel > .ph { padding: 9px 14px; border-bottom: 1px solid var(--line);
@@ -2407,7 +2589,16 @@ DASHBOARD_HTML = r"""<!doctype html>
       </select>
     </label>
     <button id="export" title="download one plain-text report — every instance, every error spell, with the HotPocket log + journalctl + host metrics around each spell start; hand it to an analyst / LLM">export report</button>
+    <button id="updateBtn" title="re-run the install one-liner to pull the latest sashi.mon. systemd restarts the service when the install finishes.">update sashi.mon</button>
     <button id="clearDb" class="danger" title="wipe ALL stored data: log events, host metrics, error spells & their artifacts, instances. Live tailing/sampling continues; history starts fresh.">clear dbs <span class="dbsz" id="dbSize">(—)</span></button>
+  </div>
+
+  <div id="modal" class="modal" style="display:none">
+    <div class="modal-bg" data-close="1"></div>
+    <div class="modal-box">
+      <div class="modal-h"><h2 id="modalTitle">Title</h2><button class="x" data-close="1">×</button></div>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
   </div>
 
   <div id="clusterBanner" class="cluster-banner" style="display:none;">
@@ -2885,7 +3076,7 @@ function renderSpellsPanel(spells) {
 }
 
 // ---- shared spell-detail renderer (used by inline rows AND the drawer) ----
-const ARTIFACT_ORDER = ['logtail', 'journalctl', 'journalctl_agent', 'journalctl_units', 'dmesg', 'ps', 'free', 'vmstat', 'uptime', 'df', 'dfi', 'chronyc', 'du'];
+const ARTIFACT_ORDER = ['logtail', 'journalctl', 'journalctl_agent', 'journalctl_units', 'journalctl_kernel', 'dmesg', 'ps', 'free', 'vmstat', 'uptime', 'df', 'dfi', 'chronyc', 'du', 'ss_peer_mesh', 'ss_peer_listen', 'ss_tcp_info', 'ss_summary', 'proc_net_snmp', 'ip_link_stats', 'ip_route_neigh', 'conntrack', 'iptables', 'peer_ping'];
 
 async function renderSpellDetail(container, spellId, prefix) {
   const meta = LAST_SPELLS.find(s => s.spell_id === spellId) || {};
@@ -2946,7 +3137,7 @@ async function renderSpellDetail(container, spellId, prefix) {
       g.items.map((a, ai) => {
         const id = `${prefix}_art_${gi}_${ai}`;
         const sz = (a.content || '').length;
-        const openDef = ['logtail', 'journalctl_agent', 'journalctl', 'dmesg'].includes(a.kind) && gi === 0;
+        const openDef = ['logtail', 'journalctl_agent', 'journalctl', 'journalctl_kernel', 'dmesg', 'ss_peer_mesh', 'peer_ping', 'conntrack'].includes(a.kind) && gi === 0;
         return `<details class="a"${openDef ? ' open' : ''}><summary>` +
           `<span class="k">${esc(a.kind)}</span>` + (a.instance ? `<span class="ins">${esc(a.instance.slice(0, 18))}</span>` : '') +
           `<span class="when">${tsClock(a.ts)}</span><span class="sz">${sz > 2048 ? Math.round(sz / 1024) + 'K' : sz + 'B'}</span>` +
@@ -3088,15 +3279,20 @@ async function refresh() {
       card = document.createElement('div');
       card.id = 'c-' + inst.name;
       card.className = 'card';
+      card.setAttribute('data-card-name', inst.name);
       card.innerHTML = `
         <h2>${inst.name}</h2>
         <div class="sub" data-sub></div>
         <div class="stats" data-stats></div>
         <div class="pmet" data-pmet></div>
         <canvas id="ch-${inst.name}"></canvas>
-        <div class="cspells" data-spells></div>`;
+        <div class="cspells" data-spells></div>
+        <div class="card-actions" data-card-actions></div>`;
       cards.appendChild(card);
     }
+    const actionsEl = card.querySelector('[data-card-actions]');
+    if (actionsEl) actionsEl.innerHTML = renderCardActions(inst.name);
+    bindCardActions(card);
     card.querySelector('[data-sub]').innerHTML =
       `<span class="health h-${inst.health}">${inst.health}</span> · sashi: ${inst.sashi_status || '—'}`;
     const c = inst.counts || {};
@@ -3142,6 +3338,13 @@ let ACTIVE_CLUSTER = (function(){
   catch { return null; }
 })();
 let CLUSTERS = [];
+let INSTANCE_CID = {};   // instance name -> contract_id
+let HARD_FORK_CIDS = new Set();
+function instCid(name) { return INSTANCE_CID[name] || null; }
+function instHardForked(name) {
+  const cid = instCid(name);
+  return cid != null && HARD_FORK_CIDS.has(cid);
+}
 
 function clusterQS() { return ACTIVE_CLUSTER ? ('&contract_id=' + encodeURIComponent(ACTIVE_CLUSTER)) : ''; }
 
@@ -3182,6 +3385,12 @@ function updateClusterBanner() {
 async function loadClusters() {
   try {
     CLUSTERS = await fetchJSON('/api/clusters');
+    INSTANCE_CID = {};
+    HARD_FORK_CIDS = new Set();
+    for (const c of CLUSTERS) {
+      if (c.hard_forked) HARD_FORK_CIDS.add(c.contract_id);
+      for (const i of (c.instances || [])) INSTANCE_CID[i.name] = c.contract_id;
+    }
     // If active cluster vanished or is unmonitored, fall back to All.
     if (ACTIVE_CLUSTER) {
       const c = CLUSTERS.find(x => x.contract_id === ACTIVE_CLUSTER);
@@ -3189,6 +3398,13 @@ async function loadClusters() {
     }
     renderClusters();
     updateClusterBanner();
+    // Re-render any visible card delete buttons.
+    document.querySelectorAll('[data-card-name]').forEach(card => {
+      const name = card.getAttribute('data-card-name');
+      const a = card.querySelector('[data-card-actions]');
+      if (a) a.innerHTML = renderCardActions(name);
+      bindCardActions(card);
+    });
   } catch (e) {
     const host = document.getElementById('clusterList');
     if (host) host.innerHTML = '<div style="color:var(--bad);font-family:var(--mono);font-size:11px">' + esc(e.message || String(e)) + '</div>';
@@ -3275,6 +3491,134 @@ document.getElementById('discoverBtn').onclick = async () => {
   btn.textContent = prev; btn.disabled = false;
 };
 document.getElementById('cbClear').onclick = () => setActiveCluster(null);
+
+// ---- modal -------------------------------------------------------------
+function openModal(title, html) {
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalBody').innerHTML = html;
+  document.getElementById('modal').style.display = 'flex';
+}
+function closeModal() { document.getElementById('modal').style.display = 'none'; }
+document.querySelectorAll('#modal [data-close]').forEach(el => el.onclick = closeModal);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+// ---- per-card actions (Delete on hard-forked clusters) -----------------
+function renderCardActions(name) {
+  if (!instHardForked(name)) return '';
+  const cid = instCid(name);
+  return `<button class="del-btn" data-del="${esc(name)}" title="cluster ${esc(cid || '?')} is hard-forked. evernode delete this node and verify via sashi list.">` +
+         `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>` +
+         `delete instance</button>`;
+}
+function bindCardActions(card) {
+  card.querySelectorAll('[data-del]').forEach(btn => {
+    btn.onclick = (e) => { e.stopPropagation(); confirmDeleteInstance(btn.dataset.del); };
+  });
+}
+function confirmDeleteInstance(name) {
+  const cid = instCid(name);
+  const html =
+    `<div class="row"><b>instance</b><code>${esc(name)}</code></div>` +
+    `<div class="row"><b>cluster</b><code>${esc(cid || '?')}</code></div>` +
+    `<p>This will run <code>evernode delete ${esc(name)}</code> on the host and then ` +
+    `re-run <code>sashi list</code> to confirm. The action is gated by the daemon to ` +
+    `clusters currently in a hard-fork state and cannot be undone.</p>` +
+    `<div class="actions">` +
+      `<button class="cancel" id="dm_cancel">cancel</button>` +
+      `<button class="go" id="dm_go">delete</button>` +
+    `</div>` +
+    `<div class="status-line" id="dm_status"></div>`;
+  openModal('Delete instance', html);
+  document.getElementById('dm_cancel').onclick = closeModal;
+  document.getElementById('dm_go').onclick = async () => {
+    const btn = document.getElementById('dm_go');
+    const stat = document.getElementById('dm_status');
+    btn.disabled = true;
+    document.getElementById('dm_cancel').disabled = true;
+    stat.className = 'status-line'; stat.textContent = 'running evernode delete (this can take a minute)…';
+    try {
+      const r = await fetch('/api/instances/delete', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const j = await r.json().catch(()=>({}));
+      let cls = j.ok ? 'ok' : 'bad';
+      stat.className = 'status-line ' + cls;
+      stat.textContent = j.ok
+        ? `deleted. exit ${j.exit_code}; sashi list confirms instance gone.`
+        : `failed: ${j.error || ('still present, exit ' + j.exit_code)}`;
+      if (j.transcript) {
+        const pre = document.createElement('pre');
+        pre.textContent = j.transcript;
+        stat.parentElement.appendChild(pre);
+      }
+      if (j.ok) {
+        await loadClusters();
+        hardReload();
+      }
+    } catch (e) {
+      stat.className = 'status-line bad';
+      stat.textContent = 'request failed: ' + e.message;
+    } finally {
+      btn.disabled = false;
+      document.getElementById('dm_cancel').disabled = false;
+    }
+  };
+}
+
+// ---- update sashi.mon -------------------------------------------------
+document.getElementById('updateBtn').onclick = () => {
+  const html =
+    `<p>This re-runs the install one-liner on the host:</p>` +
+    `<pre>curl -fsSL &lt;install-url&gt; | sudo bash</pre>` +
+    `<p>systemd will restart sashimon when the install completes. The dashboard ` +
+    `will reload itself once <code>/healthz</code> answers again (usually ~30–60s).</p>` +
+    `<div class="actions">` +
+      `<button class="cancel" id="up_cancel">cancel</button>` +
+      `<button class="go" id="up_go" style="background:var(--ok-dim);border-color:var(--ok);">update now</button>` +
+    `</div>` +
+    `<div class="status-line" id="up_status"></div>`;
+  openModal('Update sashi.mon', html);
+  document.getElementById('up_cancel').onclick = closeModal;
+  document.getElementById('up_go').onclick = async () => {
+    const go = document.getElementById('up_go');
+    const stat = document.getElementById('up_status');
+    go.disabled = true;
+    document.getElementById('up_cancel').disabled = true;
+    stat.className = 'status-line'; stat.textContent = 'spawning installer…';
+    try {
+      const r = await fetch('/api/self_update', { method: 'POST' });
+      const j = await r.json().catch(()=>({}));
+      if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      stat.textContent = 'installer running. waiting for service to come back…';
+      // Poll /healthz; expect 1+ failures during restart, then green.
+      let downSeen = false;
+      for (let i = 0; i < 90; i++) {
+        await new Promise(res => setTimeout(res, 2000));
+        try {
+          const h = await fetch('/healthz', {cache:'no-store'});
+          if (h.ok) {
+            if (downSeen) {
+              stat.className = 'status-line ok';
+              stat.textContent = 'service is back. reloading dashboard…';
+              setTimeout(() => location.reload(), 1500);
+              return;
+            }
+          }
+        } catch { downSeen = true; }
+        stat.textContent = `installer running… (~${(i+1)*2}s)`;
+      }
+      stat.className = 'status-line bad';
+      stat.textContent = 'service did not come back within ~180s. check /tmp/sashimon-update.log on the host.';
+    } catch (e) {
+      stat.className = 'status-line bad';
+      stat.textContent = 'update failed: ' + e.message;
+    } finally {
+      go.disabled = false;
+      document.getElementById('up_cancel').disabled = false;
+    }
+  };
+};
 
 loadClusters();
 setInterval(loadClusters, 30000);
@@ -3414,7 +3758,9 @@ def make_handler(store: Store, static_html_path: str | None,
                  sashi_bin: str = "sashi",
                  report_peers: list | None = None,
                  policy: "PolicyManager | None" = None,
-                 discoverer: "Discoverer | None" = None):
+                 discoverer: "Discoverer | None" = None,
+                 evernode_bin: str = "evernode",
+                 install_url: str = "https://raw.githubusercontent.com/du1ana/sashi-monitor/main/install.sh"):
     hostname = socket.gethostname()
 
     class Handler(BaseHTTPRequestHandler):
@@ -3641,6 +3987,118 @@ def make_handler(store: Store, static_html_path: str | None,
                             "contract_ids": cids})
                 return
 
+            if u.path == "/api/instances/delete":
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    body = json.loads(raw.decode("utf-8") or "{}")
+                except Exception:
+                    self._json({"ok": False, "error": "bad json body"}, code=400)
+                    return
+                name = (body.get("name") or "").strip()
+                if not name or not re.fullmatch(r"[A-Za-z0-9_\-]{4,80}", name):
+                    self._json({"ok": False, "error": "invalid instance name"},
+                               code=400)
+                    return
+                cid = store.cluster_for_instance(name)
+                if cid is None:
+                    self._json({"ok": False, "error": "instance not known to monitor"},
+                               code=404)
+                    return
+                # Destructive: only when the instance's cluster is hard-forked.
+                if cid not in store.hard_forked_clusters():
+                    self._json({"ok": False,
+                                "error": "delete is gated to hard-forked "
+                                         "clusters; this cluster is not in "
+                                         "that state"},
+                               code=403)
+                    return
+                # Run evernode delete (capture both streams).
+                try:
+                    cp = subprocess.run(
+                        [evernode_bin, "delete", name],
+                        capture_output=True, text=True, timeout=180, check=False,
+                    )
+                except FileNotFoundError:
+                    self._json({"ok": False,
+                                "error": f"'{evernode_bin}' not found in PATH"},
+                               code=500)
+                    return
+                except subprocess.TimeoutExpired:
+                    self._json({"ok": False,
+                                "error": "evernode delete timed out after 180s"},
+                               code=504)
+                    return
+                transcript = (cp.stdout or "") + (("\n" + cp.stderr) if cp.stderr else "")
+                # Verify via sashi list.
+                still_present = True
+                list_err = None
+                try:
+                    out = subprocess.check_output(
+                        [sashi_bin, "list"], text=True, timeout=15)
+                    rows = json.loads(out)
+                    still_present = any(r.get("name") == name for r in rows)
+                except Exception as e:
+                    list_err = str(e)
+                deleted = (cp.returncode == 0 and not still_present)
+                if deleted:
+                    try: store.remove_instance(name)
+                    except Exception: pass
+                    # Drop the tail thread for this instance.
+                    if discoverer is not None:
+                        try:
+                            t = discoverer.tails.pop(name, None)
+                            if t is not None: t.shutdown()
+                        except Exception:
+                            pass
+                self._json({
+                    "ok":            deleted,
+                    "name":          name,
+                    "contract_id":   cid,
+                    "exit_code":     cp.returncode,
+                    "still_present": still_present,
+                    "list_error":    list_err,
+                    "transcript":    transcript[:20000],
+                })
+                return
+
+            if u.path == "/api/self_update":
+                # Drain any body; we ignore params.
+                length = int(self.headers.get("Content-Length") or 0)
+                if length > 0:
+                    try: self.rfile.read(length)
+                    except Exception: pass
+                # Run the install one-liner detached so it survives the
+                # systemctl restart that the installer triggers at the end.
+                log_path = "/tmp/sashimon-update.log"
+                cmd = (
+                    f"set -e; "
+                    f"echo '[update] starting at '$(date -Iseconds); "
+                    f"curl -fsSL {shlex_quote(install_url)} "
+                    f"| sudo -n bash; "
+                    f"echo '[update] done at '$(date -Iseconds)"
+                )
+                try:
+                    subprocess.Popen(
+                        ["bash", "-c", f"({cmd}) >>{log_path} 2>&1"],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                except Exception as e:
+                    self._json({"ok": False, "error": str(e)}, code=500)
+                    return
+                self._json({
+                    "ok":           True,
+                    "log_path":     log_path,
+                    "install_url":  install_url,
+                    "hint":         "systemd will restart sashimon when the install completes; "
+                                    "poll /healthz to detect when it is back.",
+                })
+                return
+
             if u.path == "/api/discover_now":
                 # Drain any body.
                 length = int(self.headers.get("Content-Length") or 0)
@@ -3799,9 +4257,20 @@ def main() -> None:
                          "clusters. Default off: operator opts in per cluster "
                          "from the dashboard. Existing installs that want the "
                          "old 'tail everything' behaviour can set this.")
+    ap.add_argument("--evernode-bin",
+                    default=os.environ.get("SASHIMON_EVERNODE_BIN", "evernode"),
+                    help="`evernode` CLI binary used by the dashboard's "
+                         "destructive Delete action (only enabled while a "
+                         "cluster is hard-forked).")
+    ap.add_argument("--install-url",
+                    default=os.environ.get("SASHIMON_INSTALL_URL",
+                        "https://raw.githubusercontent.com/du1ana/sashi-monitor/main/install.sh"),
+                    help="URL of the install one-liner used by the in-dashboard "
+                         "Update button.")
     args = ap.parse_args()
 
     sashi_path = shutil.which(args.sashi) or args.sashi
+    evernode_path = shutil.which(args.evernode_bin) or args.evernode_bin
     report_peers = [p.strip() for p in (args.report_peers or "").split(",") if p.strip()]
     store = Store(args.db)
     stop = threading.Event()
@@ -3849,7 +4318,9 @@ def main() -> None:
                      roundtime_ms=args.roundtime_ms, metrics=metrics,
                      spell_manager=spell_mgr, sashi_bin=sashi_path,
                      report_peers=report_peers, policy=policy,
-                     discoverer=discoverer),
+                     discoverer=discoverer,
+                     evernode_bin=evernode_path,
+                     install_url=args.install_url),
     )
 
     # ---- TLS wrap (optional) ------------------------------------------

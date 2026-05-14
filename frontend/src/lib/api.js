@@ -71,4 +71,25 @@ export const api = {
     return r.json();
   },
   dbSize:    () => j('/api/db_size'),
+  deleteInstance: async (name) => {
+    const r = await fetch('/api/instances/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name }),
+      cache: 'no-store',
+    });
+    const jr = await r.json().catch(() => ({}));
+    if (!r.ok && jr.ok !== true) throw new Error(jr.error || ('HTTP ' + r.status));
+    return jr;
+  },
+  selfUpdate: async () => {
+    const r = await fetch('/api/self_update', { method: 'POST', cache: 'no-store' });
+    const jr = await r.json().catch(() => ({}));
+    if (!r.ok || jr.ok === false) throw new Error(jr.error || ('HTTP ' + r.status));
+    return jr;
+  },
+  healthz: async () => {
+    try { const r = await fetch('/healthz', { cache: 'no-store' }); return r.ok; }
+    catch { return false; }
+  },
 };

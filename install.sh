@@ -101,7 +101,18 @@ StandardError=journal
 WantedBy=multi-user.target
 UNIT
 
-# 5. Enable + start
+# 5. Firewall — open the dashboard port via ufw when present. Skip silently
+#    on hosts that don't use ufw; never fail the install over this.
+if command -v ufw >/dev/null 2>&1; then
+  if ufw status 2>/dev/null | head -n1 | grep -qi active; then
+    echo "[sashimon] ufw allow $PORT/tcp"
+    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
+  else
+    echo "[sashimon] ufw present but inactive — skipping firewall rule"
+  fi
+fi
+
+# 6. Enable + start
 systemctl daemon-reload
 systemctl enable sashimon >/dev/null 2>&1 || true
 systemctl restart sashimon

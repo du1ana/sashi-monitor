@@ -123,6 +123,19 @@ spawns the tails on the next discovery pass (or instantly via *Discover*).
 - `?contract_id=<id>` — filter `summary`, `histogram`, `events`, `spells`,
   `spells_log` to a single cluster
 
+### Destructive actions
+
+- `POST /api/instances/delete` `{name}` — runs `evernode delete <name>` and
+  re-verifies via `sashi list`. Gated server-side to instances whose cluster
+  is currently hard-forked (an open `spells_log` row older than
+  `HARD_FORK_AFTER` ≈ 120s with no recovery ledger). Returns
+  `{ok, exit_code, still_present, transcript}`. Override the binary via
+  `--evernode-bin` / `SASHIMON_EVERNODE_BIN`.
+- `POST /api/self_update` — spawns the install one-liner detached, returns
+  immediately. The dashboard polls `/healthz` and auto-reloads when the
+  service is back. Override the URL with `--install-url` /
+  `SASHIMON_INSTALL_URL`. Log file: `/tmp/sashimon-update.log`.
+
 Pass `--auto-monitor-new` (`SASHIMON_AUTO_MONITOR_NEW=1`) to fall back to
 the legacy "tail everything" behaviour for newly-discovered clusters.
 
