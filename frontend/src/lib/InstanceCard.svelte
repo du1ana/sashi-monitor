@@ -54,6 +54,14 @@
       </div>
     </div>
 
+    {#if instance.last_lcl || instance.last_state || instance.last_patch}
+      <div class="ledger-info">
+        <span class="li-item"><span class="k">lcl</span><span class="v mono">{instance.last_lcl ?? '—'}</span></span>
+        <span class="li-item"><span class="k">state</span><span class="v mono">{instance.last_state ?? '—'}</span></span>
+        <span class="li-item"><span class="k">patch</span><span class="v mono">{instance.last_patch ?? '—'}</span></span>
+      </div>
+    {/if}
+
     <div class="chart">
       <LineChart {buckets} {bucketSec} tags={TAGS} {visible} {mode} height={130} />
     </div>
@@ -113,6 +121,18 @@
   .v { color: var(--fg); font-size: 13px; font-variant-numeric: tabular-nums; }
   .v.bad { color: var(--red); }
   .chart { margin-top: 2px; }
+
+  .ledger-info {
+    display: flex; flex-wrap: wrap; gap: 6px 10px;
+    padding: 6px 8px;
+    background: color-mix(in srgb, var(--line) 25%, var(--bg-1));
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    font-size: 10.5px;
+  }
+  .li-item { display: inline-flex; align-items: baseline; gap: 4px; min-width: 0; }
+  .li-item .k { font-size: 9px; }
+  .li-item .v { font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
 
   .card-wrap { display: flex; flex-direction: column; gap: 6px; }
   .actions { display: flex; justify-content: flex-end; padding: 0 4px; }

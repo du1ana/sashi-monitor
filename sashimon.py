@@ -129,6 +129,12 @@ LOG_RE = re.compile(
     r"\[(?P<level>\w+)\]\[(?P<module>\w+)\]\s+(?P<msg>.*)$"
 )
 
+# Extracts lcl/state/patch from a ledger_created msg like:
+#   ****Ledger created**** (lcl:205-91a16393 state:97e82d94 patch:d304e622)
+LEDGER_INFO_RE = re.compile(
+    r"lcl:(?P<lcl>\S+)\s+state:(?P<state>\S+)\s+patch:(?P<patch>[^\s)]+)", re.I
+)
+
 # Order matters: first match wins. Most specific first.
 CLASSIFIERS = (
     ("ledger_created",   re.compile(r"\*+\s*Ledger created\s*\*+", re.I)),
@@ -717,11 +723,20 @@ class Store:
                 ).fetchall()
                 counts = {tag: c for tag, c in cnt_rows}
 
-                last_ledger = self.conn.execute(
-                    "SELECT MAX(ts) FROM events "
-                    "WHERE instance=? AND tag='ledger_created'",
+                last_ledger_row = self.conn.execute(
+                    "SELECT ts, msg FROM events "
+                    "WHERE instance=? AND tag='ledger_created' "
+                    "ORDER BY ts DESC LIMIT 1",
                     (name,),
-                ).fetchone()[0]
+                ).fetchone()
+                last_ledger = last_ledger_row[0] if last_ledger_row else None
+                last_lcl = last_state = last_patch = None
+                if last_ledger_row:
+                    m_info = LEDGER_INFO_RE.search(last_ledger_row[1] or "")
+                    if m_info:
+                        last_lcl = m_info.group("lcl")
+                        last_state = m_info.group("state")
+                        last_patch = m_info.group("patch")
                 last_event = self.conn.execute(
                     "SELECT MAX(ts) FROM events WHERE instance=?", (name,)
                 ).fetchone()[0]
@@ -797,6 +812,9 @@ class Store:
                     "uptime_pct": uptime_pct,
                     "window_s": window_seconds,
                     "counts": counts,
+                    "last_lcl": last_lcl,
+                    "last_state": last_state,
+                    "last_patch": last_patch,
                 })
         return results
 
@@ -3414,7 +3432,10 @@ async function refresh() {
       <span>Consensus loss</span><span>${c.consensus_lost || 0}</span>
       <span>Fork warnings</span><span>${c.fork_warn || 0}</span>
       <span>Errors</span><span>${c.error || 0}</span>
-      <span>Uptime est.</span><span>${inst.uptime_pct}%</span>`;
+      <span>Uptime est.</span><span>${inst.uptime_pct}%</span>
+      <span>lcl</span><span class="mono">${inst.last_lcl || '—'}</span>
+      <span>state</span><span class="mono">${inst.last_state || '—'}</span>
+      <span>patch</span><span class="mono">${inst.last_patch || '—'}</span>`;
     renderCardMetrics(card, inst.name);
     renderCardSpells(card, inst.name);
 
