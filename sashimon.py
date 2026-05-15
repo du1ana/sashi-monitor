@@ -1699,8 +1699,11 @@ def capture_snapshot(store: Store, spell_id: str, sashi_bin: str,
     add("du",         run_cmd(["sh", "-c", "du -sh /var/lib/sashimono/* 2>/dev/null; du -sh /home/sashi*/.* 2>/dev/null | tail -n 40; du -sh /home/sashi* 2>/dev/null"], timeout=25))
 
     # --- Network captures (spell-only) ----------------------------------
-    # Discover peer_ports for this host's HotPocket instances so per-port
-    # filters target the actual peer mesh instead of every TCP socket.
+    # Discover peer_ports for this host's HotPocket instances. Outbound peer
+    # links use the OTHER host's peer_port as dport (and an ephemeral sport),
+    # so a filter built only from local peer_ports misses outbound sessions
+    # (Test #5, §11.3). Cover the HotPocket peer-port band as a range to
+    # catch them regardless of direction, and union with the exact local set.
     peer_ports: list[int] = []
     try:
         for row in store.list_instances():
@@ -1710,8 +1713,23 @@ def capture_snapshot(store: Store, spell_id: str, sashi_bin: str,
     except Exception:
         pass
     peer_ports = sorted(set(peer_ports))
-    pp_filter = " or ".join(f"sport = :{p} or dport = :{p}" for p in peer_ports) if peer_ports else ""
-    pp_expr = f"'( {pp_filter} )'" if pp_filter else ""
+    # Sashimono allocates peer_ports starting at 22861; this band covers any
+    # reasonable cluster on one host. Override via SASHIMON_PEER_PORT_BAND
+    # as "LOW-HIGH" if your deployment uses a different range.
+    band = os.environ.get("SASHIMON_PEER_PORT_BAND", "22861-22890")
+    try:
+        lo_s, hi_s = band.split("-", 1)
+        band_lo, band_hi = int(lo_s), int(hi_s)
+    except Exception:
+        band_lo, band_hi = 22861, 22890
+    band_clause = (f"( sport >= :{band_lo} and sport <= :{band_hi} )"
+                   f" or ( dport >= :{band_lo} and dport <= :{band_hi} )")
+    if peer_ports:
+        local_clause = " or ".join(f"sport = :{p} or dport = :{p}" for p in peer_ports)
+        pp_filter = f"{band_clause} or {local_clause}"
+    else:
+        pp_filter = band_clause
+    pp_expr = f"'( {pp_filter} )'"
 
     # Full TCP socket info incl. RTT / retransmits / cwnd / rto.
     add("ss_tcp_info", run_cmd(["sh", "-c",
@@ -1802,7 +1820,14 @@ class SpellManager:
         self.policy = policy
         self.lock = threading.Lock()
         self.state: dict[str, dict] = {}
-        # Re-attach to spells left open by a previous run.
+        # Re-attach to spells left open by a previous run. We also kick off a
+        # deferred capture for each re-attached spell that has no captures yet
+        # (or whose captures are stale by > 5 min) so an instance that was
+        # *already* stuck when the monitor came up still produces at least
+        # one fresh diagnostic snapshot — Test #5 §11.3 caught test-devnet
+        # like this: monitor attached mid-fork, `on_event` only fires on a
+        # *transition* into a spell, so no capture ever ran.
+        reattach_targets: list[tuple[str, str]] = []
         try:
             for r in store.open_spells():
                 self.state[r["instance"]] = {
@@ -1812,8 +1837,19 @@ class SpellManager:
                     "severity": tag_severity(r.get("trigger_tag", "")),
                     "trigger_tag": r.get("trigger_tag"),
                 }
+                # If the spell carries no captures yet, the instance has been
+                # stuck since before this monitor process attached → fire one.
+                if (r.get("captures") or 0) < 1:
+                    reattach_targets.append((r["spell_id"], r["instance"]))
         except Exception:
             pass
+        for sid, inst in reattach_targets:
+            print(f"[spell] {inst[:16]}: re-attach to open spell {sid} — "
+                  f"firing deferred capture (none / stale)")
+            threading.Thread(
+                target=self._snapshot_loop, args=(sid, inst),
+                daemon=True, name=f"snap-reattach-{sid[-12:]}",
+            ).start()
 
     def current_spell(self, instance: str) -> dict | None:
         """Return a snapshot of the active spell for `instance`, or None.
