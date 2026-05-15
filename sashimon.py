@@ -1186,21 +1186,55 @@ class Store:
 
     def clear_all(self) -> dict:
         """Wipe all events and instance rows. Tail threads keep running;
-        the next discovery poll will re-upsert live instances."""
+        the next discovery poll will re-upsert live instances.
+
+        On busy hosts VACUUM and WAL checkpoint can fail under writer
+        contention from the tail threads; without them the .db file and
+        its .db-wal sidecar stay at their high-water mark even though
+        every table is empty. We retry under the store lock and log any
+        failure loudly so the bloat isn't silent."""
         with self.lock:
             ev = self.conn.execute("DELETE FROM events").rowcount
             ins = self.conn.execute("DELETE FROM instances").rowcount
             hm = self.conn.execute("DELETE FROM host_metrics").rowcount
             sp = self.conn.execute("DELETE FROM spells_log").rowcount
             ar = self.conn.execute("DELETE FROM spell_artifacts").rowcount
+            cl = self.conn.execute("DELETE FROM clusters").rowcount
             self.conn.commit()
-            try:
-                self.conn.execute("VACUUM")
-            except sqlite3.OperationalError:
-                pass
+
+            wal_ok = False
+            for attempt in range(3):
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    wal_ok = True
+                    break
+                except sqlite3.OperationalError as e:
+                    print(f"[clear_all] wal_checkpoint attempt {attempt+1} failed: {e}",
+                          file=sys.stderr)
+                    time.sleep(0.2)
+
+            vac_ok = False
+            for attempt in range(3):
+                try:
+                    self.conn.execute("VACUUM")
+                    vac_ok = True
+                    break
+                except sqlite3.OperationalError as e:
+                    print(f"[clear_all] VACUUM attempt {attempt+1} failed: {e}",
+                          file=sys.stderr)
+                    time.sleep(0.2)
+
+            if not vac_ok or not wal_ok:
+                print(f"[clear_all] db file may stay bloated: "
+                      f"wal_checkpoint={'ok' if wal_ok else 'FAIL'} "
+                      f"vacuum={'ok' if vac_ok else 'FAIL'} "
+                      f"size_bytes={self.db_size_bytes()}",
+                      file=sys.stderr)
+
             return {"events_deleted": ev, "instances_deleted": ins,
                     "host_metrics_deleted": hm, "spells_deleted": sp,
-                    "artifacts_deleted": ar}
+                    "artifacts_deleted": ar, "clusters_deleted": cl,
+                    "vacuum_ok": vac_ok, "wal_checkpoint_ok": wal_ok}
 
 
 # --------------------------------------------------------------------------
