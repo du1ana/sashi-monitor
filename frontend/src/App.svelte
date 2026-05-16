@@ -169,6 +169,12 @@
       if (r.ok) {
         await loadClusters();
         await refresh();
+        setTimeout(() => {
+          if (delResult?.status === 'ok' && !delBusy) {
+            delTarget = null;
+            delResult = null;
+          }
+        }, 1500);
       }
     } catch (e) {
       delResult = { status: 'bad', text: 'Request failed: ' + (e.message || e) };
@@ -424,7 +430,9 @@
     </div>
   </header>
 
-  <ClusterPicker bind:clusters bind:activeId={activeCluster} onChange={onClusterChange} />
+  {#if !activeCluster}
+    <ClusterPicker bind:clusters bind:activeId={activeCluster} onChange={onClusterChange} />
+  {/if}
 
   {#if activeClusterMeta}
     <div class="cluster-banner">

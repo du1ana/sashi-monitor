@@ -29,6 +29,7 @@ import shutil
 import signal
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
@@ -56,7 +57,9 @@ METRICS_INTERVAL = 30         # seconds between host-metric samples (normal)
 METRICS_INTERVAL_BOOST = 3    # seconds between samples while a spell is active
 METRICS_BOOST_COOLDOWN = 120  # keep boosted sampling this long after last error tag
 SNAPSHOT_RECAPTURE = 60       # if still in-spell, recapture ps/df/journalctl after this many s
-SNAPSHOT_MAX_CAPTURES = 3     # cap captures per spell
+SNAPSHOT_MAX_CAPTURES = 1     # cap captures per spell (was 3; artifacts dominated DB growth)
+ARTIFACT_RETENTION_DAYS = 3   # artifacts get tighter retention than events — they're bulky
+ARTIFACT_CONTENT_CAP = 65536  # per-artifact text cap (was 200000)
 HARD_FORK_AFTER = 120         # an open spell older than this (no ledger since) ≈ hard fork
 DEFAULT_ROUNDTIME_MS = 2000   # HotPocket roundtime; used for the uptime-% denominator
 # Tags that mean "the cluster/this node is in trouble".
@@ -936,7 +939,7 @@ class Store:
             self.conn.execute(
                 "INSERT INTO spell_artifacts (spell_id, ts, instance, kind, content) "
                 "VALUES (?,?,?,?,?)",
-                (spell_id, ts or time.time(), instance, kind, content[:200000]),
+                (spell_id, ts or time.time(), instance, kind, content[:ARTIFACT_CONTENT_CAP]),
             )
             self.conn.commit()
 
@@ -958,12 +961,17 @@ class Store:
         rows.reverse()
         return rows
 
-    def prune(self, retention_days: int) -> int:
-        cutoff = time.time() - retention_days * 86400
+    def prune(self, retention_days: int,
+              artifact_retention_days: int = ARTIFACT_RETENTION_DAYS) -> int:
+        now = time.time()
+        cutoff = now - retention_days * 86400
+        # Artifacts are bulky (journalctl/dmesg/ss/conntrack dumps) so they get
+        # a tighter cutoff than the main event stream.
+        art_cutoff = now - max(1, artifact_retention_days) * 86400
         with self.lock:
             cur = self.conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
             self.conn.execute("DELETE FROM host_metrics WHERE ts < ?", (cutoff,))
-            self.conn.execute("DELETE FROM spell_artifacts WHERE ts < ?", (cutoff,))
+            self.conn.execute("DELETE FROM spell_artifacts WHERE ts < ?", (art_cutoff,))
             self.conn.execute(
                 "DELETE FROM spells_log WHERE COALESCE(end_ts, start_ts) < ?", (cutoff,))
             self.conn.commit()
@@ -1348,19 +1356,28 @@ class Tail(threading.Thread):
                         if ev:
                             # Spell tracking always runs (so spells open/close
                             # regardless of event-storage policy).
+                            opened_spell = False
                             if self.spell_manager is not None:
                                 try:
-                                    self.spell_manager.on_event(self.instance, ev)
+                                    opened_spell = bool(
+                                        self.spell_manager.on_event(self.instance, ev)
+                                    )
                                 except Exception as e:
                                     print(f"[tail {self.instance[:12]}] spell: {e}",
                                           file=sys.stderr)
-                            track = True
-                            if self.policy is not None:
+                            # Always persist the trigger event of a fresh spell so
+                            # low-severity spells (consensus_lost, out_of_sync,
+                            # warning) still get one tick on the line chart even
+                            # when the policy drops the rest of the flood.
+                            track = opened_spell
+                            if not track and self.policy is not None:
                                 try:
                                     track = self.policy.should_track_event(
                                         self.spell_manager, self.instance, ev["tag"])
                                 except Exception:
                                     track = True
+                            elif not track:
+                                track = True
                             if track:
                                 try:
                                     self.store.insert_event(self.instance, ev)
@@ -1383,11 +1400,17 @@ class Tail(threading.Thread):
                     break
                 backoff = min(backoff * 2, 30.0)
 
-    def _cleanup(self) -> None:
+    def _cleanup(self, fast: bool = False) -> None:
+        # `fast` path is used on process shutdown — skip the SIGINT grace window
+        # because sashi/docker attach chains routinely take >3s to drain, which
+        # then trips systemd's TimeoutStopSec → SIGKILL of the whole unit.
         if self.proc and self.proc.poll() is None:
             try:
-                os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
-                self.proc.wait(timeout=3)
+                if fast:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                else:
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+                    self.proc.wait(timeout=3)
             except Exception:
                 try:
                     self.proc.kill()
@@ -1401,9 +1424,9 @@ class Tail(threading.Thread):
                 pass
             self.master_fd = None
 
-    def shutdown(self) -> None:
+    def shutdown(self, fast: bool = False) -> None:
         self.local_stop.set()
-        self._cleanup()
+        self._cleanup(fast=fast)
 
 
 # --------------------------------------------------------------------------
@@ -1923,10 +1946,12 @@ class SpellManager:
             "last_error_ts": 0.0, "last_ledger_ts": 0.0,
         })
 
-    def on_event(self, instance: str, ev: dict) -> None:
+    def on_event(self, instance: str, ev: dict) -> bool:
+        """Returns True when this event opened a new spell (so the caller can
+        force-track the trigger even when policy would normally drop it)."""
         tag = ev.get("tag")
         if tag not in ERROR_TAGS and tag != "ledger_created":
-            return
+            return False
         ts = ev.get("ts") or time.time()
         with self.lock:
             s = self._st(instance)
@@ -1938,11 +1963,11 @@ class SpellManager:
                     s["spell_id"] = None
                     self.store.close_spell(sid, ts, recovered=1)
                     print(f"[spell] {instance[:16]}: recovered ({sid})")
-                return
+                return False
             # error tag
             s["last_error_ts"] = ts
             if s["in_spell"]:
-                return
+                return False
             sid = f"{instance}-{int(ts)}"
             severity = tag_severity(tag)
             s["in_spell"] = True
@@ -1963,6 +1988,7 @@ class SpellManager:
             if actions.get("snapshot", True):
                 threading.Thread(target=self._snapshot_loop, args=(sid, instance),
                                  daemon=True, name=f"snap-{sid[-12:]}").start()
+            return True
 
     def is_active(self, spell_id: str) -> bool:
         with self.lock:
@@ -3934,14 +3960,20 @@ def make_handler(store: Store, static_html_path: str | None,
             pass
 
         def _send(self, code: int, body: bytes, ctype: str, extra_headers: dict | None = None) -> None:
-            self.send_response(code)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            for k, v in (extra_headers or {}).items():
-                self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                for k, v in (extra_headers or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+            except (ssl.SSLEOFError, ssl.SSLError, ConnectionResetError,
+                    ConnectionAbortedError, BrokenPipeError, TimeoutError):
+                # Client went away mid-response — common for long-polled
+                # dashboards over flaky links. Don't log; not actionable.
+                pass
 
         def _json(self, obj, code: int = 200) -> None:
             self._send(code, json.dumps(obj).encode("utf-8"),
@@ -4525,8 +4557,11 @@ def main() -> None:
             time.sleep(1.0)
     finally:
         server.shutdown()
+        # SIGKILL the sashi/docker-attach children — SIGINT routinely takes
+        # >3s per child to drain, which trips systemd's TimeoutStopSec and
+        # leaves orphaned python procs eating RAM until the next restart.
         for t in list(tails.values()):
-            t.shutdown()
+            t.shutdown(fast=True)
 
 
 if __name__ == "__main__":
