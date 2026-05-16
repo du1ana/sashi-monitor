@@ -3564,10 +3564,16 @@ function setActiveCluster(cid) {
 
 function updateClusterBanner() {
   const banner = document.getElementById('clusterBanner');
+  const panel  = document.getElementById('clusterPanel');
   if (!banner) return;
-  if (!ACTIVE_CLUSTER) { banner.style.display = 'none'; return; }
+  if (!ACTIVE_CLUSTER) {
+    banner.style.display = 'none';
+    if (panel) panel.style.display = '';
+    return;
+  }
   const c = CLUSTERS.find(x => x.contract_id === ACTIVE_CLUSTER);
   banner.style.display = '';
+  if (panel) panel.style.display = 'none';
   document.getElementById('cbId').textContent = ACTIVE_CLUSTER;
   document.getElementById('cbMeta').textContent = c
     ? `· ${c.node_count} node${c.node_count===1?'':'s'}${c.images && c.images.length ? ' · ' + shortImage(c.images[0]) : ''}`
