@@ -61,6 +61,11 @@ SNAPSHOT_MAX_CAPTURES = 1     # cap captures per spell (was 3; artifacts dominat
 ARTIFACT_RETENTION_DAYS = 3   # artifacts get tighter retention than events — they're bulky
 ARTIFACT_CONTENT_CAP = 65536  # per-artifact text cap (was 200000)
 HARD_FORK_AFTER = 120         # an open spell older than this (no ledger since) ≈ hard fork
+# Per-round consensus vote lines (kept/erased/selected, see `proposal_votes`
+# table below). High-volume, short-value — only useful for reconstructing the
+# exact moment of a fork, which per the runbook is always investigated within
+# hours — so it gets its own tight retention, shorter than the events table.
+PROPOSAL_VOTES_RETENTION_DAYS = 2
 DEFAULT_ROUNDTIME_MS = 2000   # HotPocket roundtime; used for the uptime-% denominator
 # Tags that mean "the cluster/this node is in trouble".
 ERROR_TAGS = ("fork_warn", "consensus_lost", "out_of_sync", "error")
@@ -80,6 +85,9 @@ TAG_SEVERITY = {
     "out_of_sync":    "low",
     "consensus_lost": "low",
     "warning":        "low",
+    "vote_kept":      "low",
+    "vote_erased":    "low",
+    "ledger_selected":"low",
 }
 
 # Default settings — overridable at runtime via /api/policy (persisted in the
@@ -138,6 +146,46 @@ LEDGER_INFO_RE = re.compile(
     r"lcl:(?P<lcl>\S+)\s+state:(?P<state>\S+)\s+patch:(?P<patch>[^\s)]+)", re.I
 )
 
+# Per-round consensus vote lines (only present at log.log_level=dbg). These are
+# the ground truth for "who voted for what, when, with what latency" — see
+# consensus.cpp revise_candidate_proposals (kept/erased) and attempt_ledger_close
+# (selected). Parsed out of the raw stream into `proposal_votes` instead of
+# being stored as free-text `events` rows, which is both cheaper and directly
+# queryable.
+#   [s3-91a16393] u/i/t:3/5/1751870481 s:97e82d94 p:d304e622 ps:204-... rs:12-... [frm:self<0ms]
+VOTE_KEPT_RE = re.compile(
+    r"^\[s(?P<stage>\d+)-(?P<hash>[0-9a-fA-F]+)\]\s+"
+    r"u/i/t:(?P<u>\d+)/(?P<i>\d+)/(?P<t>\d+)\s+"
+    r"s:(?P<state>\S+)\s+p:(?P<patch>\S+)\s+"
+    r"ps:(?P<ps>\S+)\s+rs:(?P<rs>\S+)\s+"
+    r"\[frm:(?P<frm>[^<\]]+)<(?P<lat>\d+)ms\]"
+)
+#   Erased [s2-abc123] [frm:9c3f1a2b]
+VOTE_ERASED_RE = re.compile(
+    r"^Erased\s+\[s(?P<stage>\d+)-(?P<hash>[0-9a-fA-F]+)\]\s+\[frm:(?P<frm>[^\]]+)\]"
+)
+#   Closing ledger with proposal:91a16393
+LEDGER_SELECTED_RE = re.compile(r"Closing ledger with proposal:(?P<hash>[0-9a-fA-F]+)", re.I)
+
+
+VOTE_TAG_KIND = {"vote_kept": "kept", "vote_erased": "erased", "ledger_selected": "selected"}
+
+
+def parse_vote_fields(msg: str) -> tuple[str | None, dict | None]:
+    """Match a per-round consensus vote/selection debug line. Returns
+    (tag, fields) or (None, None) if msg isn't one of these."""
+    m = VOTE_KEPT_RE.match(msg)
+    if m:
+        return "vote_kept", m.groupdict()
+    m = VOTE_ERASED_RE.match(msg)
+    if m:
+        return "vote_erased", m.groupdict()
+    m = LEDGER_SELECTED_RE.search(msg)
+    if m:
+        return "ledger_selected", m.groupdict()
+    return None, None
+
+
 # Order matters: first match wins. Most specific first.
 CLASSIFIERS = (
     ("ledger_created",   re.compile(r"\*+\s*Ledger created\s*\*+", re.I)),
@@ -181,12 +229,14 @@ def parse_log_line(line: str, now_ts: float) -> dict | None:
         except ValueError:
             ts = now_ts
         msg = m.group("msg")
+        vote_tag, vote_fields = parse_vote_fields(msg)
         return {
             "ts": ts,
             "level": m.group("level"),
             "module": m.group("module"),
-            "tag": classify(msg),
+            "tag": vote_tag or classify(msg),
             "msg": msg,
+            "vote": vote_fields,
         }
     # Free-form line (contract stdout, etc.)
     return {
@@ -195,6 +245,7 @@ def parse_log_line(line: str, now_ts: float) -> dict | None:
         "module": "contract",
         "tag": classify(line),
         "msg": line,
+        "vote": None,
     }
 
 
@@ -476,6 +527,49 @@ CREATE TABLE IF NOT EXISTS spell_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_artifacts_spell ON spell_artifacts(spell_id, ts);
 
+-- Per-round consensus vote lines (log.log_level=dbg only): who proposed what
+-- for this stage/root_hash, who got pruned as stale, and which root_hash a
+-- node actually closed. This is the ground truth for "who approved/accepted
+-- this ledger" instead of inferring it from fork_warn spam after the fact.
+-- kind: 'kept' | 'erased' | 'selected'. from_pubkey is 'self' or a short hex
+-- prefix; NULL for 'selected' rows (those describe this node's own close).
+CREATE TABLE IF NOT EXISTS proposal_votes (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    instance               TEXT    NOT NULL,
+    ts                     REAL    NOT NULL,
+    kind                   TEXT    NOT NULL,
+    stage                  INTEGER,
+    root_hash              TEXT,
+    from_pubkey            TEXT,
+    latency_ms             INTEGER,
+    last_primary_shard_id  TEXT,
+    last_raw_shard_id      TEXT,
+    state_hash             TEXT,
+    patch_hash             TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_pv_inst_ts ON proposal_votes(instance, ts);
+CREATE INDEX IF NOT EXISTS idx_pv_hash    ON proposal_votes(root_hash);
+
+-- Confirmed chain-split events: two+ instances of the same cluster closed
+-- DIFFERENT hashes at the SAME ledger seq_no. This is the direct, automatic
+-- version of what §11 of HOTPOCKET_CONSENSUS_INVESTIGATION.md did by hand
+-- (comparing lcl hashes across hosts' logs) — distinguishes a real chain
+-- split from a mere vote-visibility split (same hash, quorum just didn't
+-- see enough votes; no row here for that case since there's only one hash).
+CREATE TABLE IF NOT EXISTS fork_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           REAL    NOT NULL,
+    contract_id  TEXT,
+    seq_no       INTEGER NOT NULL,
+    hash_a       TEXT    NOT NULL,
+    instances_a  TEXT    NOT NULL,  -- JSON array of instance names
+    hash_b       TEXT    NOT NULL,
+    instances_b  TEXT    NOT NULL,
+    UNIQUE(contract_id, seq_no, hash_a, hash_b)
+);
+CREATE INDEX IF NOT EXISTS idx_fork_events_ts ON fork_events(ts);
+CREATE INDEX IF NOT EXISTS idx_fork_events_cid ON fork_events(contract_id, seq_no);
+
 -- Runtime settings (tracking policy, etc.). Single-row key/value store so the
 -- frontend can flip the DB-tracking mode without restarting the daemon.
 CREATE TABLE IF NOT EXISTS settings (
@@ -519,6 +613,44 @@ class Store:
                 (instance, ev["ts"], ev["level"], ev["module"], ev["tag"], ev["msg"]),
             )
             self.conn.commit()
+
+    def insert_proposal_vote(self, instance: str, ts: float, kind: str,
+                             fields: dict) -> None:
+        """`fields` is the regex groupdict from parse_vote_fields(); missing
+        keys (e.g. 'selected' rows have no stage/from/latency) default to None."""
+        lat = fields.get("lat")
+        with self.lock:
+            self.conn.execute(
+                "INSERT INTO proposal_votes "
+                "(instance, ts, kind, stage, root_hash, from_pubkey, latency_ms, "
+                " last_primary_shard_id, last_raw_shard_id, state_hash, patch_hash) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (instance, ts, kind,
+                 int(fields["stage"]) if fields.get("stage") is not None else None,
+                 fields.get("hash"), fields.get("frm"),
+                 int(lat) if lat is not None else None,
+                 fields.get("ps"), fields.get("rs"),
+                 fields.get("state"), fields.get("patch")),
+            )
+            self.conn.commit()
+
+    def proposal_votes_window(self, since: float, until: float | None = None,
+                              instance: str | None = None,
+                              root_hash: str | None = None,
+                              limit: int = 5000) -> list[dict]:
+        if until is None:
+            until = time.time()
+        q = "SELECT * FROM proposal_votes WHERE ts>=? AND ts<=?"
+        args: list = [since, until]
+        if instance:
+            q += " AND instance=?"; args.append(instance)
+        if root_hash:
+            q += " AND root_hash=?"; args.append(root_hash)
+        q += " ORDER BY ts DESC LIMIT ?"; args.append(limit)
+        with self.lock:
+            cur = self.conn.execute(q, args)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     def upsert_instance(self, info: dict) -> None:
         now = time.time()
@@ -924,7 +1056,7 @@ class Store:
         for r in rows:
             if r["end_ts"] is None:
                 age = now - r["start_ts"]
-                r["state"] = "hard_fork?" if age > HARD_FORK_AFTER else "active"
+                r["state"] = "potential_fork" if age > HARD_FORK_AFTER else "active"
                 r["duration_s"] = age
             else:
                 r["state"] = "recovered" if r.get("recovered") else "ended"
@@ -962,16 +1094,21 @@ class Store:
         return rows
 
     def prune(self, retention_days: int,
-              artifact_retention_days: int = ARTIFACT_RETENTION_DAYS) -> int:
+              artifact_retention_days: int = ARTIFACT_RETENTION_DAYS,
+              proposal_votes_retention_days: int = PROPOSAL_VOTES_RETENTION_DAYS) -> int:
         now = time.time()
         cutoff = now - retention_days * 86400
         # Artifacts are bulky (journalctl/dmesg/ss/conntrack dumps) so they get
         # a tighter cutoff than the main event stream.
         art_cutoff = now - max(1, artifact_retention_days) * 86400
+        # Per-round vote lines are high-volume/short-value — tighter cutoff too.
+        pv_cutoff = now - max(1, proposal_votes_retention_days) * 86400
         with self.lock:
             cur = self.conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
             self.conn.execute("DELETE FROM host_metrics WHERE ts < ?", (cutoff,))
             self.conn.execute("DELETE FROM spell_artifacts WHERE ts < ?", (art_cutoff,))
+            self.conn.execute("DELETE FROM proposal_votes WHERE ts < ?", (pv_cutoff,))
+            self.conn.execute("DELETE FROM fork_events WHERE ts < ?", (cutoff,))
             self.conn.execute(
                 "DELETE FROM spells_log WHERE COALESCE(end_ts, start_ts) < ?", (cutoff,))
             self.conn.commit()
@@ -1029,6 +1166,7 @@ class Store:
                 "status": status, "last_seen": last_seen,
             })
         hard_set = self.hard_forked_clusters()
+        split_set = self.chain_split_clusters()
         out = []
         seen_cids = set()
         for cid, label, monitored, first_seen, last_seen in cluster_rows:
@@ -1047,6 +1185,7 @@ class Store:
                 "images":      images,
                 "instances":   insts,
                 "hard_forked": cid in hard_set,
+                "chain_split": cid in split_set,
             })
         # Surface instances whose contract_id has no row in `clusters` yet
         # (race condition between upserts) so the UI never hides them.
@@ -1064,6 +1203,7 @@ class Store:
                 "images":      sorted({i["image"]  for i in insts if i.get("image")}),
                 "instances":   insts,
                 "hard_forked": cid in hard_set,
+                "chain_split": cid in split_set,
             })
         return out
 
@@ -1088,6 +1228,55 @@ class Store:
                 "  AND i.contract_id IS NOT NULL",
                 (cutoff,),
             ).fetchall()
+        return {r[0] for r in rows if r[0]}
+
+    def insert_fork_event(self, ts: float, contract_id: str | None, seq_no: int,
+                          hash_a: str, instances_a: list, hash_b: str,
+                          instances_b: list) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO fork_events "
+                "(ts, contract_id, seq_no, hash_a, instances_a, hash_b, instances_b) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (ts, contract_id, seq_no, hash_a, json.dumps(instances_a),
+                 hash_b, json.dumps(instances_b)),
+            )
+            self.conn.commit()
+
+    def fork_events_window(self, since: float, until: float | None = None,
+                           contract_id: str | None = None,
+                           limit: int = 500) -> list[dict]:
+        if until is None:
+            until = time.time()
+        q = "SELECT * FROM fork_events WHERE ts>=? AND ts<=?"
+        args: list = [since, until]
+        if contract_id:
+            q += " AND contract_id=?"; args.append(contract_id)
+        q += " ORDER BY ts DESC LIMIT ?"; args.append(limit)
+        with self.lock:
+            cur = self.conn.execute(q, args)
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for r in rows:
+            r["instances_a"] = json.loads(r["instances_a"])
+            r["instances_b"] = json.loads(r["instances_b"])
+        return rows
+
+    def chain_split_clusters(self, since: float | None = None) -> set[str]:
+        """contract_ids with a confirmed chain split (two different hashes at
+        the same seq_no) — a stronger, direct signal than `hard_forked_clusters`
+        (which only infers a hard fork from spell *age*). since=None → all-time."""
+        with self.lock:
+            if since is None:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT contract_id FROM fork_events "
+                    "WHERE contract_id IS NOT NULL"
+                ).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT DISTINCT contract_id FROM fork_events "
+                    "WHERE contract_id IS NOT NULL AND ts>=?", (since,)
+                ).fetchall()
         return {r[0] for r in rows if r[0]}
 
     def cluster_for_instance(self, name: str) -> str | None:
@@ -1116,7 +1305,7 @@ class Store:
             stale = existing - (names_to_keep or set())
             if not stale:
                 return {"instances": 0, "events": 0, "host_metrics": 0,
-                        "spells": 0, "artifacts": 0}
+                        "spells": 0, "artifacts": 0, "proposal_votes": 0}
             placeholders = ",".join("?" * len(stale))
             args = tuple(stale)
             spell_ids = [r[0] for r in self.conn.execute(
@@ -1124,9 +1313,12 @@ class Store:
                 args,
             )]
             counts = {"instances": 0, "events": 0, "host_metrics": 0,
-                      "spells": 0, "artifacts": 0}
+                      "spells": 0, "artifacts": 0, "proposal_votes": 0}
             counts["events"] = self.conn.execute(
                 f"DELETE FROM events WHERE instance IN ({placeholders})", args
+            ).rowcount
+            counts["proposal_votes"] = self.conn.execute(
+                f"DELETE FROM proposal_votes WHERE instance IN ({placeholders})", args
             ).rowcount
             counts["host_metrics"] = self.conn.execute(
                 f"DELETE FROM host_metrics WHERE instance IN ({placeholders})", args
@@ -1208,6 +1400,8 @@ class Store:
             sp = self.conn.execute("DELETE FROM spells_log").rowcount
             ar = self.conn.execute("DELETE FROM spell_artifacts").rowcount
             cl = self.conn.execute("DELETE FROM clusters").rowcount
+            pv = self.conn.execute("DELETE FROM proposal_votes").rowcount
+            fe = self.conn.execute("DELETE FROM fork_events").rowcount
             self.conn.commit()
 
             wal_ok = False
@@ -1242,6 +1436,7 @@ class Store:
             return {"events_deleted": ev, "instances_deleted": ins,
                     "host_metrics_deleted": hm, "spells_deleted": sp,
                     "artifacts_deleted": ar, "clusters_deleted": cl,
+                    "proposal_votes_deleted": pv, "fork_events_deleted": fe,
                     "vacuum_ok": vac_ok, "wal_checkpoint_ok": wal_ok}
 
 
@@ -1297,10 +1492,73 @@ class PolicyManager:
         return POLICY_MODES["balanced"][spell["severity"]]["events"]
 
 
+class ForkDetector:
+    """Cross-instance LCL comparison, fed a `ledger_created` event from every
+    tailed instance. Flags the moment two+ instances of the SAME cluster hold
+    DIFFERENT hashes at the SAME ledger seq_no — a confirmed chain split, as
+    opposed to a `fork_warn` log line (which only means "no quorum this
+    round" and self-heals most of the time, per
+    HOTPOCKET_CONSENSUS_INVESTIGATION.md §3.2/§11.3's "vote-visibility split").
+
+    This is the automatic version of what that investigation did by hand:
+    grep every host's log for the last `****Ledger created****` line and
+    compare lcl hashes across hosts.
+    """
+
+    def __init__(self, store: Store):
+        self.store = store
+        self.lock = threading.Lock()
+        # contract_id -> seq_no -> hash -> set(instance)
+        self._seen: dict[str, dict[int, dict[str, set]]] = {}
+        # (contract_id, seq_no, hash_a, hash_b) pairs already recorded.
+        self._recorded: set[tuple] = set()
+        # Bound memory per contract: only compare against this many recent
+        # seq_nos (a hard fork's divergence point is always within a handful
+        # of ledgers of "now", not the whole chain history).
+        self._max_tracked_seqs = 64
+
+    def on_ledger_created(self, instance: str, contract_id: str | None,
+                          ts: float, lcl: str | None) -> None:
+        if not contract_id or not lcl or "-" not in lcl:
+            return
+        seq_str, _, hsh = lcl.partition("-")
+        try:
+            seq = int(seq_str)
+        except ValueError:
+            return
+        with self.lock:
+            by_seq = self._seen.setdefault(contract_id, {})
+            by_hash = by_seq.setdefault(seq, {})
+            by_hash.setdefault(hsh, set()).add(instance)
+
+            for other_hash, other_insts in list(by_hash.items()):
+                if other_hash == hsh or instance in other_insts:
+                    continue
+                key_lo, key_hi = sorted((hsh, other_hash))
+                rec_key = (contract_id, seq, key_lo, key_hi)
+                if rec_key in self._recorded:
+                    continue
+                self._recorded.add(rec_key)
+                try:
+                    self.store.insert_fork_event(
+                        ts=ts, contract_id=contract_id, seq_no=seq,
+                        hash_a=key_lo, instances_a=sorted(by_hash.get(key_lo, [])),
+                        hash_b=key_hi, instances_b=sorted(by_hash.get(key_hi, [])),
+                    )
+                    print(f"[fork] CONFIRMED chain split: cluster {contract_id[:12]} "
+                          f"seq {seq}: {key_lo} vs {key_hi}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[fork] insert_fork_event failed: {e}", file=sys.stderr)
+
+            if len(by_seq) > self._max_tracked_seqs:
+                for old_seq in sorted(by_seq)[:-self._max_tracked_seqs]:
+                    del by_seq[old_seq]
+
+
 class Tail(threading.Thread):
     def __init__(self, instance: str, store: Store, stop_event: threading.Event,
                  sashi_bin: str, spell_manager=None, policy: "PolicyManager | None" = None,
-                 contract_id: str | None = None):
+                 contract_id: str | None = None, fork_detector: "ForkDetector | None" = None):
         super().__init__(daemon=True, name=f"tail-{instance[:12]}")
         self.instance = instance
         self.contract_id = contract_id
@@ -1313,6 +1571,7 @@ class Tail(threading.Thread):
         self.sashi_bin = sashi_bin
         self.spell_manager = spell_manager
         self.policy = policy
+        self.fork_detector = fork_detector
         self.proc: subprocess.Popen | None = None
         self.master_fd: int | None = None
 
@@ -1380,10 +1639,28 @@ class Tail(threading.Thread):
                                 track = True
                             if track:
                                 try:
-                                    self.store.insert_event(self.instance, ev)
+                                    kind = VOTE_TAG_KIND.get(ev["tag"])
+                                    if kind and ev.get("vote"):
+                                        # Structured, compact — replaces what
+                                        # would otherwise be a raw free-text
+                                        # `info_other` row per vote line.
+                                        self.store.insert_proposal_vote(
+                                            self.instance, ev["ts"], kind, ev["vote"])
+                                    else:
+                                        self.store.insert_event(self.instance, ev)
                                 except Exception as e:
                                     print(f"[tail {self.instance[:12]}] db: {e}",
                                           file=sys.stderr)
+                            if ev["tag"] == "ledger_created" and self.fork_detector is not None:
+                                m = LEDGER_INFO_RE.search(ev["msg"])
+                                if m:
+                                    try:
+                                        self.fork_detector.on_ledger_created(
+                                            self.instance, self.contract_id,
+                                            ev["ts"], m.group("lcl"))
+                                    except Exception as e:
+                                        print(f"[tail {self.instance[:12]}] fork: {e}",
+                                              file=sys.stderr)
             except FileNotFoundError:
                 print(f"[tail {self.instance[:12]}] '{self.sashi_bin}' not found",
                       file=sys.stderr)
@@ -1438,7 +1715,8 @@ class Discoverer(threading.Thread):
                  stop_event: threading.Event, sashi_bin: str,
                  interval: int = DISCOVER_INTERVAL, spell_manager=None,
                  policy: "PolicyManager | None" = None,
-                 auto_monitor_new: bool = False):
+                 auto_monitor_new: bool = False,
+                 fork_detector: "ForkDetector | None" = None):
         super().__init__(daemon=True, name="discover")
         self.store = store
         self.tails = tails
@@ -1448,6 +1726,7 @@ class Discoverer(threading.Thread):
         self.spell_manager = spell_manager
         self.policy = policy
         self.auto_monitor_new = auto_monitor_new
+        self.fork_detector = fork_detector
         self._wake = threading.Event()
 
     def trigger(self) -> None:
@@ -1516,7 +1795,8 @@ class Discoverer(threading.Thread):
                 t = Tail(name, self.store, self.stop_event, self.sashi_bin,
                          spell_manager=self.spell_manager,
                          policy=self.policy,
-                         contract_id=cid)
+                         contract_id=cid,
+                         fork_detector=self.fork_detector)
                 self.tails[name] = t
                 t.start()
                 started += 1
@@ -2587,7 +2867,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .card .sp::before { content: "\25CF"; }
   .card .sp.recovered::before { color: var(--warn); }
   .card .sp.active::before    { color: var(--bad); }
-  .card .sp.hardfork::before  { color: var(--bad); text-shadow: 0 0 6px var(--bad-dim); }
+  .card .sp.potentialfork::before  { color: var(--bad); text-shadow: 0 0 6px var(--bad-dim); }
   .card .sp.ended::before     { color: var(--fg-faint); }
   .card .sp .st  { flex: 0 0 70px; color: var(--fg); }
   .card .sp .tg  { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2609,7 +2889,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .ribbon .blk:hover { opacity:1; transform: scaleY(1.12); }
   .ribbon .blk.recovered { background: var(--warn); }
   .ribbon .blk.active    { background: var(--bad); animation: pulse 1.4s ease-in-out infinite; }
-  .ribbon .blk.hardfork  { background: var(--bad); box-shadow: 0 0 0 1px var(--bad), 0 0 8px var(--bad-dim) inset; }
+  .ribbon .blk.potentialfork  { background: var(--bad); box-shadow: 0 0 0 1px var(--bad), 0 0 8px var(--bad-dim) inset; }
   .ribbon .blk.ended     { background: var(--fg-faint); }
   .ribbon .axl { position:absolute; bottom:1px; font-family:var(--mono); font-size:9px; color:var(--fg-faint); }
   .ribbon-legend { font-family:var(--mono); font-size:9px; color:var(--fg-dim); margin-top:5px;
@@ -2659,7 +2939,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .spell-item { border:1px solid var(--line); border-left-width:2px; border-radius:3px; overflow:hidden; background:var(--bg); }
   .spell-item.recovered { border-left-color:var(--warn); }
   .spell-item.active    { border-left-color:var(--bad); }
-  .spell-item.hardfork  { border-left-color:var(--bad); box-shadow:inset 3px 0 14px var(--bad-dim); }
+  .spell-item.potentialfork  { border-left-color:var(--bad); box-shadow:inset 3px 0 14px var(--bad-dim); }
   .spell-item.ended     { border-left-color:var(--fg-faint); }
   .spell-item > summary { list-style:none; cursor:pointer; padding:7px 12px; display:flex; gap:12px; align-items:center;
                           font-family:var(--mono); font-size:11px; }
@@ -2670,7 +2950,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   .spell-item > summary:hover { background:var(--bg2); }
   .spell-item .st { flex:0 0 86px; font-weight:600; }
   .spell-item.recovered .st { color:var(--warn); } .spell-item.active .st { color:var(--bad); }
-  .spell-item.hardfork .st { color:var(--bad); } .spell-item.ended .st { color:var(--fg-faint); }
+  .spell-item.potentialfork .st { color:var(--bad); } .spell-item.ended .st { color:var(--fg-faint); }
   .spell-item .ins { flex:0 0 150px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .spell-item .tg  { flex:0 0 124px; color:var(--bad); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .spell-item .ms  { flex:1 1 120px; color:var(--fg-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -2695,7 +2975,23 @@ DASHBOARD_HTML = r"""<!doctype html>
   .evtline .e.fork_warn .g, .evtline .e.error .g { color:var(--bad); }
   .evtline .e.consensus_lost .g, .evtline .e.out_of_sync .g { color:var(--warn); }
   .evtline .e.ledger_created .g { color:var(--ok); }
+  .evtline .e.vote_kept .g { color:var(--ok); }
+  .evtline .e.vote_erased .g { color:var(--fg-dim); text-decoration:line-through; }
+  .evtline .e.ledger_selected .g { color:var(--warn); font-weight:700; }
   .evtline .e .m { color:var(--fg-dim); white-space:pre-wrap; word-break:break-word; }
+  .chain-split-badge { display:inline-block; padding:1px 7px; margin-left:6px; font-family:var(--mono);
+    font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.06em;
+    color:var(--bad); border:1px solid var(--bad); border-radius:2px;
+    box-shadow:0 0 6px var(--bad-dim); animation: pulse 1.6s ease-in-out infinite; }
+  #forkEvents:empty { display:none; }
+  #forkEvents { margin:0 0 10px; padding:8px 10px; border:1px solid var(--bad); border-radius:3px;
+    background: rgba(255,90,82,.06); font-family:var(--mono); font-size:11px; }
+  #forkEvents .fe-h { color:var(--bad); font-weight:700; text-transform:uppercase; letter-spacing:.05em;
+    font-size:10px; margin-bottom:5px; }
+  #forkEvents .fe-row { display:flex; gap:10px; flex-wrap:wrap; padding:2px 0; color:var(--fg-dim); }
+  #forkEvents .fe-row b { color:var(--fg); }
+  #forkEvents .fe-row .hash-a { color:var(--warn); }
+  #forkEvents .fe-row .hash-b { color:var(--bad); }
   /* artifact "pills" — nested expandable <details> inside a spell */
   .arts .cap-h { font-family:var(--mono); font-size:9.5px; color:var(--fg-dim); margin:12px 0 6px; display:flex; gap:8px; align-items:center; }
   .arts .cap-h:first-child { margin-top:0; }
@@ -2848,10 +3144,11 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="ribbon-legend">
         <i class="l-rec">recovered (ledger resumed)</i>
         <i class="l-act">active now</i>
-        <i class="l-hf">hard fork? (open &gt;120s, no ledger)</i>
+        <i class="l-hf">potential fork (open &gt;120s, no ledger)</i>
         <i class="l-end">ended</i>
         <span style="margin-left:auto" id="spellCount"></span>
       </div>
+      <div id="forkEvents"></div>
       <div class="spelllist" id="spellRows"></div>
     </div>
   </div>
@@ -3083,12 +3380,13 @@ let OPEN_SPELLS = new Set(); // spell_ids currently expanded in the spells panel
 let SPELL_LIST_KEY = '';     // signature of the rendered spell list, to avoid needless rebuilds
 
 async function refreshHost(win) {
-  let machine = [], procRows = [], spells = [];
+  let machine = [], procRows = [], spells = [], forkEvents = [];
   try {
-    [machine, procRows, spells] = await Promise.all([
+    [machine, procRows, spells, forkEvents] = await Promise.all([
       fetchJSON(`/api/host_metrics?instance=machine&window=${win}`),
       fetchJSON(`/api/host_metrics?window=${win}&limit=20000`),
       fetchJSON(`/api/spells_log?window=86400` + clusterQS()),
+      fetchJSON(`/api/fork_events?window=86400` + (ACTIVE_CLUSTER ? '&contract_id=' + encodeURIComponent(ACTIVE_CLUSTER) : '')),
     ]);
   } catch (e) { document.getElementById('hostMeta').textContent = 'host: ' + e.message; return; }
   machine = machine.slice().reverse();                 // API returns DESC
@@ -3145,7 +3443,7 @@ async function refreshHost(win) {
     if (rows.length >= 5) { const a=rows[0].proc_rss_mb, b=rows[rows.length-1].proc_rss_mb;
       if (a>0 && b>a*2 && b-a>100) v.push(`${name.slice(0,16)} RSS ${Math.round(a)}→${Math.round(b)}MB this window — possible leak → eventual OOM`); }
   }
-  const openHF = spells.filter(s => s.state === 'hard_fork?' || s.state === 'active');
+  const openHF = spells.filter(s => s.state === 'potential_fork' || s.state === 'active');
   if (openHF.length) v.unshift(`${openHF.length} spell(s) OPEN now — ${openHF.map(s=>(s.instance||'').slice(0,12)).join(', ')}`);
   document.getElementById('hostVerdict').innerHTML = v.length ? v.map(t=>'⚠ '+esc(t)).join('<br>') : '';
 
@@ -3155,6 +3453,25 @@ async function refreshHost(win) {
   renderStatusBar(last, v, openHF, lastAge, byInst);
   renderRibbon(spells);
   renderSpellsPanel(spells);
+  renderForkEvents(forkEvents);
+}
+
+// Confirmed chain splits (fork_events): two+ instances closed DIFFERENT
+// hashes at the SAME ledger seq_no. Distinct from — and a stronger signal
+// than — the ribbon's "potential fork" (which only infers from spell age).
+function renderForkEvents(events) {
+  const host = document.getElementById('forkEvents');
+  if (!host) return;
+  if (!events || !events.length) { host.innerHTML = ''; return; }
+  const ord = events.slice().sort((a, b) => b.ts - a.ts);
+  host.innerHTML = `<div class="fe-h">⚠ ${ord.length} confirmed chain split${ord.length===1?'':'s'} — different lcl hash at the same ledger, not just a fork_warn blip</div>` +
+    ord.map(e => `<div class="fe-row">` +
+      `<span>${esc(new Date(e.ts * 1000).toLocaleString())}</span>` +
+      `<span>seq <b>${e.seq_no}</b></span>` +
+      `<span class="hash-a">${esc(shortHash(e.hash_a))} <b>(${(e.instances_a||[]).map(n=>esc(n.slice(0,12))).join(', ')})</b></span>` +
+      `<span>vs</span>` +
+      `<span class="hash-b">${esc(shortHash(e.hash_b))} <b>(${(e.instances_b||[]).map(n=>esc(n.slice(0,12))).join(', ')})</b></span>` +
+    `</div>`).join('');
 }
 
 // ---- host status bar (homescreen at-a-glance) -----------------------
@@ -3220,7 +3537,7 @@ function expandSpellRow(spellId) {
 }
 
 // ---- inline-expandable spell list (spells panel) --------------------
-const spellCls = s => s.state === 'recovered' ? 'recovered' : s.state === 'active' ? 'active' : s.state === 'hard_fork?' ? 'hardfork' : 'ended';
+const spellCls = s => s.state === 'recovered' ? 'recovered' : s.state === 'active' ? 'active' : s.state === 'potential_fork' ? 'potentialfork' : 'ended';
 const durBucket = s => String(Math.round((s.duration_s || 0) / 30));
 const spellPrefix = id => 'r' + String(id).replace(/[^a-zA-Z0-9]/g, '_');
 function spellSummaryHTML(s) {
@@ -3273,12 +3590,13 @@ async function renderSpellDetail(container, spellId, prefix) {
   const startTs = meta.start_ts || (Date.now() / 1000 - 600);
   const endTs = meta.end_ts || (Date.now() / 1000);
   const p0 = startTs - 90, p1 = endTs + 90;
-  let arts = [], hm = [], evs = [];
+  let arts = [], hm = [], evs = [], votes = [];
   try {
-    [arts, hm, evs] = await Promise.all([
+    [arts, hm, evs, votes] = await Promise.all([
       fetchJSON('/api/spell_artifacts?spell_id=' + encodeURIComponent(spellId)),
       fetchJSON(`/api/host_metrics?window=86400&limit=20000`),
       fetchJSON(`/api/events?instance=${encodeURIComponent(meta.instance || '')}&since=${p0}&until=${p1}&limit=2000`),
+      fetchJSON(`/api/proposal_votes?instance=${encodeURIComponent(meta.instance || '')}&since=${p0}&until=${p1}&limit=2000`),
     ]);
   } catch (e) { container.innerHTML = '<div style="color:var(--bad)">error: ' + esc(e.message) + '</div>'; return; }
 
@@ -3295,7 +3613,7 @@ async function renderSpellDetail(container, spellId, prefix) {
     `state <b class="${(meta.state && meta.state !== 'recovered' && meta.state !== 'ended') ? 'bad' : ''}">${esc(meta.state || '?')}</b> · ` +
     `started <b>${esc(new Date(startTs * 1000).toLocaleString())}</b> · duration <b>${dur}</b> · ` +
     `trigger <b class="bad">${esc(meta.trigger_tag || '?')}</b> ${esc((meta.trigger_msg || '').slice(0, 160))}</div>` +
-    `<div class="hdrline">${arts.length} artifacts · ${boosted} boosted (3s) host samples · ${evs.length} log events in window</div>`;
+    `<div class="hdrline">${arts.length} artifacts · ${boosted} boosted (3s) host samples · ${evs.length} log events · ${votes.length} vote lines in window</div>`;
 
   html += `<h4>host metrics — spell window ±90s${boosted ? ` · ${boosted} boosted samples` : ''}</h4>`;
   html += `<div class="dgrid">` +
@@ -3313,6 +3631,23 @@ async function renderSpellDetail(container, spellId, prefix) {
     html += `<div class="evtline">` + ord.map(e =>
       `<div class="e ${esc(e.tag)}"><span class="t">${tsClock(e.ts)}</span><span class="g">${esc(e.tag)}</span><span class="m">${esc((e.msg || '').slice(0, 400))}</span></div>`
     ).join('') + `</div>`;
+  }
+
+  html += `<h4>consensus votes around the spell (${votes.length}) — who this node's stage-3 counted, kept, or erased, and what it closed</h4>`;
+  if (!votes.length) html += `<div style="color:var(--fg-faint);font-family:var(--mono);font-size:11px">no vote lines captured — set log.log_level to "dbg" in hp.cfg.override to enable this</div>`;
+  else {
+    const vord = votes.slice().sort((a, b) => a.ts - b.ts);
+    html += `<div class="evtline">` + vord.map(v => {
+      const who = v.from_pubkey === 'self' ? 'self' : shortHash(v.from_pubkey || '');
+      let msg;
+      if (v.kind === 'selected') msg = `closed with root_hash ${shortHash(v.root_hash)}`;
+      else msg = `s${v.stage ?? '?'} ${v.kind} root_hash:${shortHash(v.root_hash)} frm:${who}` +
+        (v.latency_ms != null ? ` lat:${v.latency_ms}ms` : '') +
+        (v.last_primary_shard_id ? ` ps:${shortHash(v.last_primary_shard_id)}` : '') +
+        (v.state_hash ? ` state:${shortHash(v.state_hash)}` : '');
+      const tag = v.kind === 'kept' ? 'vote_kept' : v.kind === 'erased' ? 'vote_erased' : 'ledger_selected';
+      return `<div class="e ${tag}"><span class="t">${tsClock(v.ts)}</span><span class="g">${esc(tag)}</span><span class="m">${esc(msg)}</span></div>`;
+    }).join('') + `</div>`;
   }
 
   html += `<h4>captured snapshots — journalctl / dmesg / ps / df / chronyc / contract log (${arts.length}) — each is its own expandable pill with a grep box</h4>`;
@@ -3406,10 +3741,10 @@ function renderCardSpells(card, name) {
   }
   const showAll = !!CARD_SPELLS_ALL[name];
   const list = showAll ? mine : mine.slice(0, 5);
-  const unresolved = mine.filter(s => s.state === 'active' || s.state === 'hard_fork?').length;
+  const unresolved = mine.filter(s => s.state === 'active' || s.state === 'potential_fork').length;
   let html = `<div class="hdr">error spells · 24h — ${mine.length}${unresolved ? ` · <b style="color:var(--bad)">${unresolved} open</b>` : ''} · click → expand</div>`;
   html += list.map(s => {
-    const cls = s.state==='recovered'?'recovered' : s.state==='active'?'active' : s.state==='hard_fork?'?'hardfork' : 'ended';
+    const cls = s.state==='recovered'?'recovered' : s.state==='active'?'active' : s.state==='potential_fork'?'potentialfork' : 'ended';
     return `<div class="sp ${cls}" data-sid="${esc(s.spell_id)}" title="${esc(s.state)} · ${esc(s.trigger_tag||'')} · ${esc(new Date(s.start_ts*1000).toLocaleString())}">` +
       `<span class="st">${esc(s.state)}</span>` +
       `<span class="tg">${esc(s.trigger_tag||'')}${s.trigger_msg?' · '+esc((s.trigger_msg||'').slice(0,38)):''}</span>` +
@@ -3576,7 +3911,7 @@ function updateClusterBanner() {
   if (panel) panel.style.display = 'none';
   document.getElementById('cbId').textContent = ACTIVE_CLUSTER;
   document.getElementById('cbMeta').textContent = c
-    ? `· ${c.node_count} node${c.node_count===1?'':'s'}${c.images && c.images.length ? ' · ' + shortImage(c.images[0]) : ''}`
+    ? `· ${c.node_count} node${c.node_count===1?'':'s'}${c.images && c.images.length ? ' · ' + shortImage(c.images[0]) : ''}${c.chain_split ? ' · CHAIN SPLIT' : ''}`
     : '';
 }
 
@@ -3639,6 +3974,7 @@ function renderClusters() {
         `<div class="id-row">` +
           `<span class="cid">${esc(shortCid(c.contract_id))}</span>` +
           `<span class="np${c.node_count>0?' hot':''}">${c.node_count} node${c.node_count===1?'':'s'}</span>` +
+          (c.chain_split ? `<span class="chain-split-badge" title="two+ instances confirmed on different lcl hashes at the same seq_no">chain split</span>` : '') +
         `</div>` +
         `<div class="meta-row">` +
           (tenants?`<span><b>tenant</b>${esc(tenants)}</span>`:'') +
@@ -4117,6 +4453,33 @@ def make_handler(store: Store, static_html_path: str | None,
                 self._json(store.open_spells())
                 return
 
+            if u.path == "/api/proposal_votes":
+                inst = qs.get("instance", [None])[0]
+                root_hash = qs.get("root_hash", [None])[0]
+                limit = int(qs.get("limit", ["5000"])[0])
+                if "since" in qs:
+                    # Absolute window (e.g. a spell's start_ts-90 .. end_ts+90),
+                    # same convention as /api/events.
+                    since = float(qs["since"][0])
+                    until = float(qs["until"][0]) if "until" in qs else time.time()
+                else:
+                    window = _parse_window(qs.get("window", [None])[0])
+                    until = time.time()
+                    since = (until - 3600.0) if window <= 0 else (until - window)
+                self._json(store.proposal_votes_window(
+                    since, until, instance=inst, root_hash=root_hash, limit=limit))
+                return
+
+            if u.path == "/api/fork_events":
+                cid = qs.get("contract_id", [None])[0]
+                window = _parse_window(qs.get("window", [None])[0])
+                until = time.time()
+                since = (until - 86400.0) if window <= 0 else (until - window)
+                limit = int(qs.get("limit", ["500"])[0])
+                self._json(store.fork_events_window(
+                    since, until, contract_id=cid, limit=limit))
+                return
+
             if u.path == "/api/report":
                 window = _parse_window(qs.get("window", ["all"])[0])
                 self_only = qs.get("self", ["0"])[0] in ("1", "true", "yes")
@@ -4510,9 +4873,11 @@ def main() -> None:
         metrics.tick_cb = spell_mgr.tick
         metrics.start()
 
+    fork_detector = ForkDetector(store)
     discoverer = Discoverer(store, tails, stop, sashi_path,
                             spell_manager=spell_mgr, policy=policy,
-                            auto_monitor_new=args.auto_monitor_new)
+                            auto_monitor_new=args.auto_monitor_new,
+                            fork_detector=fork_detector)
     discoverer.start()
     Pruner(store, stop, args.retention_days).start()
 
