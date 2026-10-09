@@ -1,12 +1,9 @@
-// Copies the single-file build to repo root so the daemon
-// (and installer) can serve/deploy it directly.
+// Copy the single-file build next to sashimon.py, which serves it as the dashboard.
 import { copyFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const src  = resolve(here, '..', 'dist', 'index.html');
-const dst  = resolve(here, '..', '..', 'index.html');
-
-copyFileSync(src, dst);
+const dst = resolve(here, '..', '..', 'dashboard.html');
+copyFileSync(resolve(here, '..', 'dist', 'index.html'), dst);
 console.log('[postbuild] wrote', dst);

@@ -1,29 +1,32 @@
 #!/usr/bin/env bash
-# Sashimon installer. Run as root.
+# sashimon installer (v2). Run as root on a Sashimono host.
 #
 # One-liner:
 #   curl -fsSL https://raw.githubusercontent.com/du1ana/sashi-monitor/main/install.sh | sudo bash
 #
-# Override repo via env:
-#   SASHIMON_REPO=https://raw.githubusercontent.com/foo/bar/main \
-#   SASHIMON_PORT=9000 SASHIMON_BIND=127.0.0.1 \
-#   curl -fsSL "$SASHIMON_REPO/install.sh" | sudo -E bash
+# With peers (other hosts running sashimon, so every dashboard shows the whole cluster):
+#   curl -fsSL https://raw.githubusercontent.com/du1ana/sashi-monitor/main/install.sh | \
+#     sudo SASHIMON_PEERS=https://dapps-dev8.geveo.com:8765 SASHIMON_HOST_LABEL=dev15 bash
+#
+# Env overrides: SASHIMON_REPO, SASHIMON_PORT (8765), SASHIMON_BIND (0.0.0.0), SASHIMON_PEERS (comma-separated URLs),
+# SASHIMON_HOST_LABEL (hostname), SASHIMON_RETENTION_HOURS (72), SASHIMON_MAX_DB_MB (512), SASHIMON_TLS_AUTO (1),
+# SASHIMON_TLS_CERT / SASHIMON_TLS_KEY, SASHIMON_KEEP_V1_DB (0: the old v1 events.db is deleted).
 
 set -euo pipefail
 
 REPO="${SASHIMON_REPO:-https://raw.githubusercontent.com/du1ana/sashi-monitor/main}"
-
 INSTALL_DIR="${SASHIMON_INSTALL_DIR:-/opt/sashimon}"
 DATA_DIR="${SASHIMON_DATA_DIR:-/var/lib/sashimon}"
 PORT="${SASHIMON_PORT:-8765}"
 BIND="${SASHIMON_BIND:-0.0.0.0}"
-# Optional TLS — if a Sashimono contract-template cert/key exists, sashimon
-# auto-serves HTTPS. Override with SASHIMON_TLS_CERT/SASHIMON_TLS_KEY, or
-# disable with SASHIMON_TLS_AUTO=0.
+PEERS="${SASHIMON_PEERS:-}"
+HOST_LABEL="${SASHIMON_HOST_LABEL:-$(hostname)}"
+RETENTION_HOURS="${SASHIMON_RETENTION_HOURS:-72}"
+MAX_DB_MB="${SASHIMON_MAX_DB_MB:-512}"
 TLS_AUTO="${SASHIMON_TLS_AUTO:-1}"
 TLS_CERT="${SASHIMON_TLS_CERT:-}"
 TLS_KEY="${SASHIMON_TLS_KEY:-}"
-POLICY_MODE="${SASHIMON_POLICY_MODE:-balanced}"
+KEEP_V1_DB="${SASHIMON_KEEP_V1_DB:-0}"
 SERVICE_FILE="/etc/systemd/system/sashimon.service"
 
 if [[ $EUID -ne 0 ]]; then
@@ -31,68 +34,67 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-echo "[sashimon] installing to $INSTALL_DIR  data=$DATA_DIR  port=$PORT"
-
-# 1. Deps
-if command -v apt-get >/dev/null 2>&1; then
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y --no-install-recommends python3 ca-certificates curl
-elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y python3 ca-certificates curl
-elif command -v yum >/dev/null 2>&1; then
-  yum install -y python3 ca-certificates curl
-else
-  echo "[sashimon] no supported package manager; ensure python3 is installed" >&2
-fi
-
-PY="$(command -v python3)"
+PY="$(command -v python3 || true)"
 if [[ -z "$PY" ]]; then
-  echo "[sashimon] python3 not found" >&2
-  exit 1
+  echo "[sashimon] installing python3"
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -y && apt-get install -y --no-install-recommends python3 ca-certificates curl
+  else
+    echo "[sashimon] python3 not found and no apt-get; install python3 >= 3.8 first" >&2
+    exit 1
+  fi
+  PY="$(command -v python3)"
 fi
+command -v sashi >/dev/null 2>&1 || echo "[sashimon] WARNING: 'sashi' not found; no instances will be discovered." >&2
 
-# 2. Sanity-check sashi
-if ! command -v sashi >/dev/null 2>&1; then
-  echo "[sashimon] WARNING: 'sashi' binary not found in PATH." >&2
-  echo "             Sashimon will start but won't see instances until 'sashi' is installed." >&2
-fi
+echo "[sashimon] installing to $INSTALL_DIR  data=$DATA_DIR  port=$PORT  host=$HOST_LABEL  peers=${PEERS:-none}"
 
-# 3. Fetch payload
-#    The dashboard is now embedded in sashimon.py (DASHBOARD_HTML) — self-
-#    contained, no separate frontend build to keep in sync. Older installs
-#    dropped an index.html next to the script which would *override* the
-#    embedded dashboard, so remove it on (re)install.
+systemctl stop sashimon 2>/dev/null || true
+
 mkdir -p "$INSTALL_DIR" "$DATA_DIR"
-echo "[sashimon] downloading sashimon.py"
-curl -fsSL "$REPO/sashimon.py" -o "$INSTALL_DIR/sashimon.py"
+curl -fsSL "$REPO/sashimon.py" -o "$INSTALL_DIR/sashimon.py.new"
+curl -fsSL "$REPO/dashboard.html" -o "$INSTALL_DIR/dashboard.html.new"
+mv "$INSTALL_DIR/sashimon.py.new" "$INSTALL_DIR/sashimon.py"
+mv "$INSTALL_DIR/dashboard.html.new" "$INSTALL_DIR/dashboard.html"
 chmod +x "$INSTALL_DIR/sashimon.py"
-if [[ -f "$INSTALL_DIR/index.html" ]]; then
-  echo "[sashimon] removing legacy $INSTALL_DIR/index.html (embedded dashboard is used now)"
-  rm -f "$INSTALL_DIR/index.html"
+rm -f "$INSTALL_DIR/index.html"      # v1 leftover
+
+# v1 stored every log line in events.db (gigabytes at debug level). v2 uses sashimon.db.
+if ls "$DATA_DIR"/events.db* >/dev/null 2>&1; then
+  if [[ "$KEEP_V1_DB" == "1" ]]; then
+    echo "[sashimon] keeping v1 database $DATA_DIR/events.db (SASHIMON_KEEP_V1_DB=1)"
+  else
+    echo "[sashimon] deleting v1 database: $(du -sh "$DATA_DIR" | cut -f1) in $DATA_DIR/events.db*"
+    rm -f "$DATA_DIR"/events.db "$DATA_DIR"/events.db-wal "$DATA_DIR"/events.db-shm
+  fi
 fi
 
-# 4. systemd unit
-EXTRA_FLAGS="--policy-mode $POLICY_MODE"
+FLAGS="--db $DATA_DIR/sashimon.db --port $PORT --bind $BIND --host-label $HOST_LABEL"
+FLAGS="$FLAGS --retention-hours $RETENTION_HOURS --max-db-mb $MAX_DB_MB"
+IFS=',' read -r -a PEER_LIST <<< "$PEERS"
+for p in "${PEER_LIST[@]}"; do
+  [[ -n "$p" ]] && FLAGS="$FLAGS --peer $p"
+done
 if [[ -n "$TLS_CERT" && -n "$TLS_KEY" ]]; then
-  EXTRA_FLAGS="$EXTRA_FLAGS --tls-cert $TLS_CERT --tls-key $TLS_KEY"
+  FLAGS="$FLAGS --tls-cert $TLS_CERT --tls-key $TLS_KEY"
 elif [[ "$TLS_AUTO" != "0" && "$TLS_AUTO" != "false" ]]; then
-  EXTRA_FLAGS="$EXTRA_FLAGS --tls-auto"
+  FLAGS="$FLAGS --tls-auto"
 fi
 
-echo "[sashimon] writing $SERVICE_FILE"
 cat >"$SERVICE_FILE" <<UNIT
 [Unit]
-Description=Sashimono HotPocket instance monitor
+Description=sashimon - HotPocket consensus observer
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$PY $INSTALL_DIR/sashimon.py --db $DATA_DIR/events.db --port $PORT --bind $BIND $EXTRA_FLAGS
+ExecStart=$PY $INSTALL_DIR/sashimon.py $FLAGS
 Restart=always
 RestartSec=5
 User=root
+Nice=10
+IOSchedulingClass=idle
 Environment=PYTHONUNBUFFERED=1
 StandardOutput=journal
 StandardError=journal
@@ -101,30 +103,17 @@ StandardError=journal
 WantedBy=multi-user.target
 UNIT
 
-# 5. Firewall — open the dashboard port via ufw when present. Skip silently
-#    on hosts that don't use ufw; never fail the install over this.
-if command -v ufw >/dev/null 2>&1; then
-  if ufw status 2>/dev/null | head -n1 | grep -qi active; then
-    echo "[sashimon] ufw allow $PORT/tcp"
-    ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-  else
-    echo "[sashimon] ufw present but inactive — skipping firewall rule"
-  fi
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n1 | grep -qi active; then
+  ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
 fi
 
-# 6. Enable + start
 systemctl daemon-reload
 systemctl enable sashimon >/dev/null 2>&1 || true
 systemctl restart sashimon
-
-sleep 1
+sleep 2
 if systemctl is-active --quiet sashimon; then
-  IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  [[ -z "$IP" ]] && IP="127.0.0.1"
-  echo
-  echo "[sashimon] running. dashboard: http://$IP:$PORT"
-  echo "[sashimon] logs: journalctl -u sashimon -f"
+  echo "[sashimon] running: $(journalctl -u sashimon -n 1 --no-pager -o cat)"
 else
-  echo "[sashimon] service failed to start. journalctl -u sashimon --no-pager -n 50" >&2
+  echo "[sashimon] service failed to start: journalctl -u sashimon --no-pager -n 50" >&2
   exit 1
 fi

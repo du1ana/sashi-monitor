@@ -7,7 +7,7 @@ __pycache__/
 *.db-shm
 .DS_Store
 
-# Frontend build artifacts (we ship the bundled index.html at repo root)
+# Frontend build artifacts (the built dashboard.html at repo root is committed)
 frontend/node_modules/
 frontend/dist/
 

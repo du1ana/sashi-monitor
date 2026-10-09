@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sashimon uninstaller. Run as root.
 #   curl -fsSL https://raw.githubusercontent.com/du1ana/sashi-monitor/main/uninstall.sh | sudo bash
-#   PURGE=1 ... bash    # also delete /var/lib/sashimon (events.db)
+#   PURGE=1 ... bash    # also delete /var/lib/sashimon (sashimon.db)
 
 set -euo pipefail
 

@@ -1,30 +1,22 @@
 #!/usr/bin/env python3
+"""sashimon - HotPocket consensus observer for Sashimono hosts.
+
+Follows every HotPocket instance's own log file (hp.log, never docker attach, so a slow monitor can
+never block a node), turns log lines into compact per-node/per-minute records, detects consensus
+incidents (forks, stalls, height splits, frozen nodes, refused closes, UNL switches...), keeps the raw
+log only in a short in-memory ring buffer that is saved when an incident fires, and serves a dashboard.
+Peers (other hosts running sashimon) are polled so each host sees the whole cluster.
+
+Standard library only.
 """
-Sashimono HotPocket instance monitor.
-
-Discovers Sashimono instances on the local VM via `sashi list`, tails each
-instance's log stream via `sashi attach`, classifies events (functional /
-consensus_loss / fork / error), persists to SQLite, and exposes a small
-embedded HTTP dashboard.
-
-Designed to run as root via systemd. No external Python deps required;
-stdlib only.
-"""
-
-# Make all PEP-604 (`X | Y`) annotations lazy strings so this file imports
-# cleanly on Python 3.8 / 3.9 (e.g. Ubuntu 20.04, which is the default
-# Sashimono host OS). Runtime type checks here use isinstance/get(), never
-# the annotation objects themselves, so PEP 563 is safe.
-from __future__ import annotations
 
 import argparse
+import collections
+import glob
 import json
 import os
-import pty
+import queue
 import re
-import select
-import shlex
-from shlex import quote as shlex_quote
 import shutil
 import signal
 import socket
@@ -34,1348 +26,187 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
+import urllib.parse
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
-# --------------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------------
+VERSION = "2.0.0"
 
-DEFAULT_DB = "/var/lib/sashimon/events.db"
-DEFAULT_PORT = 8765
-DEFAULT_BIND = "0.0.0.0"
-DISCOVER_INTERVAL = 30        # seconds between `sashi list` polls
-STALL_THRESHOLD = 30          # seconds without ledger_created => "stalled"
-RETENTION_DAYS = 14           # event row retention
-RETENTION_SWEEP = 3600        # seconds between retention sweeps
+PEER_STALE_S = 60     # keep using a peer's last good snapshot this long after a failed poll
 
-# Host-metrics / error-spell capture (§8 of HOTPOCKET_CONSENSUS_INVESTIGATION.md)
-METRICS_INTERVAL = 30         # seconds between host-metric samples (normal)
-METRICS_INTERVAL_BOOST = 3    # seconds between samples while a spell is active
-METRICS_BOOST_COOLDOWN = 120  # keep boosted sampling this long after last error tag
-SNAPSHOT_RECAPTURE = 60       # if still in-spell, recapture ps/df/journalctl after this many s
-SNAPSHOT_MAX_CAPTURES = 1     # cap captures per spell (was 3; artifacts dominated DB growth)
-ARTIFACT_RETENTION_DAYS = 3   # artifacts get tighter retention than events — they're bulky
-ARTIFACT_CONTENT_CAP = 65536  # per-artifact text cap (was 200000)
-HARD_FORK_AFTER = 120         # an open spell older than this (no ledger since) ≈ hard fork
-# Per-round consensus vote lines (kept/erased/selected, see `proposal_votes`
-# table below). High-volume, short-value — only useful for reconstructing the
-# exact moment of a fork, which per the runbook is always investigated within
-# hours — so it gets its own tight retention, shorter than the events table.
-PROPOSAL_VOTES_RETENTION_DAYS = 2
-DEFAULT_ROUNDTIME_MS = 2000   # HotPocket roundtime; used for the uptime-% denominator
-# Tags that mean "the cluster/this node is in trouble".
-ERROR_TAGS = ("fork_warn", "consensus_lost", "out_of_sync", "error")
-# Mounts always sampled in addition to whatever holds the contract dirs.
-ALWAYS_SAMPLE_MOUNTS = ("/", "/var/lib")
-
-# --------------------------------------------------------------------------
-# Severity + tracking policy
-# --------------------------------------------------------------------------
-# Treat fork conditions as high-impact (boost metrics + snapshot + always
-# track events). Consensus-loss / out-of-sync / plain warnings are low-impact
-# noise that bloats the DB during a spell — keep the spell row, but drop
-# the per-event flood and skip metric boost.
-TAG_SEVERITY = {
-    "fork_warn":      "high",
-    "error":          "high",
-    "out_of_sync":    "low",
-    "consensus_lost": "low",
-    "warning":        "low",
-    "vote_kept":      "low",
-    "vote_erased":    "low",
-    "ledger_selected":"low",
-}
-
-# Default settings — overridable at runtime via /api/policy (persisted in the
-# `settings` table). `policy_mode` picks one of the presets below.
-DEFAULT_POLICY_MODE = "balanced"
-
-POLICY_MODES = {
-    # Legacy behaviour: track every event, boost metrics + snapshot for every
-    # spell regardless of severity.
-    "full": {
-        "low":  {"events": True,  "boost": True,  "snapshot": True},
-        "high": {"events": True,  "boost": True,  "snapshot": True},
-    },
-    # Default — only fork-class spells get the heavy treatment. Low-severity
-    # spells (consensus_lost, out_of_sync, warning) skip metric boost +
-    # snapshots, and during the spell their event-flood is dropped.
-    "balanced": {
-        "low":  {"events": False, "boost": False, "snapshot": False},
-        "high": {"events": True,  "boost": True,  "snapshot": True},
-    },
-    # Most aggressive — only track ledger_created + high-severity events;
-    # never boost metrics or snapshot.
-    "minimal": {
-        "low":  {"events": False, "boost": False, "snapshot": False},
-        "high": {"events": True,  "boost": False, "snapshot": False},
-    },
-}
-
-# Tags that are ALWAYS persisted regardless of policy gating (so we can still
-# tell healthy from forked, and so a spell can open from its trigger event).
-ALWAYS_TRACK_TAGS = {"ledger_created", "fork_warn", "error",
-                     "hp_started", "hp_stopped"}
-
-
-def tag_severity(tag: str) -> str:
-    return TAG_SEVERITY.get(tag, "high" if tag in ERROR_TAGS else "low")
-
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------
 # Log parsing
-# --------------------------------------------------------------------------
-#
-# HotPocket log format:  YYYYMMDD HH:MM:SS.mmm [level][module] message
-# Example:               20260506 14:41:10.244 [inf][hpc] ****Ledger created**** ...
-#
-# Lines that don't match (e.g. contract-emitted "DOVA contract is running...")
-# are still captured but timestamped at receipt time.
+# ---------------------------------------------------------------------------------------------------------
 
-LOG_RE = re.compile(
-    r"^(?P<date>\d{8})\s+(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})\s+"
-    r"\[(?P<level>\w+)\]\[(?P<module>\w+)\]\s+(?P<msg>.*)$"
-)
+LINE_RE = re.compile(r"^(\d{8}) (\d\d:\d\d:\d\d\.\d{3}) \[(\w{3})\]\[(\w+)\] (.*)$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
-# Extracts lcl/state/patch from a ledger_created msg like:
-#   ****Ledger created**** (lcl:205-91a16393 state:97e82d94 patch:d304e622)
-LEDGER_INFO_RE = re.compile(
-    r"lcl:(?P<lcl>\S+)\s+state:(?P<state>\S+)\s+patch:(?P<patch>[^\s)]+)", re.I
-)
+RE_CREATED = re.compile(r"\*\*\*\*Ledger created\*\*\*\* \(lcl:(\d+)-([0-9a-f]+) state:([0-9a-f]+) patch:([0-9a-f]+)")
+RE_WON = re.compile(r"won:(\d+) needed:(\d+)")
+RE_VOTES = re.compile(r"votes:(\d+) needed:(\d+)")
+RE_RECEIVED = re.compile(r"received:(\d+) needed:(\d+)")
+RE_MISSED = re.compile(r"Missed stage (\d) window")
+RE_SKIPPED = re.compile(r"Skipped (\d+) round")
+RE_VOTE_STATUS = re.compile(r"^Vote status: (\d)")
+RE_STATS = re.compile(r"Consensus stats \(last (\d+) rounds\): (.*)$")
+RE_KV = re.compile(r"([a-z-]+):(\d+)")
+RE_FF = re.compile(r"ours:(\d+)-([0-9a-f]+) certified:(\d+)-([0-9a-f]+) from:([0-9a-f]+)")
+RE_REFUSED = re.compile(r"lcl\(ours/theirs\):(\d+)-([0-9a-f]+)/(\d+)-([0-9a-f]+)")
+RE_VERSION = re.compile(r"^HotPocket (\d+\.\d+\.\d+)")
+RE_PUBKEY = re.compile(r"^Public key: (ed[0-9a-f]+)")
+RE_PATCH_SYNC = re.compile(r"Applying pending patch recorded in synced ledger (\d+)-([0-9a-f]+)")
+RE_CONFLICT = re.compile(r"Conflicting certified ledgers at seq (\d+)")
 
-# Per-round consensus vote lines (only present at log.log_level=dbg). These are
-# the ground truth for "who voted for what, when, with what latency" — see
-# consensus.cpp revise_candidate_proposals (kept/erased) and attempt_ledger_close
-# (selected). Parsed out of the raw stream into `proposal_votes` instead of
-# being stored as free-text `events` rows, which is both cheaper and directly
-# queryable.
-#   [s3-91a16393] u/i/t:3/5/1751870481 s:97e82d94 p:d304e622 ps:204-... rs:12-... [frm:self<0ms]
-VOTE_KEPT_RE = re.compile(
-    r"^\[s(?P<stage>\d+)-(?P<hash>[0-9a-fA-F]+)\]\s+"
-    r"u/i/t:(?P<u>\d+)/(?P<i>\d+)/(?P<t>\d+)\s+"
-    r"s:(?P<state>\S+)\s+p:(?P<patch>\S+)\s+"
-    r"ps:(?P<ps>\S+)\s+rs:(?P<rs>\S+)\s+"
-    r"\[frm:(?P<frm>[^<\]]+)<(?P<lat>\d+)ms\]"
-)
-#   Erased [s2-abc123] [frm:9c3f1a2b]
-VOTE_ERASED_RE = re.compile(
-    r"^Erased\s+\[s(?P<stage>\d+)-(?P<hash>[0-9a-fA-F]+)\]\s+\[frm:(?P<frm>[^\]]+)\]"
-)
-#   Closing ledger with proposal:91a16393
-LEDGER_SELECTED_RE = re.compile(r"Closing ledger with proposal:(?P<hash>[0-9a-fA-F]+)", re.I)
+VOTE_STATUS_NAMES = {0: "unknown", 1: "unreliable", 2: "desync", 3: "synced"}
+
+# Debug lines emitted many times per round that carry nothing we record (checked first, cheaply).
+HIGH_VOLUME_PREFIXES = ("[s", "Erased [s", "Waiting ", "Started stage", "Proposed-s", "Serving hpfs",
+                        "Hpfs ldgr serve", "Hpfs cont serve", "Starting hpfs", "Stopping hpfs", "Closing ledger with")
+
+# Per-minute counters kept per node.
+MINUTE_FIELDS = [
+    "lines", "closes", "max_seq", "vote_split", "few_votes", "consensus_lost", "shard_split", "desync",
+    "missed_stage", "skipped_rounds", "refused", "late_close", "fast_forward", "sync_target", "errors",
+    "warnings", "queue_full", "frozen_s", "unreliable",
+]
 
 
-VOTE_TAG_KIND = {"vote_kept": "kept", "vote_erased": "erased", "ledger_selected": "selected"}
+def parse_ts(d, t):
+    # HotPocket logs in the container's local time, which is UTC on Sashimono instances.
+    return datetime.strptime(d + " " + t, "%Y%m%d %H:%M:%S.%f").replace(tzinfo=timezone.utc).timestamp()
 
 
-def parse_vote_fields(msg: str) -> tuple[str | None, dict | None]:
-    """Match a per-round consensus vote/selection debug line. Returns
-    (tag, fields) or (None, None) if msg isn't one of these."""
-    m = VOTE_KEPT_RE.match(msg)
-    if m:
-        return "vote_kept", m.groupdict()
-    m = VOTE_ERASED_RE.match(msg)
-    if m:
-        return "vote_erased", m.groupdict()
-    m = LEDGER_SELECTED_RE.search(msg)
-    if m:
-        return "ledger_selected", m.groupdict()
-    return None, None
-
-
-# Order matters: first match wins. Most specific first.
-CLASSIFIERS = (
-    ("ledger_created",   re.compile(r"\*+\s*Ledger created\s*\*+", re.I)),
-    ("fork_warn",        re.compile(
-        r"(Cannot close ledger.*fork condition|"
-        r"No consensus on last shard hash.*fork condition)", re.I)),
-    ("consensus_lost",   re.compile(r"Not enough peers proposing to perform consensus", re.I)),
-    ("out_of_sync",      re.compile(r"We are not on the consensus ledger", re.I)),
-    ("contract_running", re.compile(r"contract is running", re.I)),
-    ("role_change",      re.compile(r"Switched (?:to OBSERVER|back to VALIDATOR) mode", re.I)),
-    ("hp_started",       re.compile(r"^HotPocket\s+\d|Consensus processor started", re.I)),
-    ("hp_stopped",       re.compile(r"Consensus processor stopped", re.I)),
-    ("error",            re.compile(
-        r"\[err\]|HotPocket usage limit failure|Consensus thread exited|"
-        r"Error occured when closing ledger|contract execution failed|"
-        r"patch file changes after consensus failed", re.I)),
-    ("warning",          re.compile(
-        r"\[wrn\]|Consensus output hash didn't match|"
-        r"Input required but wasn't in our candidate inputs", re.I)),
-)
-
-
-def classify(msg: str) -> str:
-    for tag, rx in CLASSIFIERS:
-        if rx.search(msg):
-            return tag
-    return "info_other"
-
-
-def parse_log_line(line: str, now_ts: float) -> dict | None:
-    line = line.rstrip("\r\n")
-    if not line.strip():
-        return None
-    m = LOG_RE.match(line)
-    if m:
-        try:
-            ts = datetime.strptime(
-                m.group("date") + m.group("time"),
-                "%Y%m%d%H:%M:%S.%f",
-            ).replace(tzinfo=timezone.utc).timestamp()
-        except ValueError:
-            ts = now_ts
-        msg = m.group("msg")
-        vote_tag, vote_fields = parse_vote_fields(msg)
-        return {
-            "ts": ts,
-            "level": m.group("level"),
-            "module": m.group("module"),
-            "tag": vote_tag or classify(msg),
-            "msg": msg,
-            "vote": vote_fields,
-        }
-    # Free-form line (contract stdout, etc.)
-    return {
-        "ts": now_ts,
-        "level": "raw",
-        "module": "contract",
-        "tag": classify(line),
-        "msg": line,
-        "vote": None,
-    }
-
-
-# --------------------------------------------------------------------------
-# Host metrics & shell helpers
-# --------------------------------------------------------------------------
-#
-# sashimon runs as root on the VM that hosts the HotPocket instances, so we
-# read /proc and statvfs directly. Everything here is best-effort: a missing
-# file or an unavailable tool yields None for that field, never an exception.
-
-def run_cmd(cmd: list[str], timeout: float = 8.0, want_err: bool = False) -> str | None:
-    """Run a command, return its stdout (str), or None on any failure/timeout."""
-    try:
-        cp = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False,
-        )
-        out = cp.stdout or ""
-        if want_err and cp.stderr:
-            out = (out + "\n" + cp.stderr).strip()
-        return out
-    except Exception:
-        return None
-
-
-def _read_text(path: str) -> str | None:
-    try:
-        with open(path, "r", errors="replace") as f:
-            return f.read()
-    except Exception:
-        return None
-
-
-def _cpu_jiffies() -> tuple[int, int, int] | None:
-    """(idle+iowait, total, steal) jiffies from /proc/stat."""
-    txt = _read_text("/proc/stat")
-    if not txt:
-        return None
-    for line in txt.splitlines():
-        if line.startswith("cpu "):
-            v = [int(x) for x in line.split()[1:]]
-            idle = v[3] + (v[4] if len(v) > 4 else 0)
-            steal = v[7] if len(v) > 7 else 0
-            return idle, sum(v), steal
-    return None
-
-
-def _loadavg() -> tuple[float, float, float] | None:
-    txt = _read_text("/proc/loadavg")
-    if not txt:
-        return None
-    try:
-        p = txt.split()
-        return float(p[0]), float(p[1]), float(p[2])
-    except Exception:
-        return None
-
-
-def _meminfo() -> dict[str, int] | None:
-    txt = _read_text("/proc/meminfo")
-    if not txt:
-        return None
-    d: dict[str, int] = {}
-    for line in txt.splitlines():
-        k, _, rest = line.partition(":")
-        try:
-            d[k.strip()] = int(rest.strip().split()[0])  # kB
-        except Exception:
-            pass
-    return d or None
-
-
-def _net_totals() -> tuple[int, int] | None:
-    """(rx_bytes, tx_bytes) summed over non-loopback interfaces."""
-    txt = _read_text("/proc/net/dev")
-    if not txt:
-        return None
-    rx = tx = 0
-    for line in txt.splitlines()[2:]:
-        iface, _, data = line.partition(":")
-        iface = iface.strip()
-        if not data or iface in ("lo",):
-            continue
-        c = data.split()
-        try:
-            rx += int(c[0]); tx += int(c[8])
-        except Exception:
-            pass
-    return rx, tx
-
-
-def _sys_open_fds() -> int | None:
-    txt = _read_text("/proc/sys/fs/file-nr")
-    if not txt:
-        return None
-    try:
-        return int(txt.split()[0])
-    except Exception:
-        return None
-
-
-def _disk_usage(path: str) -> dict | None:
-    try:
-        st = os.statvfs(path)
-    except Exception:
-        return None
-    blocks = st.f_blocks or 1
-    files = st.f_files or 1
-    return {
-        "free_mb": st.f_bavail * st.f_frsize / 1048576.0,
-        "used_pct": 100.0 * (1.0 - st.f_bavail / blocks),
-        "inode_used_pct": 100.0 * (1.0 - st.f_favail / files),
-    }
-
-
-def _ntp_status() -> tuple[float | None, int | None]:
-    """(last_offset_ms, synced 0/1). Tries chronyc, then timedatectl."""
-    # chronyc -c tracking : csv; field 5 (0-based) = 'last offset' in seconds.
-    out = run_cmd(["chronyc", "-c", "tracking"], timeout=4)
-    if out:
-        try:
-            f = out.strip().split(",")
-            return float(f[5]) * 1000.0, 1
-        except Exception:
-            pass
-    out = run_cmd(["chronyc", "tracking"], timeout=4)
-    if out:
-        m = re.search(r"Last offset\s*:\s*([-+0-9.eE]+)\s*seconds", out)
-        leap = re.search(r"Leap status\s*:\s*(\w+)", out)
-        if m:
-            synced = 1 if (leap and leap.group(1).lower() == "normal") else 1
-            return float(m.group(1)) * 1000.0, synced
-    out = run_cmd(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], timeout=4)
-    if out is not None:
-        return None, (1 if out.strip().lower() in ("yes", "true", "1") else 0)
-    return None, None
-
-
-def _find_instance_pid(name: str) -> int | None:
-    """Best-effort: the pid of the HotPocket process for an instance.
-
-    Sashimono runs each instance under its own Linux user and/or container; the
-    instance name (or contract id) usually appears in the process cmdline. We
-    scan /proc rather than relying on pgrep so it works without extra tooling.
-    """
-    if not name:
-        return None
-    needle = name.encode()
-    try:
-        for entry in os.listdir("/proc"):
-            if not entry.isdigit():
-                continue
-            try:
-                with open(f"/proc/{entry}/cmdline", "rb") as f:
-                    cl = f.read()
-            except Exception:
-                continue
-            if needle in cl and (b"hpcore" in cl or b"hp.core" in cl or b"node" in cl or b"sashi" in cl):
-                return int(entry)
-    except Exception:
-        return None
-    # Fallback: pgrep -f.
-    out = run_cmd(["pgrep", "-f", name], timeout=3)
-    if out:
-        try:
-            return int(out.split()[0])
-        except Exception:
-            return None
-    return None
-
-
-def _proc_rss_mb(pid: int) -> float | None:
-    txt = _read_text(f"/proc/{pid}/status")
-    if not txt:
-        return None
-    m = re.search(r"^VmRSS:\s*(\d+)\s*kB", txt, re.M)
-    return (int(m.group(1)) / 1024.0) if m else None
-
-
-def _proc_open_fds(pid: int) -> int | None:
-    try:
-        return len(os.listdir(f"/proc/{pid}/fd"))
-    except Exception:
-        return None
-
-
-# --------------------------------------------------------------------------
-# Storage
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------
+# Storage: one writer thread, batched transactions, bounded size
+# ---------------------------------------------------------------------------------------------------------
 
 SCHEMA = """
-CREATE TABLE IF NOT EXISTS events (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance  TEXT    NOT NULL,
-    ts        REAL    NOT NULL,
-    level     TEXT,
-    module    TEXT,
-    tag       TEXT,
-    msg       TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_events_instance_ts ON events(instance, ts);
-CREATE INDEX IF NOT EXISTS idx_events_tag         ON events(tag);
-CREATE INDEX IF NOT EXISTS idx_events_ts          ON events(ts);
-
-CREATE TABLE IF NOT EXISTS instances (
-    name         TEXT PRIMARY KEY,
-    contract_id  TEXT,
-    tenant       TEXT,
-    image        TEXT,
-    user_port    INTEGER,
-    peer_port    INTEGER,
-    status       TEXT,
-    first_seen   REAL,
-    last_seen    REAL
-);
-
--- One row per host-metric sample. `instance` is NULL for machine-wide samples
--- and set for per-HP-process samples taken at the same `ts`. `during_spell`
--- and `spell_id` mark samples taken while an error spell was active (and at the
--- boosted rate). `extra` holds JSON for fields without their own column
--- (per-mount disk, etc.).
-CREATE TABLE IF NOT EXISTS host_metrics (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts            REAL    NOT NULL,
-    instance      TEXT,
-    during_spell  INTEGER DEFAULT 0,
-    spell_id      TEXT,
-    cpu_pct       REAL,
-    steal_pct     REAL,
-    load1         REAL,
-    load5         REAL,
-    mem_used_pct  REAL,
-    mem_avail_mb  REAL,
-    swap_used_mb  REAL,
-    disk_used_pct REAL,   -- worst (max) used% across sampled mounts
-    disk_free_mb  REAL,   -- min free across sampled mounts
-    inode_used_pct REAL,  -- worst across sampled mounts
-    net_rx_kbps   REAL,
-    net_tx_kbps   REAL,
-    sys_open_fds  INTEGER,
-    proc_rss_mb   REAL,   -- per-instance rows only
-    proc_open_fds INTEGER,-- per-instance rows only
-    proc_pid      INTEGER,-- per-instance rows only
-    ntp_offset_ms REAL,
-    ntp_synced    INTEGER,
-    extra         TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_hm_ts        ON host_metrics(ts);
-CREATE INDEX IF NOT EXISTS idx_hm_inst_ts   ON host_metrics(instance, ts);
-CREATE INDEX IF NOT EXISTS idx_hm_spell     ON host_metrics(spell_id);
-
--- Lifecycle of error spells: one row per spell, opened when an instance first
--- emits an error tag while not already in a spell, closed when it next emits
--- ledger_created (recovered=1). An open row (end_ts NULL) older than
--- HARD_FORK_AFTER ≈ a hard fork that never recovered.
-CREATE TABLE IF NOT EXISTS spells_log (
-    spell_id     TEXT PRIMARY KEY,
-    instance     TEXT NOT NULL,
-    start_ts     REAL NOT NULL,
-    end_ts       REAL,
-    recovered    INTEGER,        -- 1 if a ledger_created closed it; NULL while open
-    trigger_tag  TEXT,
-    trigger_msg  TEXT,
-    captures     INTEGER DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS idx_spells_start ON spells_log(start_ts);
-CREATE INDEX IF NOT EXISTS idx_spells_inst  ON spells_log(instance, start_ts);
-
--- Free-form diagnostic snapshots captured when a spell starts (and re-captured
--- while it persists): `ps`, `df`, `journalctl`, `dmesg`, `chronyc`, tail of the
--- HP log, contract dir sizes, etc.
-CREATE TABLE IF NOT EXISTS spell_artifacts (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    spell_id  TEXT NOT NULL,
-    ts        REAL NOT NULL,
-    instance  TEXT,            -- NULL for machine-wide artifacts
-    kind      TEXT NOT NULL,   -- 'ps' | 'df' | 'dfi' | 'journalctl' | 'dmesg' | 'chronyc' | 'free' | 'vmstat' | 'uptime' | 'du' | 'logtail'
-    content   TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_artifacts_spell ON spell_artifacts(spell_id, ts);
-
--- Per-round consensus vote lines (log.log_level=dbg only): who proposed what
--- for this stage/root_hash, who got pruned as stale, and which root_hash a
--- node actually closed. This is the ground truth for "who approved/accepted
--- this ledger" instead of inferring it from fork_warn spam after the fact.
--- kind: 'kept' | 'erased' | 'selected'. from_pubkey is 'self' or a short hex
--- prefix; NULL for 'selected' rows (those describe this node's own close).
-CREATE TABLE IF NOT EXISTS proposal_votes (
-    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
-    instance               TEXT    NOT NULL,
-    ts                     REAL    NOT NULL,
-    kind                   TEXT    NOT NULL,
-    stage                  INTEGER,
-    root_hash              TEXT,
-    from_pubkey            TEXT,
-    latency_ms             INTEGER,
-    last_primary_shard_id  TEXT,
-    last_raw_shard_id      TEXT,
-    state_hash             TEXT,
-    patch_hash             TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_pv_inst_ts ON proposal_votes(instance, ts);
-CREATE INDEX IF NOT EXISTS idx_pv_hash    ON proposal_votes(root_hash);
-
--- Confirmed chain-split events: two+ instances of the same cluster closed
--- DIFFERENT hashes at the SAME ledger seq_no. This is the direct, automatic
--- version of what §11 of HOTPOCKET_CONSENSUS_INVESTIGATION.md did by hand
--- (comparing lcl hashes across hosts' logs) — distinguishes a real chain
--- split from a mere vote-visibility split (same hash, quorum just didn't
--- see enough votes; no row here for that case since there's only one hash).
-CREATE TABLE IF NOT EXISTS fork_events (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts           REAL    NOT NULL,
-    contract_id  TEXT,
-    seq_no       INTEGER NOT NULL,
-    hash_a       TEXT    NOT NULL,
-    instances_a  TEXT    NOT NULL,  -- JSON array of instance names
-    hash_b       TEXT    NOT NULL,
-    instances_b  TEXT    NOT NULL,
-    UNIQUE(contract_id, seq_no, hash_a, hash_b)
-);
-CREATE INDEX IF NOT EXISTS idx_fork_events_ts ON fork_events(ts);
-CREATE INDEX IF NOT EXISTS idx_fork_events_cid ON fork_events(contract_id, seq_no);
-
--- Runtime settings (tracking policy, etc.). Single-row key/value store so the
--- frontend can flip the DB-tracking mode without restarting the daemon.
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-
--- Discovered clusters (grouping of instances by Sashimono contract_id). The
--- daemon only tails instances whose cluster is marked monitored=1; everything
--- else is still listed (so the operator can opt in from the dashboard) but
--- not consuming pty resources.
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS clusters (
-    contract_id  TEXT PRIMARY KEY,
-    label        TEXT,
-    monitored    INTEGER NOT NULL DEFAULT 0,
-    first_seen   REAL,
-    last_seen    REAL
-);
+    id INTEGER PRIMARY KEY, contract_id TEXT UNIQUE NOT NULL, first_seen REAL, last_seen REAL);
+CREATE TABLE IF NOT EXISTS nodes (
+    id INTEGER PRIMARY KEY, cluster_id INTEGER, name TEXT NOT NULL, short TEXT, host TEXT,
+    pubkey TEXT, version TEXT, image TEXT, first_seen REAL, last_seen REAL, UNIQUE (cluster_id, name));
+CREATE TABLE IF NOT EXISTS node_minutes (
+    node_id INTEGER, minute INTEGER,
+    lines INTEGER, closes INTEGER, max_seq INTEGER, vote_split INTEGER, few_votes INTEGER,
+    consensus_lost INTEGER, shard_split INTEGER, desync INTEGER, missed_stage INTEGER,
+    skipped_rounds INTEGER, refused INTEGER, late_close INTEGER, fast_forward INTEGER, sync_target INTEGER,
+    errors INTEGER, warnings INTEGER, queue_full INTEGER, frozen_s INTEGER, unreliable INTEGER,
+    PRIMARY KEY (node_id, minute)) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_nm_minute ON node_minutes(minute);
+CREATE TABLE IF NOT EXISTS ledgers (
+    cluster_id INTEGER, seq INTEGER, hash TEXT, nodes TEXT, first_ts REAL, last_ts REAL,
+    PRIMARY KEY (cluster_id, seq, hash)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY, cluster_id INTEGER, node_id INTEGER, kind TEXT, severity TEXT,
+    start_ts REAL, end_ts REAL, summary TEXT, detail TEXT);
+CREATE INDEX IF NOT EXISTS idx_inc_cluster_ts ON incidents(cluster_id, start_ts);
+CREATE TABLE IF NOT EXISTS captures (
+    id INTEGER PRIMARY KEY, incident_id INTEGER, node_id INTEGER, ts REAL, kind TEXT, data BLOB);
+CREATE INDEX IF NOT EXISTS idx_cap_incident ON captures(incident_id);
+CREATE TABLE IF NOT EXISTS stats (
+    node_id INTEGER, ts REAL, rounds INTEGER, data TEXT, PRIMARY KEY (node_id, ts)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS host_minutes (
+    minute INTEGER PRIMARY KEY, load1 REAL, cpu REAL, iowait REAL, mem_pct REAL, swap_mb REAL,
+    disk_free_mb REAL, sashimon_cpu REAL);
 """
-
-# Sentinel contract id for instances missing a real contract_id field.
-NO_CONTRACT_ID = "_unknown"
 
 
 class Store:
-    def __init__(self, path: str):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+    def __init__(self, path, max_mb, retention_h):
         self.path = path
-        self.lock = threading.Lock()
-        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=10.0)
-        self.conn.executescript(SCHEMA)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
-        self.conn.commit()
+        self.max_mb = max_mb
+        self.retention_s = retention_h * 3600
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        new = not os.path.exists(path)
+        self.w = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+        if new:
+            self.w.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        self.w.execute("PRAGMA journal_mode=WAL")
+        self.w.execute("PRAGMA synchronous=NORMAL")
+        self.w.execute("PRAGMA journal_size_limit=67108864")
+        self.w.execute("PRAGMA busy_timeout=5000")
+        self.w.executescript(SCHEMA)
+        # Incidents left open by a previous run can't be tracked any more: close them at restart.
+        self.w.execute("UPDATE incidents SET end_ts=?, summary=summary || ' (closed at monitor restart)' "
+                       "WHERE end_ts IS NULL", (time.time(),))
+        self.q = queue.Queue(maxsize=50000)
+        self.ids = {}            # ("cluster", contract_id) / ("node", name) -> id
+        self.id_lock = threading.Lock()
+        self.dropped = 0
+        threading.Thread(target=self._writer, name="db-writer", daemon=True).start()
 
-    def insert_event(self, instance: str, ev: dict) -> None:
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO events (instance, ts, level, module, tag, msg) "
-                "VALUES (?,?,?,?,?,?)",
-                (instance, ev["ts"], ev["level"], ev["module"], ev["tag"], ev["msg"]),
-            )
-            self.conn.commit()
+    # -- ids are assigned synchronously (rare) so callers can use them immediately
+    def cluster_id(self, contract_id):
+        key = ("c", contract_id)
+        with self.id_lock:
+            if key in self.ids:
+                return self.ids[key]
+            now = time.time()
+            self.w.execute("INSERT OR IGNORE INTO clusters(contract_id, first_seen, last_seen) VALUES (?,?,?)",
+                           (contract_id, now, now))
+            cid = self.w.execute("SELECT id FROM clusters WHERE contract_id=?", (contract_id,)).fetchone()[0]
+            self.ids[key] = cid
+            return cid
 
-    def insert_proposal_vote(self, instance: str, ts: float, kind: str,
-                             fields: dict) -> None:
-        """`fields` is the regex groupdict from parse_vote_fields(); missing
-        keys (e.g. 'selected' rows have no stage/from/latency) default to None."""
-        lat = fields.get("lat")
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO proposal_votes "
-                "(instance, ts, kind, stage, root_hash, from_pubkey, latency_ms, "
-                " last_primary_shard_id, last_raw_shard_id, state_hash, patch_hash) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (instance, ts, kind,
-                 int(fields["stage"]) if fields.get("stage") is not None else None,
-                 fields.get("hash"), fields.get("frm"),
-                 int(lat) if lat is not None else None,
-                 fields.get("ps"), fields.get("rs"),
-                 fields.get("state"), fields.get("patch")),
-            )
-            self.conn.commit()
+    def node_id(self, name, cluster_id, host, image):
+        key = ("n", cluster_id, name)
+        with self.id_lock:
+            if key in self.ids:
+                return self.ids[key]
+            now = time.time()
+            self.w.execute("INSERT OR IGNORE INTO nodes(cluster_id, name, short, host, image, first_seen, last_seen) "
+                           "VALUES (?,?,?,?,?,?,?)", (cluster_id, name, name[:8], host, image, now, now))
+            nid = self.w.execute("SELECT id FROM nodes WHERE cluster_id=? AND name=?", (cluster_id, name)).fetchone()[0]
+            self.ids[key] = nid
+            return nid
 
-    def proposal_votes_window(self, since: float, until: float | None = None,
-                              instance: str | None = None,
-                              root_hash: str | None = None,
-                              limit: int = 5000) -> list[dict]:
-        if until is None:
-            until = time.time()
-        q = "SELECT * FROM proposal_votes WHERE ts>=? AND ts<=?"
-        args: list = [since, until]
-        if instance:
-            q += " AND instance=?"; args.append(instance)
-        if root_hash:
-            q += " AND root_hash=?"; args.append(root_hash)
-        q += " ORDER BY ts DESC LIMIT ?"; args.append(limit)
-        with self.lock:
-            cur = self.conn.execute(q, args)
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    def insert_incident(self, cluster_id, node_id, kind, severity, start_ts, summary, detail):
+        with self.id_lock:
+            cur = self.w.execute(
+                "INSERT INTO incidents(cluster_id, node_id, kind, severity, start_ts, end_ts, summary, detail) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (cluster_id, node_id, kind, severity, start_ts, None, summary, json.dumps(detail)))
+            return cur.lastrowid
 
-    def upsert_instance(self, info: dict) -> None:
-        now = time.time()
-        with self.lock:
-            self.conn.execute(
-                """
-                INSERT INTO instances
-                  (name, contract_id, tenant, image, user_port, peer_port,
-                   status, first_seen, last_seen)
-                VALUES (?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(name) DO UPDATE SET
-                  contract_id = excluded.contract_id,
-                  tenant      = excluded.tenant,
-                  image       = excluded.image,
-                  user_port   = excluded.user_port,
-                  peer_port   = excluded.peer_port,
-                  status      = excluded.status,
-                  last_seen   = excluded.last_seen
-                """,
-                (
-                    info["name"],
-                    info.get("contract_id"),
-                    info.get("tenant"),
-                    info.get("image"),
-                    info.get("user_port"),
-                    info.get("peer_port"),
-                    info.get("status"),
-                    now,
-                    now,
-                ),
-            )
-            self.conn.commit()
+    def put(self, sql, args):
+        try:
+            self.q.put_nowait((sql, args))
+        except queue.Full:
+            self.dropped += 1
 
-    def list_instances(self) -> list[dict]:
-        with self.lock:
-            cur = self.conn.execute("SELECT * FROM instances ORDER BY name")
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    def _writer(self):
+        while True:
+            batch = [self.q.get()]
+            deadline = time.time() + 1.0
+            while time.time() < deadline and len(batch) < 5000:
+                try:
+                    batch.append(self.q.get(timeout=max(0.01, deadline - time.time())))
+                except queue.Empty:
+                    break
+            try:
+                with self.id_lock:
+                    self.w.execute("BEGIN")
+                    for sql, args in batch:
+                        self.w.execute(sql, args)
+                    self.w.execute("COMMIT")
+            except Exception:
+                traceback.print_exc()
+                try:
+                    self.w.execute("ROLLBACK")
+                except Exception:
+                    pass
 
-    def events_window(
-        self,
-        instance: str | None = None,
-        since: float | None = None,
-        until: float | None = None,
-        tag: str | None = None,
-        limit: int = 5000,
-        contract_id: str | None = None,
-    ) -> list[dict]:
-        q = ("SELECT instance, ts, level, module, tag, msg "
-             "FROM events WHERE 1=1")
-        args: list = []
-        if instance:
-            q += " AND instance=?"; args.append(instance)
-        if contract_id:
-            q += " AND instance IN (SELECT name FROM instances WHERE contract_id=?)"
-            args.append(contract_id)
-        if since is not None:
-            q += " AND ts>=?";       args.append(since)
-        if until is not None:
-            q += " AND ts<=?";       args.append(until)
-        if tag:
-            q += " AND tag=?";       args.append(tag)
-        q += " ORDER BY ts DESC LIMIT ?"
-        args.append(limit)
-        with self.lock:
-            cur = self.conn.execute(q, args)
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+    def reader(self):
+        c = sqlite3.connect("file:%s?mode=ro" % self.path, uri=True, timeout=10, check_same_thread=False)
+        c.row_factory = sqlite3.Row
+        return c
 
-    def spells(
-        self,
-        instance: str | None = None,
-        since: float = 0.0,
-        until: float | None = None,
-        tags: tuple[str, ...] = (
-            "consensus_lost", "fork_warn", "out_of_sync", "error", "warning",
-        ),
-        max_gap: float = 10.0,
-        min_count: int = 1,
-    ) -> list[dict]:
-        """
-        Group consecutive same-(instance, tag) events into spells.
-
-        A spell ends when:
-          * the next event has a different (instance, tag), or
-          * the gap to the next event exceeds max_gap seconds.
-
-        Returns each spell as:
-          {instance, tag, start_ts, end_ts, duration_s, count}
-
-        max_gap default 10s ≈ 5× HotPocket roundtime; suits consensus-loop
-        emissions which repeat every ~2s while a condition holds.
-        """
-        if until is None:
-            until = time.time()
-        if not tags:
-            return []
-        placeholders = ",".join(["?"] * len(tags))
-        q = (
-            f"SELECT instance, tag, ts FROM events "
-            f"WHERE tag IN ({placeholders}) AND ts>=? AND ts<=? "
-        )
-        args: list = list(tags) + [since, until]
-        if instance:
-            q += "AND instance=? "
-            args.append(instance)
-        q += "ORDER BY instance, tag, ts"
-
-        out: list[dict] = []
-        cur_inst: str | None = None
-        cur_tag: str | None = None
-        cur_start = cur_end = 0.0
-        cur_count = 0
-
-        def flush():
-            if cur_inst is not None and cur_count >= min_count:
-                out.append({
-                    "instance":   cur_inst,
-                    "tag":        cur_tag,
-                    "start_ts":   cur_start,
-                    "end_ts":     cur_end,
-                    "duration_s": max(0.0, cur_end - cur_start),
-                    "count":      cur_count,
-                })
-
-        with self.lock:
-            for inst, tag, ts in self.conn.execute(q, args):
-                if (inst != cur_inst or tag != cur_tag
-                        or (cur_count > 0 and ts - cur_end > max_gap)):
-                    flush()
-                    cur_inst, cur_tag = inst, tag
-                    cur_start = ts
-                    cur_count = 0
-                cur_end = ts
-                cur_count += 1
-            flush()
-
-        out.sort(key=lambda s: s["duration_s"], reverse=True)
-        return out
-
-    def earliest_event_ts(self, instance: str | None = None) -> float | None:
-        q = "SELECT MIN(ts) FROM events"
-        args: list = []
-        if instance:
-            q += " WHERE instance=?"
-            args.append(instance)
-        with self.lock:
-            return self.conn.execute(q, args).fetchone()[0]
-
-    def histogram(
-        self,
-        instance: str | None,
-        since: float,
-        until: float,
-        bucket_seconds: int,
-        contract_id: str | None = None,
-    ) -> list[dict]:
-        """Tag counts per time bucket for charting."""
-        q = (
-            "SELECT CAST((ts - ?) / ? AS INTEGER) AS bkt, tag, COUNT(*) "
-            "FROM events WHERE ts>=? AND ts<=? "
-        )
-        args: list = [since, bucket_seconds, since, until]
-        if instance:
-            q += "AND instance=? "
-            args.append(instance)
-        if contract_id:
-            q += "AND instance IN (SELECT name FROM instances WHERE contract_id=?) "
-            args.append(contract_id)
-        q += "GROUP BY bkt, tag ORDER BY bkt"
-        with self.lock:
-            rows = self.conn.execute(q, args).fetchall()
-        out: dict[int, dict] = {}
-        for bkt, tag, cnt in rows:
-            slot = out.setdefault(int(bkt), {"bucket_start": since + int(bkt) * bucket_seconds})
-            slot[tag] = cnt
-        return [out[k] for k in sorted(out)]
-
-    def summary(self, window_seconds: int = 3600,
-                roundtime_ms: int = DEFAULT_ROUNDTIME_MS,
-                contract_id: str | None = None) -> list[dict]:
-        """window_seconds=0 means all-time. roundtime_ms drives the uptime-%
-        denominator (one ledger expected per roundtime). Optional contract_id
-        scopes the summary to a single cluster."""
-        now = time.time()
-        round_s = max(0.5, roundtime_ms / 1000.0)
-        all_time = (window_seconds <= 0)
-        since = 0.0 if all_time else now - window_seconds
-        results: list[dict] = []
-        with self.lock:
-            if contract_id:
-                inst_rows = self.conn.execute(
-                    "SELECT name, status FROM instances "
-                    "WHERE contract_id=? ORDER BY name", (contract_id,)
-                ).fetchall()
-            else:
-                inst_rows = self.conn.execute(
-                    "SELECT name, status FROM instances ORDER BY name"
-                ).fetchall()
-            for name, sashi_status in inst_rows:
-                cnt_rows = self.conn.execute(
-                    "SELECT tag, COUNT(*) FROM events "
-                    "WHERE instance=? AND ts>=? GROUP BY tag",
-                    (name, since),
-                ).fetchall()
-                counts = {tag: c for tag, c in cnt_rows}
-
-                last_ledger_row = self.conn.execute(
-                    "SELECT ts, msg FROM events "
-                    "WHERE instance=? AND tag='ledger_created' "
-                    "ORDER BY ts DESC LIMIT 1",
-                    (name,),
-                ).fetchone()
-                last_ledger = last_ledger_row[0] if last_ledger_row else None
-                last_lcl = last_state = last_patch = None
-                if last_ledger_row:
-                    m_info = LEDGER_INFO_RE.search(last_ledger_row[1] or "")
-                    if m_info:
-                        last_lcl = m_info.group("lcl")
-                        last_state = m_info.group("state")
-                        last_patch = m_info.group("patch")
-                last_event = self.conn.execute(
-                    "SELECT MAX(ts) FROM events WHERE instance=?", (name,)
-                ).fetchone()[0]
-                last_fork = self.conn.execute(
-                    "SELECT MAX(ts) FROM events "
-                    "WHERE instance=? AND tag='fork_warn'",
-                    (name,),
-                ).fetchone()[0]
-                last_cons_lost = self.conn.execute(
-                    "SELECT MAX(ts) FROM events "
-                    "WHERE instance=? AND tag='consensus_lost'",
-                    (name,),
-                ).fetchone()[0]
-                last_oos = self.conn.execute(
-                    "SELECT MAX(ts) FROM events "
-                    "WHERE instance=? AND tag='out_of_sync'",
-                    (name,),
-                ).fetchone()[0]
-
-                ledger_age = (now - last_ledger) if last_ledger else None
-                event_age = (now - last_event) if last_event else None
-
-                # Health is derived from current state, not aggregate counts.
-                # A recent ledger trumps any past error: if we're producing
-                # ledgers within STALL_THRESHOLD, we're healthy.
-                fresh_ledger = (
-                    last_ledger is not None
-                    and (now - last_ledger) <= STALL_THRESHOLD
-                )
-                # Most-recent error tag wins if no fresh ledger.
-                err_candidates = [
-                    ("forked",          last_fork),
-                    ("consensus_loss",  last_cons_lost),
-                    ("consensus_loss",  last_oos),
-                ]
-                err_candidates = [(h, ts) for h, ts in err_candidates if ts]
-                latest_err = max(err_candidates, key=lambda x: x[1]) if err_candidates else None
-
-                if fresh_ledger and (
-                    latest_err is None or latest_err[1] < last_ledger
-                ):
-                    health = "healthy"
-                elif latest_err is not None:
-                    health = latest_err[0]
-                elif event_age is not None and event_age > STALL_THRESHOLD:
-                    health = "stalled"
-                elif fresh_ledger:
-                    health = "healthy"
-                else:
-                    health = "unknown"
-
-                # Approx uptime % = fraction of roundtime slots producing a
-                # ledger. For all-time, use the span between first-seen and now.
-                if all_time:
-                    first_ts = self.conn.execute(
-                        "SELECT MIN(ts) FROM events WHERE instance=?", (name,)
-                    ).fetchone()[0]
-                    span = max(round_s, (now - first_ts)) if first_ts else round_s
-                else:
-                    span = max(round_s, float(window_seconds))
-                slots = max(1, int(span // round_s))
-                uptime_pct = round(
-                    100.0 * min(counts.get("ledger_created", 0), slots) / slots,
-                    1,
-                )
-
-                results.append({
-                    "name": name,
-                    "sashi_status": sashi_status,
-                    "health": health,
-                    "last_ledger_age_s": ledger_age,
-                    "last_event_age_s": event_age,
-                    "uptime_pct": uptime_pct,
-                    "window_s": window_seconds,
-                    "counts": counts,
-                    "last_lcl": last_lcl,
-                    "last_state": last_state,
-                    "last_patch": last_patch,
-                })
-        return results
-
-    # ---- host metrics --------------------------------------------------
-
-    _HM_COLS = (
-        "ts", "instance", "during_spell", "spell_id", "cpu_pct", "steal_pct",
-        "load1", "load5", "mem_used_pct", "mem_avail_mb", "swap_used_mb",
-        "disk_used_pct", "disk_free_mb", "inode_used_pct", "net_rx_kbps",
-        "net_tx_kbps", "sys_open_fds", "proc_rss_mb", "proc_open_fds",
-        "proc_pid", "ntp_offset_ms", "ntp_synced", "extra",
-    )
-
-    def insert_host_metrics(self, rows: list[dict]) -> None:
-        if not rows:
-            return
-        ph = ",".join(["?"] * len(self._HM_COLS))
-        with self.lock:
-            self.conn.executemany(
-                f"INSERT INTO host_metrics ({','.join(self._HM_COLS)}) VALUES ({ph})",
-                [tuple(r.get(c) for c in self._HM_COLS) for r in rows],
-            )
-            self.conn.commit()
-
-    def host_metrics_window(self, instance: str | None, since: float,
-                            until: float | None = None, limit: int = 20000) -> list[dict]:
-        if until is None:
-            until = time.time()
-        q = "SELECT * FROM host_metrics WHERE ts>=? AND ts<=?"
-        args: list = [since, until]
-        # instance="" / "machine" => machine-wide rows (instance IS NULL)
-        if instance in ("", "machine", "_host"):
-            q += " AND instance IS NULL"
-        elif instance:
-            q += " AND instance=?"; args.append(instance)
-        q += " ORDER BY ts DESC LIMIT ?"; args.append(limit)
-        with self.lock:
-            cur = self.conn.execute(q, args)
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-    def latest_host_metric(self) -> dict | None:
-        with self.lock:
-            cur = self.conn.execute(
-                "SELECT * FROM host_metrics WHERE instance IS NULL ORDER BY ts DESC LIMIT 1")
-            cols = [d[0] for d in cur.description]
-            row = cur.fetchone()
-            return dict(zip(cols, row)) if row else None
-
-    # ---- spells lifecycle ---------------------------------------------
-
-    def open_spell(self, spell_id: str, instance: str, start_ts: float,
-                   trigger_tag: str, trigger_msg: str) -> None:
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO spells_log "
-                "(spell_id, instance, start_ts, trigger_tag, trigger_msg) "
-                "VALUES (?,?,?,?,?)",
-                (spell_id, instance, start_ts, trigger_tag, (trigger_msg or "")[:500]),
-            )
-            self.conn.commit()
-
-    def close_spell(self, spell_id: str, end_ts: float, recovered: int) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE spells_log SET end_ts=?, recovered=? "
-                "WHERE spell_id=? AND end_ts IS NULL",
-                (end_ts, recovered, spell_id),
-            )
-            self.conn.commit()
-
-    def spell_inc_captures(self, spell_id: str) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE spells_log SET captures = COALESCE(captures,0)+1 WHERE spell_id=?",
-                (spell_id,))
-            self.conn.commit()
-
-    def open_spells(self) -> list[dict]:
-        with self.lock:
-            cur = self.conn.execute(
-                "SELECT * FROM spells_log WHERE end_ts IS NULL ORDER BY start_ts")
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-    def spells_log_window(self, since: float, until: float | None = None,
-                          instance: str | None = None, limit: int = 500,
-                          contract_id: str | None = None) -> list[dict]:
-        if until is None:
-            until = time.time()
-        q = "SELECT * FROM spells_log WHERE start_ts>=? AND start_ts<=?"
-        args: list = [since, until]
-        if instance:
-            q += " AND instance=?"; args.append(instance)
-        if contract_id:
-            q += " AND instance IN (SELECT name FROM instances WHERE contract_id=?)"
-            args.append(contract_id)
-        q += " ORDER BY start_ts DESC LIMIT ?"; args.append(limit)
-        now = time.time()
-        with self.lock:
-            cur = self.conn.execute(q, args)
-            cols = [d[0] for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        for r in rows:
-            if r["end_ts"] is None:
-                age = now - r["start_ts"]
-                r["state"] = "potential_fork" if age > HARD_FORK_AFTER else "active"
-                r["duration_s"] = age
-            else:
-                r["state"] = "recovered" if r.get("recovered") else "ended"
-                r["duration_s"] = r["end_ts"] - r["start_ts"]
-        return rows
-
-    def add_spell_artifact(self, spell_id: str, instance: str | None,
-                           kind: str, content: str | None, ts: float | None = None) -> None:
-        if content is None:
-            return
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO spell_artifacts (spell_id, ts, instance, kind, content) "
-                "VALUES (?,?,?,?,?)",
-                (spell_id, ts or time.time(), instance, kind, content[:ARTIFACT_CONTENT_CAP]),
-            )
-            self.conn.commit()
-
-    def spell_artifacts(self, spell_id: str) -> list[dict]:
-        with self.lock:
-            cur = self.conn.execute(
-                "SELECT id, ts, instance, kind, content FROM spell_artifacts "
-                "WHERE spell_id=? ORDER BY ts, id", (spell_id,))
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
-
-    def recent_log_lines(self, instance: str, limit: int = 200) -> list[dict]:
-        with self.lock:
-            cur = self.conn.execute(
-                "SELECT ts, level, module, tag, msg FROM events "
-                "WHERE instance=? ORDER BY ts DESC LIMIT ?", (instance, limit))
-            cols = [d[0] for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        rows.reverse()
-        return rows
-
-    def prune(self, retention_days: int,
-              artifact_retention_days: int = ARTIFACT_RETENTION_DAYS,
-              proposal_votes_retention_days: int = PROPOSAL_VOTES_RETENTION_DAYS) -> int:
-        now = time.time()
-        cutoff = now - retention_days * 86400
-        # Artifacts are bulky (journalctl/dmesg/ss/conntrack dumps) so they get
-        # a tighter cutoff than the main event stream.
-        art_cutoff = now - max(1, artifact_retention_days) * 86400
-        # Per-round vote lines are high-volume/short-value — tighter cutoff too.
-        pv_cutoff = now - max(1, proposal_votes_retention_days) * 86400
-        with self.lock:
-            cur = self.conn.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
-            self.conn.execute("DELETE FROM host_metrics WHERE ts < ?", (cutoff,))
-            self.conn.execute("DELETE FROM spell_artifacts WHERE ts < ?", (art_cutoff,))
-            self.conn.execute("DELETE FROM proposal_votes WHERE ts < ?", (pv_cutoff,))
-            self.conn.execute("DELETE FROM fork_events WHERE ts < ?", (cutoff,))
-            self.conn.execute(
-                "DELETE FROM spells_log WHERE COALESCE(end_ts, start_ts) < ?", (cutoff,))
-            self.conn.commit()
-            return cur.rowcount
-
-    # ---- clusters -----------------------------------------------------
-
-    def upsert_cluster(self, contract_id: str, label: str | None = None) -> None:
-        """Record a cluster the daemon has seen. `monitored` defaults to 0
-        for any newly-discovered cluster; the operator opts in from the UI."""
-        now = time.time()
-        with self.lock:
-            self.conn.execute(
-                """
-                INSERT INTO clusters (contract_id, label, monitored, first_seen, last_seen)
-                VALUES (?, ?, 0, ?, ?)
-                ON CONFLICT(contract_id) DO UPDATE SET
-                  label     = COALESCE(excluded.label, clusters.label),
-                  last_seen = excluded.last_seen
-                """,
-                (contract_id, label, now, now),
-            )
-            self.conn.commit()
-
-    def set_cluster_monitored(self, contract_id: str, monitored: bool) -> None:
-        with self.lock:
-            self.conn.execute(
-                "UPDATE clusters SET monitored=? WHERE contract_id=?",
-                (1 if monitored else 0, contract_id),
-            )
-            self.conn.commit()
-
-    def cluster_monitored_set(self) -> set[str]:
-        with self.lock:
-            return {r[0] for r in self.conn.execute(
-                "SELECT contract_id FROM clusters WHERE monitored=1"
-            )}
-
-    def list_clusters(self) -> list[dict]:
-        """Return clusters with rolled-up instance metadata. Cheaper than a
-        join via the dashboard because this runs once on demand."""
-        with self.lock:
-            cluster_rows = self.conn.execute(
-                "SELECT contract_id, label, monitored, first_seen, last_seen "
-                "FROM clusters ORDER BY monitored DESC, last_seen DESC"
-            ).fetchall()
-            inst_rows = self.conn.execute(
-                "SELECT name, contract_id, tenant, image, status, last_seen "
-                "FROM instances ORDER BY name"
-            ).fetchall()
-        by_cid: dict[str, list[dict]] = {}
-        for name, cid, tenant, image, status, last_seen in inst_rows:
-            by_cid.setdefault(cid or NO_CONTRACT_ID, []).append({
-                "name": name, "tenant": tenant, "image": image,
-                "status": status, "last_seen": last_seen,
-            })
-        hard_set = self.hard_forked_clusters()
-        split_set = self.chain_split_clusters()
-        out = []
-        seen_cids = set()
-        for cid, label, monitored, first_seen, last_seen in cluster_rows:
-            seen_cids.add(cid)
-            insts = by_cid.get(cid, [])
-            tenants = sorted({i["tenant"] for i in insts if i.get("tenant")})
-            images  = sorted({i["image"]  for i in insts if i.get("image")})
-            out.append({
-                "contract_id": cid,
-                "label":       label,
-                "monitored":   bool(monitored),
-                "first_seen":  first_seen,
-                "last_seen":   last_seen,
-                "node_count":  len(insts),
-                "tenants":     tenants,
-                "images":      images,
-                "instances":   insts,
-                "hard_forked": cid in hard_set,
-                "chain_split": cid in split_set,
-            })
-        # Surface instances whose contract_id has no row in `clusters` yet
-        # (race condition between upserts) so the UI never hides them.
-        for cid, insts in by_cid.items():
-            if cid in seen_cids:
-                continue
-            out.append({
-                "contract_id": cid,
-                "label":       None,
-                "monitored":   False,
-                "first_seen":  None,
-                "last_seen":   max((i.get("last_seen") or 0) for i in insts) if insts else None,
-                "node_count":  len(insts),
-                "tenants":     sorted({i["tenant"] for i in insts if i.get("tenant")}),
-                "images":      sorted({i["image"]  for i in insts if i.get("image")}),
-                "instances":   insts,
-                "hard_forked": cid in hard_set,
-                "chain_split": cid in split_set,
-            })
-        return out
-
-    def instance_names_for_cluster(self, contract_id: str) -> list[str]:
-        with self.lock:
-            return [r[0] for r in self.conn.execute(
-                "SELECT name FROM instances WHERE contract_id=?", (contract_id,)
-            )]
-
-    def hard_forked_clusters(self, hard_fork_after: float = HARD_FORK_AFTER
-                             ) -> set[str]:
-        """Return the set of contract_ids that currently have an open spell
-        whose age exceeds `hard_fork_after` (i.e. no recovery ledger has
-        arrived since the spell started). Used to gate destructive actions
-        in the UI."""
-        cutoff = time.time() - hard_fork_after
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT DISTINCT i.contract_id FROM spells_log s "
-                "JOIN instances i ON i.name = s.instance "
-                "WHERE s.end_ts IS NULL AND s.start_ts <= ? "
-                "  AND i.contract_id IS NOT NULL",
-                (cutoff,),
-            ).fetchall()
-        return {r[0] for r in rows if r[0]}
-
-    def insert_fork_event(self, ts: float, contract_id: str | None, seq_no: int,
-                          hash_a: str, instances_a: list, hash_b: str,
-                          instances_b: list) -> None:
-        with self.lock:
-            self.conn.execute(
-                "INSERT OR IGNORE INTO fork_events "
-                "(ts, contract_id, seq_no, hash_a, instances_a, hash_b, instances_b) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (ts, contract_id, seq_no, hash_a, json.dumps(instances_a),
-                 hash_b, json.dumps(instances_b)),
-            )
-            self.conn.commit()
-
-    def fork_events_window(self, since: float, until: float | None = None,
-                           contract_id: str | None = None,
-                           limit: int = 500) -> list[dict]:
-        if until is None:
-            until = time.time()
-        q = "SELECT * FROM fork_events WHERE ts>=? AND ts<=?"
-        args: list = [since, until]
-        if contract_id:
-            q += " AND contract_id=?"; args.append(contract_id)
-        q += " ORDER BY ts DESC LIMIT ?"; args.append(limit)
-        with self.lock:
-            cur = self.conn.execute(q, args)
-            cols = [d[0] for d in cur.description]
-            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        for r in rows:
-            r["instances_a"] = json.loads(r["instances_a"])
-            r["instances_b"] = json.loads(r["instances_b"])
-        return rows
-
-    def chain_split_clusters(self, since: float | None = None) -> set[str]:
-        """contract_ids with a confirmed chain split (two different hashes at
-        the same seq_no) — a stronger, direct signal than `hard_forked_clusters`
-        (which only infers a hard fork from spell *age*). since=None → all-time."""
-        with self.lock:
-            if since is None:
-                rows = self.conn.execute(
-                    "SELECT DISTINCT contract_id FROM fork_events "
-                    "WHERE contract_id IS NOT NULL"
-                ).fetchall()
-            else:
-                rows = self.conn.execute(
-                    "SELECT DISTINCT contract_id FROM fork_events "
-                    "WHERE contract_id IS NOT NULL AND ts>=?", (since,)
-                ).fetchall()
-        return {r[0] for r in rows if r[0]}
-
-    def cluster_for_instance(self, name: str) -> str | None:
-        with self.lock:
-            row = self.conn.execute(
-                "SELECT contract_id FROM instances WHERE name=?", (name,)
-            ).fetchone()
-        return row[0] if row else None
-
-    def remove_instance(self, name: str) -> None:
-        """Drop an instance row + its events after a successful `evernode
-        delete`. Keep host_metrics and spells_log for audit."""
-        with self.lock:
-            self.conn.execute("DELETE FROM events WHERE instance=?", (name,))
-            self.conn.execute("DELETE FROM instances WHERE name=?", (name,))
-            self.conn.commit()
-
-    def purge_instances(self, names_to_keep: set[str]) -> dict:
-        """Remove every trace of instances NOT in `names_to_keep`. Called from
-        Discoverer after a successful `sashi list` to age out expired tenants.
-        Returns counts so the caller can log the cleanup."""
-        with self.lock:
-            existing = {r[0] for r in self.conn.execute(
-                "SELECT name FROM instances"
-            )}
-            stale = existing - (names_to_keep or set())
-            if not stale:
-                return {"instances": 0, "events": 0, "host_metrics": 0,
-                        "spells": 0, "artifacts": 0, "proposal_votes": 0}
-            placeholders = ",".join("?" * len(stale))
-            args = tuple(stale)
-            spell_ids = [r[0] for r in self.conn.execute(
-                f"SELECT spell_id FROM spells_log WHERE instance IN ({placeholders})",
-                args,
-            )]
-            counts = {"instances": 0, "events": 0, "host_metrics": 0,
-                      "spells": 0, "artifacts": 0, "proposal_votes": 0}
-            counts["events"] = self.conn.execute(
-                f"DELETE FROM events WHERE instance IN ({placeholders})", args
-            ).rowcount
-            counts["proposal_votes"] = self.conn.execute(
-                f"DELETE FROM proposal_votes WHERE instance IN ({placeholders})", args
-            ).rowcount
-            counts["host_metrics"] = self.conn.execute(
-                f"DELETE FROM host_metrics WHERE instance IN ({placeholders})", args
-            ).rowcount
-            counts["spells"] = self.conn.execute(
-                f"DELETE FROM spells_log WHERE instance IN ({placeholders})", args
-            ).rowcount
-            if spell_ids:
-                sp_ph = ",".join("?" * len(spell_ids))
-                counts["artifacts"] = self.conn.execute(
-                    f"DELETE FROM spell_artifacts WHERE spell_id IN ({sp_ph})",
-                    tuple(spell_ids),
-                ).rowcount
-            counts["instances"] = self.conn.execute(
-                f"DELETE FROM instances WHERE name IN ({placeholders})", args
-            ).rowcount
-            self.conn.commit()
-            return counts
-
-    def purge_empty_clusters(self, contract_ids_to_keep: set[str]) -> int:
-        """Drop cluster rows whose contract_id is not in the keep-set AND has
-        no remaining instances. Returns rows removed."""
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT c.contract_id FROM clusters c "
-                "LEFT JOIN instances i ON i.contract_id = c.contract_id "
-                "GROUP BY c.contract_id HAVING COUNT(i.name) = 0"
-            ).fetchall()
-            to_drop = [r[0] for r in rows if r[0] not in (contract_ids_to_keep or set())]
-            if not to_drop:
-                return 0
-            placeholders = ",".join("?" * len(to_drop))
-            n = self.conn.execute(
-                f"DELETE FROM clusters WHERE contract_id IN ({placeholders})",
-                tuple(to_drop),
-            ).rowcount
-            self.conn.commit()
-            return n
-
-    def get_setting(self, key: str, default: str | None = None) -> str | None:
-        with self.lock:
-            row = self.conn.execute(
-                "SELECT value FROM settings WHERE key=?", (key,)
-            ).fetchone()
-        return row[0] if row else default
-
-    def set_setting(self, key: str, value: str) -> None:
-        with self.lock:
-            self.conn.execute(
-                "INSERT INTO settings (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
-            self.conn.commit()
-
-    def db_size_bytes(self) -> int:
-        """Sum of the SQLite main file + its -wal and -shm sidecars (best-effort)."""
+    def size_bytes(self):
         total = 0
         for suffix in ("", "-wal", "-shm"):
             try:
@@ -1384,3555 +215,1026 @@ class Store:
                 pass
         return total
 
-    def clear_all(self) -> dict:
-        """Wipe all events and instance rows. Tail threads keep running;
-        the next discovery poll will re-upsert live instances.
-
-        On busy hosts VACUUM and WAL checkpoint can fail under writer
-        contention from the tail threads; without them the .db file and
-        its .db-wal sidecar stay at their high-water mark even though
-        every table is empty. We retry under the store lock and log any
-        failure loudly so the bloat isn't silent."""
-        with self.lock:
-            ev = self.conn.execute("DELETE FROM events").rowcount
-            ins = self.conn.execute("DELETE FROM instances").rowcount
-            hm = self.conn.execute("DELETE FROM host_metrics").rowcount
-            sp = self.conn.execute("DELETE FROM spells_log").rowcount
-            ar = self.conn.execute("DELETE FROM spell_artifacts").rowcount
-            cl = self.conn.execute("DELETE FROM clusters").rowcount
-            pv = self.conn.execute("DELETE FROM proposal_votes").rowcount
-            fe = self.conn.execute("DELETE FROM fork_events").rowcount
-            self.conn.commit()
-
-            wal_ok = False
-            for attempt in range(3):
-                try:
-                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    wal_ok = True
+    def maintain(self):
+        """Retention by age, then by size; reclaim space; keep the WAL small."""
+        cutoff = time.time() - self.retention_s
+        minute_cut = int(cutoff // 60)
+        stmts = [
+            ("DELETE FROM node_minutes WHERE minute < ?", (minute_cut,)),
+            ("DELETE FROM host_minutes WHERE minute < ?", (minute_cut,)),
+            ("DELETE FROM ledgers WHERE last_ts < ?", (cutoff,)),
+            ("DELETE FROM stats WHERE ts < ?", (cutoff,)),
+            ("DELETE FROM captures WHERE ts < ?", (cutoff,)),
+            ("DELETE FROM incidents WHERE start_ts < ? AND end_ts IS NOT NULL", (cutoff,)),
+        ]
+        with self.id_lock:
+            for sql, args in stmts:
+                self.w.execute(sql, args)
+            # Size cap: captures are the bulk; drop the oldest until under the cap.
+            for _ in range(20):
+                if self.size_bytes() <= self.max_mb * 1048576:
                     break
-                except sqlite3.OperationalError as e:
-                    print(f"[clear_all] wal_checkpoint attempt {attempt+1} failed: {e}",
-                          file=sys.stderr)
-                    time.sleep(0.2)
-
-            vac_ok = False
-            for attempt in range(3):
-                try:
-                    self.conn.execute("VACUUM")
-                    vac_ok = True
+                row = self.w.execute("SELECT MIN(id) FROM captures").fetchone()
+                if not row or row[0] is None:
                     break
-                except sqlite3.OperationalError as e:
-                    print(f"[clear_all] VACUUM attempt {attempt+1} failed: {e}",
-                          file=sys.stderr)
-                    time.sleep(0.2)
+                self.w.execute("DELETE FROM captures WHERE id < ?", (row[0] + 200,))
+                self.w.execute("PRAGMA incremental_vacuum(2000)")
+            self.w.execute("PRAGMA incremental_vacuum(5000)")
+            self.w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
-            if not vac_ok or not wal_ok:
-                print(f"[clear_all] db file may stay bloated: "
-                      f"wal_checkpoint={'ok' if wal_ok else 'FAIL'} "
-                      f"vacuum={'ok' if vac_ok else 'FAIL'} "
-                      f"size_bytes={self.db_size_bytes()}",
-                      file=sys.stderr)
-
-            return {"events_deleted": ev, "instances_deleted": ins,
-                    "host_metrics_deleted": hm, "spells_deleted": sp,
-                    "artifacts_deleted": ar, "clusters_deleted": cl,
-                    "proposal_votes_deleted": pv, "fork_events_deleted": fe,
-                    "vacuum_ok": vac_ok, "wal_checkpoint_ok": wal_ok}
+    def clear(self):
+        with self.id_lock:
+            for t in ("node_minutes", "host_minutes", "ledgers", "stats", "captures", "incidents"):
+                self.w.execute("DELETE FROM %s" % t)
+            self.w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.w.execute("VACUUM")
+            self.w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
 
-# --------------------------------------------------------------------------
-# Tail worker (one per instance)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------------------
+# Per-node state and log following
+# ---------------------------------------------------------------------------------------------------------
 
-class PolicyManager:
-    """Resolves the current event-tracking + spell-handling policy.
-
-    Backed by the `settings` table so the dashboard can flip the mode at
-    runtime; reads are cheap (hits SQLite per call but only on the ingest
-    path, which is already DB-bound).
-    """
-
-    def __init__(self, store: Store, default_mode: str = DEFAULT_POLICY_MODE):
-        self.store = store
-        self.default = default_mode if default_mode in POLICY_MODES else "balanced"
-        if self.store.get_setting("policy_mode") is None:
-            self.store.set_setting("policy_mode", self.default)
-
-    def mode(self) -> str:
-        m = self.store.get_setting("policy_mode", self.default) or self.default
-        return m if m in POLICY_MODES else self.default
-
-    def set_mode(self, mode: str) -> str:
-        if mode not in POLICY_MODES:
-            raise ValueError(f"unknown policy mode: {mode}")
-        self.store.set_setting("policy_mode", mode)
-        return mode
-
-    def spell_actions(self, severity: str) -> dict:
-        """Return {events, boost, snapshot} bools for a spell of given severity
-        under the current mode."""
-        return POLICY_MODES[self.mode()].get(
-            severity, POLICY_MODES[self.mode()]["high"]
-        )
-
-    def should_track_event(self, spell_mgr, instance: str, tag: str) -> bool:
-        """Apply the per-event gate. ALWAYS_TRACK_TAGS bypass everything."""
-        if tag in ALWAYS_TRACK_TAGS:
-            return True
-        mode = self.mode()
-        if mode == "full":
-            return True
-        sev = tag_severity(tag)
-        if mode == "minimal":
-            return sev == "high"
-        # balanced: only gate while the instance is in a low-severity spell.
-        spell = spell_mgr.current_spell(instance) if spell_mgr else None
-        if spell is None:
-            return True
-        return POLICY_MODES["balanced"][spell["severity"]]["events"]
-
-
-class ForkDetector:
-    """Cross-instance LCL comparison, fed a `ledger_created` event from every
-    tailed instance. Flags the moment two+ instances of the SAME cluster hold
-    DIFFERENT hashes at the SAME ledger seq_no — a confirmed chain split, as
-    opposed to a `fork_warn` log line (which only means "no quorum this
-    round" and self-heals most of the time, per
-    HOTPOCKET_CONSENSUS_INVESTIGATION.md §3.2/§11.3's "vote-visibility split").
-
-    This is the automatic version of what that investigation did by hand:
-    grep every host's log for the last `****Ledger created****` line and
-    compare lcl hashes across hosts.
-    """
-
-    def __init__(self, store: Store):
-        self.store = store
-        self.lock = threading.Lock()
-        # contract_id -> seq_no -> hash -> set(instance)
-        self._seen: dict[str, dict[int, dict[str, set]]] = {}
-        # (contract_id, seq_no, hash_a, hash_b) pairs already recorded.
-        self._recorded: set[tuple] = set()
-        # Bound memory per contract: only compare against this many recent
-        # seq_nos (a hard fork's divergence point is always within a handful
-        # of ledgers of "now", not the whole chain history).
-        self._max_tracked_seqs = 64
-
-    def on_ledger_created(self, instance: str, contract_id: str | None,
-                          ts: float, lcl: str | None) -> None:
-        if not contract_id or not lcl or "-" not in lcl:
-            return
-        seq_str, _, hsh = lcl.partition("-")
-        try:
-            seq = int(seq_str)
-        except ValueError:
-            return
-        with self.lock:
-            by_seq = self._seen.setdefault(contract_id, {})
-            by_hash = by_seq.setdefault(seq, {})
-            by_hash.setdefault(hsh, set()).add(instance)
-
-            for other_hash, other_insts in list(by_hash.items()):
-                if other_hash == hsh or instance in other_insts:
-                    continue
-                key_lo, key_hi = sorted((hsh, other_hash))
-                rec_key = (contract_id, seq, key_lo, key_hi)
-                if rec_key in self._recorded:
-                    continue
-                self._recorded.add(rec_key)
-                try:
-                    self.store.insert_fork_event(
-                        ts=ts, contract_id=contract_id, seq_no=seq,
-                        hash_a=key_lo, instances_a=sorted(by_hash.get(key_lo, [])),
-                        hash_b=key_hi, instances_b=sorted(by_hash.get(key_hi, [])),
-                    )
-                    print(f"[fork] CONFIRMED chain split: cluster {contract_id[:12]} "
-                          f"seq {seq}: {key_lo} vs {key_hi}", file=sys.stderr)
-                except Exception as e:
-                    print(f"[fork] insert_fork_event failed: {e}", file=sys.stderr)
-
-            if len(by_seq) > self._max_tracked_seqs:
-                for old_seq in sorted(by_seq)[:-self._max_tracked_seqs]:
-                    del by_seq[old_seq]
-
-
-class Tail(threading.Thread):
-    def __init__(self, instance: str, store: Store, stop_event: threading.Event,
-                 sashi_bin: str, spell_manager=None, policy: "PolicyManager | None" = None,
-                 contract_id: str | None = None, fork_detector: "ForkDetector | None" = None):
-        super().__init__(daemon=True, name=f"tail-{instance[:12]}")
-        self.instance = instance
+class Node:
+    def __init__(self, app, name, contract_id, user, log_dir, image, cfg_path):
+        self.app = app
+        self.name = name
+        self.short = name[:8]
         self.contract_id = contract_id
-        self.store = store
-        # `stop_event` is the global daemon stop; `local_stop` is set when this
-        # tail alone should die (cluster un-monitored at runtime). Either one
-        # exits the loop.
-        self.stop_event = stop_event
-        self.local_stop = threading.Event()
-        self.sashi_bin = sashi_bin
-        self.spell_manager = spell_manager
-        self.policy = policy
-        self.fork_detector = fork_detector
-        self.proc: subprocess.Popen | None = None
-        self.master_fd: int | None = None
+        self.user = user
+        self.log_dir = log_dir
+        self.image = image
+        self.cfg_path = cfg_path
+        self.cluster_id = app.store.cluster_id(contract_id)
+        self.id = app.store.node_id(name, self.cluster_id, app.host, image)
+        self.version = None
+        self.pubkey = None
+        self.seq = None
+        self.hash = None
+        self.close_ts = None
+        self.line_ts = None          # hpcore timestamp of the last line
+        self.read_ts = None          # wall time the last line was read
+        self.vote_status = None
+        self.last_votes = None       # e.g. "votes:8/11" or "won:10/11"
+        self.stats = None
+        self.frozen_since = None
+        self.proc = None             # last /proc diagnosis
+        self.ring = collections.deque(maxlen=app.ring_lines)
+        self.minute = None
+        self.cnt = None
+        self.stop = threading.Event()
+        # Re-entrant: an event raised while parsing a line (under this lock) captures this node's ring buffer.
+        self.lock = threading.RLock()
+        self.thread = threading.Thread(target=self._follow, name="follow-" + self.short, daemon=True)
+        self.thread.start()
 
-    def _should_stop(self) -> bool:
-        return self.stop_event.is_set() or self.local_stop.is_set()
-
-    def _start_proc(self) -> None:
-        master, slave = pty.openpty()
-        self.master_fd = master
-        self.proc = subprocess.Popen(
-            [self.sashi_bin, "attach", "-n", self.instance],
-            stdin=slave, stdout=slave, stderr=slave,
-            close_fds=True, preexec_fn=os.setsid,
-        )
-        os.close(slave)
-
-    def run(self) -> None:
-        backoff = 1.0
-        while not self._should_stop():
-            try:
-                self._start_proc()
-                buf = b""
-                backoff = 1.0
-                while not self._should_stop():
-                    rlist, _, _ = select.select([self.master_fd], [], [], 1.0)
-                    if not rlist:
-                        if self.proc.poll() is not None:
-                            break
-                        continue
-                    try:
-                        chunk = os.read(self.master_fd, 4096)
-                    except OSError:
-                        break
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while b"\n" in buf:
-                        line, buf = buf.split(b"\n", 1)
-                        text = line.decode("utf-8", errors="replace")
-                        ev = parse_log_line(text, time.time())
-                        if ev:
-                            # Spell tracking always runs (so spells open/close
-                            # regardless of event-storage policy).
-                            opened_spell = False
-                            if self.spell_manager is not None:
-                                try:
-                                    opened_spell = bool(
-                                        self.spell_manager.on_event(self.instance, ev)
-                                    )
-                                except Exception as e:
-                                    print(f"[tail {self.instance[:12]}] spell: {e}",
-                                          file=sys.stderr)
-                            # Always persist the trigger event of a fresh spell so
-                            # low-severity spells (consensus_lost, out_of_sync,
-                            # warning) still get one tick on the line chart even
-                            # when the policy drops the rest of the flood.
-                            track = opened_spell
-                            if not track and self.policy is not None:
-                                try:
-                                    track = self.policy.should_track_event(
-                                        self.spell_manager, self.instance, ev["tag"])
-                                except Exception:
-                                    track = True
-                            elif not track:
-                                track = True
-                            if track:
-                                try:
-                                    kind = VOTE_TAG_KIND.get(ev["tag"])
-                                    if kind and ev.get("vote"):
-                                        # Structured, compact — replaces what
-                                        # would otherwise be a raw free-text
-                                        # `info_other` row per vote line.
-                                        self.store.insert_proposal_vote(
-                                            self.instance, ev["ts"], kind, ev["vote"])
-                                    else:
-                                        self.store.insert_event(self.instance, ev)
-                                except Exception as e:
-                                    print(f"[tail {self.instance[:12]}] db: {e}",
-                                          file=sys.stderr)
-                            if ev["tag"] == "ledger_created" and self.fork_detector is not None:
-                                m = LEDGER_INFO_RE.search(ev["msg"])
-                                if m:
-                                    try:
-                                        self.fork_detector.on_ledger_created(
-                                            self.instance, self.contract_id,
-                                            ev["ts"], m.group("lcl"))
-                                    except Exception as e:
-                                        print(f"[tail {self.instance[:12]}] fork: {e}",
-                                              file=sys.stderr)
-            except FileNotFoundError:
-                print(f"[tail {self.instance[:12]}] '{self.sashi_bin}' not found",
-                      file=sys.stderr)
-                self.stop_event.wait(15)
-            except Exception as e:
-                print(f"[tail {self.instance[:12]}] {e}", file=sys.stderr)
-            finally:
-                self._cleanup()
-
-            if not self._should_stop():
-                # Honour whichever signal trips first.
-                self.stop_event.wait(backoff)
-                if self.local_stop.is_set():
-                    break
-                backoff = min(backoff * 2, 30.0)
-
-    def _cleanup(self, fast: bool = False) -> None:
-        # `fast` path is used on process shutdown — skip the SIGINT grace window
-        # because sashi/docker attach chains routinely take >3s to drain, which
-        # then trips systemd's TimeoutStopSec → SIGKILL of the whole unit.
-        if self.proc and self.proc.poll() is None:
-            try:
-                if fast:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
-                else:
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
-                    self.proc.wait(timeout=3)
-            except Exception:
-                try:
-                    self.proc.kill()
-                except Exception:
-                    pass
-        self.proc = None
-        if self.master_fd is not None:
-            try:
-                os.close(self.master_fd)
-            except Exception:
-                pass
-            self.master_fd = None
-
-    def shutdown(self, fast: bool = False) -> None:
-        self.local_stop.set()
-        self._cleanup(fast=fast)
-
-
-# --------------------------------------------------------------------------
-# Discovery
-# --------------------------------------------------------------------------
-
-class Discoverer(threading.Thread):
-    def __init__(self, store: Store, tails: dict[str, Tail],
-                 stop_event: threading.Event, sashi_bin: str,
-                 interval: int = DISCOVER_INTERVAL, spell_manager=None,
-                 policy: "PolicyManager | None" = None,
-                 auto_monitor_new: bool = False,
-                 fork_detector: "ForkDetector | None" = None):
-        super().__init__(daemon=True, name="discover")
-        self.store = store
-        self.tails = tails
-        self.stop_event = stop_event
-        self.sashi_bin = sashi_bin
-        self.interval = interval
-        self.spell_manager = spell_manager
-        self.policy = policy
-        self.auto_monitor_new = auto_monitor_new
-        self.fork_detector = fork_detector
-        self._wake = threading.Event()
-
-    def trigger(self) -> None:
-        """Force the next discovery pass immediately. Called by /api/discover_now
-        and when the user toggles a cluster's monitored state from the UI."""
-        self._wake.set()
-
-    def discover_once(self) -> dict:
-        """Run one discovery pass; return {clusters_seen, instances_seen,
-        tails_started, tails_reaped}."""
-        try:
-            out = subprocess.check_output(
-                [self.sashi_bin, "list"], text=True, timeout=15,
-            )
-        except FileNotFoundError:
-            print(f"[discover] '{self.sashi_bin}' not found in PATH",
-                  file=sys.stderr)
-            return {"error": "sashi not found"}
-        except Exception as e:
-            print(f"[discover] {e}", file=sys.stderr)
-            return {"error": str(e)}
-
-        try:
-            instances = json.loads(out)
-        except Exception as e:
-            print(f"[discover] bad json: {e}", file=sys.stderr)
-            return {"error": f"bad json: {e}"}
-
-        seen_clusters: set[str] = set()
-        seen_instances: set[str] = set()
-        # First pass: persist everything we saw, so the UI can show all
-        # clusters even before they're monitored.
-        for ins in instances:
-            name = ins.get("name")
-            if not name:
-                continue
-            cid = ins.get("contract_id") or NO_CONTRACT_ID
-            seen_clusters.add(cid)
-            seen_instances.add(name)
-            self.store.upsert_instance(ins)
-            self.store.upsert_cluster(cid)
-
-        # Optionally flip newly-seen clusters to monitored=1 (initial-install
-        # convenience; off by default).
-        if self.auto_monitor_new and seen_clusters:
-            currently_monitored = self.store.cluster_monitored_set()
-            for cid in seen_clusters:
-                if cid not in currently_monitored:
-                    self.store.set_cluster_monitored(cid, True)
-
-        # Map instance->contract_id so we know which tails to keep.
-        inst_to_cid: dict[str, str] = {}
-        for ins in instances:
-            n = ins.get("name")
-            if n:
-                inst_to_cid[n] = ins.get("contract_id") or NO_CONTRACT_ID
-
-        monitored = self.store.cluster_monitored_set()
-        started = 0
-        reaped = 0
-
-        # Start tails for monitored, not-yet-tailed instances.
-        for name in seen_instances:
-            cid = inst_to_cid.get(name)
-            if cid in monitored and name not in self.tails:
-                t = Tail(name, self.store, self.stop_event, self.sashi_bin,
-                         spell_manager=self.spell_manager,
-                         policy=self.policy,
-                         contract_id=cid,
-                         fork_detector=self.fork_detector)
-                self.tails[name] = t
-                t.start()
-                started += 1
-                print(f"[discover] tailing {name[:16]} (cluster {cid[:12]})")
-
-        # Reap tails whose cluster is no longer monitored (or whose instance
-        # has vanished from `sashi list`).
-        for name in list(self.tails.keys()):
-            cid = inst_to_cid.get(name, self.tails[name].contract_id)
-            keep = (cid in monitored) and (name in seen_instances)
-            if not keep:
-                try:
-                    self.tails[name].shutdown()
-                except Exception:
-                    pass
-                self.tails.pop(name, None)
-                reaped += 1
-                print(f"[discover] dropped tail {name[:16]} (cluster {(cid or '?')[:12]} unmonitored)")
-
-        # Age out any instances + clusters no longer present in `sashi list`.
-        # Only runs after a successful parse — a failed/empty-due-to-error
-        # poll returned early above, so we never nuke history on a transient
-        # sashi hiccup.
-        purged = self.store.purge_instances(seen_instances)
-        empty_clusters = self.store.purge_empty_clusters(seen_clusters)
-        if any(purged.values()) or empty_clusters:
-            print(f"[discover] purged stale: instances={purged['instances']} "
-                  f"events={purged['events']} host_metrics={purged['host_metrics']} "
-                  f"spells={purged['spells']} artifacts={purged['artifacts']} "
-                  f"empty_clusters={empty_clusters}")
-
-        return {
-            "clusters_seen":  len(seen_clusters),
-            "instances_seen": len(seen_instances),
-            "tails_started":  started,
-            "tails_reaped":   reaped,
-            "purged":         purged,
-            "empty_clusters_dropped": empty_clusters,
-        }
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                self.discover_once()
-            except Exception as e:
-                print(f"[discover] {e}", file=sys.stderr)
-            # Sleep until interval elapses OR a manual trigger wakes us.
-            self._wake.clear()
-            waited = 0.0
-            step = 0.5
-            while waited < self.interval and not self.stop_event.is_set() and not self._wake.is_set():
-                self.stop_event.wait(step)
-                waited += step
-
-
-# --------------------------------------------------------------------------
-# Retention sweeper
-# --------------------------------------------------------------------------
-
-class Pruner(threading.Thread):
-    def __init__(self, store: Store, stop_event: threading.Event,
-                 retention_days: int):
-        super().__init__(daemon=True, name="pruner")
-        self.store = store
-        self.stop_event = stop_event
-        self.retention_days = retention_days
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            try:
-                n = self.store.prune(self.retention_days)
-                if n:
-                    print(f"[pruner] removed {n} old events")
-            except Exception as e:
-                print(f"[pruner] {e}", file=sys.stderr)
-            self.stop_event.wait(RETENTION_SWEEP)
-
-
-# --------------------------------------------------------------------------
-# Host-metrics collector
-# --------------------------------------------------------------------------
-
-class MetricsCollector(threading.Thread):
-    """Samples machine + per-HP-process metrics into `host_metrics`.
-
-    Normal cadence: every `normal_interval` s. While an error spell is active
-    (signalled via `boost()`), every `boost_interval` s, with rows tagged
-    during_spell=1. `sample_now()` takes an immediate out-of-band sample (used
-    the instant a spell starts).
-    """
-
-    def __init__(self, store: Store, stop_event: threading.Event,
-                 instances_ref: dict, normal_interval: int = METRICS_INTERVAL,
-                 boost_interval: int = METRICS_INTERVAL_BOOST, ntp_enabled: bool = True):
-        super().__init__(daemon=True, name="metrics")
-        self.store = store
-        self.stop = stop_event
-        self.instances_ref = instances_ref
-        self.normal_interval = max(2, normal_interval)
-        self.boost_interval = max(1, boost_interval)
-        self.ntp_enabled = ntp_enabled
-        self._lock = threading.Lock()
-        self._boost_until = 0.0
-        self._boost_spell_id: str | None = None
-        self._prev: dict = {}
-        self._pid_cache: dict[str, int | None] = {}
-        self.tick_cb = None  # set by main() to SpellManager.tick
-
-    def boost(self, spell_id: str, duration: float) -> None:
-        with self._lock:
-            self._boost_until = max(self._boost_until, time.time() + duration)
-            self._boost_spell_id = spell_id
-
-    def _boost_now(self) -> tuple[bool, str | None]:
-        with self._lock:
-            active = time.time() < self._boost_until
-            return active, (self._boost_spell_id if active else None)
-
-    # ---- sample construction ------------------------------------------
-
-    def _build_rows(self, during_spell: int, spell_id: str | None) -> list[dict]:
-        now = time.time()
-        rows: list[dict] = []
-        cpu = _cpu_jiffies(); load = _loadavg(); mem = _meminfo()
-        net = _net_totals(); fds = _sys_open_fds()
-        ntp_ms, ntp_synced = (_ntp_status() if self.ntp_enabled else (None, None))
-
-        cpu_pct = steal_pct = None
-        if cpu and self._prev.get("cpu"):
-            i0, t0, s0 = self._prev["cpu"]; i1, t1, s1 = cpu
-            dt = t1 - t0
-            if dt > 0:
-                cpu_pct = round(max(0.0, 100.0 * (1.0 - (i1 - i0) / dt)), 1)
-                steal_pct = round(max(0.0, 100.0 * (s1 - s0) / dt), 2)
-        net_rx = net_tx = None
-        if net and self._prev.get("net") and self._prev.get("ts"):
-            r0, x0 = self._prev["net"]; r1, x1 = net
-            dts = now - self._prev["ts"]
-            if dts > 0:
-                net_rx = round(max(0.0, (r1 - r0) / dts / 1024.0), 1)
-                net_tx = round(max(0.0, (x1 - x0) / dts / 1024.0), 1)
-        self._prev = {"cpu": cpu, "net": net, "ts": now}
-
-        mounts = {m for m in ALWAYS_SAMPLE_MOUNTS if os.path.isdir(m)}
-        mounts.add("/")
-        disks: dict[str, dict] = {}
-        worst_used = worst_inode = 0.0
-        min_free: float | None = None
-        for m in mounts:
-            d = _disk_usage(m)
-            if not d:
-                continue
-            disks[m] = {k: round(v, 1) for k, v in d.items()}
-            worst_used = max(worst_used, d["used_pct"])
-            worst_inode = max(worst_inode, d["inode_used_pct"])
-            min_free = d["free_mb"] if min_free is None else min(min_free, d["free_mb"])
-
-        mem_used_pct = mem_avail_mb = swap_used_mb = None
-        if mem:
-            total = mem.get("MemTotal", 0)
-            avail = mem.get("MemAvailable", mem.get("MemFree", 0))
-            if total:
-                mem_used_pct = round(100.0 * (1.0 - avail / total), 1)
-            mem_avail_mb = round(avail / 1024.0, 1)
-            swap_used_mb = round((mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)) / 1024.0, 1)
-
-        rows.append({
-            "ts": now, "instance": None, "during_spell": during_spell, "spell_id": spell_id,
-            "cpu_pct": cpu_pct, "steal_pct": steal_pct,
-            "load1": load[0] if load else None, "load5": load[1] if load else None,
-            "mem_used_pct": mem_used_pct, "mem_avail_mb": mem_avail_mb,
-            "swap_used_mb": swap_used_mb,
-            "disk_used_pct": round(worst_used, 1),
-            "disk_free_mb": round(min_free, 1) if min_free is not None else None,
-            "inode_used_pct": round(worst_inode, 1),
-            "net_rx_kbps": net_rx, "net_tx_kbps": net_tx, "sys_open_fds": fds,
-            "ntp_offset_ms": (round(ntp_ms, 3) if ntp_ms is not None else None),
-            "ntp_synced": ntp_synced,
-            "extra": json.dumps({"disks": disks}),
-        })
-
-        # Per-instance HP process rows.
-        for name in list(self.instances_ref.keys()):
-            pid = self._pid_cache.get(name)
-            if not pid or not os.path.isdir(f"/proc/{pid}"):
-                pid = _find_instance_pid(name)
-                self._pid_cache[name] = pid
-            if not pid:
-                continue
-            rss = _proc_rss_mb(pid)
-            pfds = _proc_open_fds(pid)
-            if rss is None and pfds is None:
-                continue
-            rows.append({
-                "ts": now, "instance": name, "during_spell": during_spell,
-                "spell_id": spell_id, "proc_rss_mb": rss, "proc_open_fds": pfds,
-                "proc_pid": pid,
-            })
-        return rows
-
-    def sample_now(self, spell_id: str | None = None, during_spell: int = 0) -> None:
-        try:
-            rows = self._build_rows(during_spell, spell_id)
-            self.store.insert_host_metrics(rows)
-        except Exception as e:
-            print(f"[metrics] sample failed: {e}", file=sys.stderr)
-
-    def run(self) -> None:
-        # Prime the deltas so the first real sample has rates.
-        self._prev = {"cpu": _cpu_jiffies(), "net": _net_totals(), "ts": time.time()}
+    # -- following hp.log across plog rotations (hp.log -> hp.1.log ...)
+    def _follow(self):
+        path = os.path.join(self.log_dir, "hp.log")
+        f = None
+        ino = None
+        buf = b""
         while not self.stop.is_set():
-            boosting, sid = self._boost_now()
-            self.sample_now(spell_id=sid, during_spell=1 if boosting else 0)
-            if callable(self.tick_cb):
+            try:
+                if f is None:
+                    if not os.path.exists(path):
+                        time.sleep(2)
+                        continue
+                    f = open(path, "rb")
+                    ino = os.fstat(f.fileno()).st_ino
+                    if self.read_ts is None:
+                        # Start near the end, but read enough to learn version/pubkey/last ledger.
+                        size = os.path.getsize(path)
+                        f.seek(max(0, size - 262144))
+                        self._prime()
+                        if size > 262144:
+                            f.readline()
+                chunk = f.read(65536)
+                if chunk:
+                    buf += chunk
+                    *lines, buf = buf.split(b"\n")
+                    for raw in lines:
+                        self._line(raw.decode("utf-8", "replace"))
+                    continue
+                # No new data: rotated or truncated?
                 try:
-                    self.tick_cb()
-                except Exception as e:
-                    print(f"[metrics] tick: {e}", file=sys.stderr)
-            self.stop.wait(self.boost_interval if boosting else self.normal_interval)
+                    st = os.stat(path)
+                    if st.st_ino != ino or st.st_size < f.tell():
+                        f.close()
+                        f = None
+                        buf = b""
+                        continue
+                except FileNotFoundError:
+                    pass
+                time.sleep(0.25)
+            except Exception:
+                traceback.print_exc()
+                try:
+                    if f:
+                        f.close()
+                except Exception:
+                    pass
+                f = None
+                time.sleep(2)
+        if f:
+            f.close()
 
+    def _prime(self):
+        """Learn version and pubkey from the oldest rotated log (they are only printed at startup)."""
+        files = sorted(glob.glob(os.path.join(self.log_dir, "hp.*.log")),
+                       key=lambda p: int(re.search(r"hp\.(\d+)\.log$", p).group(1)), reverse=True)
+        files.append(os.path.join(self.log_dir, "hp.log"))
+        for p in files[:2] + files[-1:]:
+            try:
+                with open(p, "rb") as fh:
+                    head = fh.read(65536).decode("utf-8", "replace").replace("﻿", "")
+                for raw in head.splitlines():
+                    m = LINE_RE.match(raw)
+                    if not m:
+                        continue
+                    msg = m.group(5)
+                    v = RE_VERSION.match(msg)
+                    if v:
+                        self.version = v.group(1)
+                    k = RE_PUBKEY.match(msg)
+                    if k:
+                        self.pubkey = k.group(1)
+                if self.version and self.pubkey:
+                    break
+            except OSError:
+                pass
+        if self.version or self.pubkey:
+            self.app.store.put("UPDATE nodes SET version=coalesce(?,version), pubkey=coalesce(?,pubkey) WHERE id=?",
+                               (self.version, self.pubkey, self.id))
 
-# --------------------------------------------------------------------------
-# Error-spell manager + diagnostic snapshots
-# --------------------------------------------------------------------------
+    def _bump(self, ts, field, n=1):
+        minute = int(ts // 60)
+        if self.minute != minute:
+            self._flush()
+            self.minute = minute
+            self.cnt = dict.fromkeys(MINUTE_FIELDS, 0)
+        if field == "max_seq":
+            self.cnt["max_seq"] = max(self.cnt["max_seq"], n)
+        else:
+            self.cnt[field] += n
 
-def capture_snapshot(store: Store, spell_id: str, sashi_bin: str,
-                     instances: list[str]) -> None:
-    """Capture machine-wide + per-instance diagnostics into `spell_artifacts`."""
-    ts = time.time()
+    def _flush(self):
+        if self.minute is None or not self.cnt:
+            return
+        c = self.cnt
+        self.app.store.put(
+            "INSERT OR REPLACE INTO node_minutes(node_id, minute, %s) VALUES (?,?,%s)"
+            % (",".join(MINUTE_FIELDS), ",".join("?" * len(MINUTE_FIELDS))),
+            (self.id, self.minute, *[c[k] for k in MINUTE_FIELDS]))
 
-    def add(kind: str, content: str | None, inst: str | None = None) -> None:
-        store.add_spell_artifact(spell_id, inst, kind, content, ts)
-
-    add("ps",         run_cmd(["sh", "-c", "ps aux --sort=-%mem 2>/dev/null | head -n 30"], timeout=8))
-    add("free",       run_cmd(["sh", "-c", "free -m 2>/dev/null; echo; head -n 6 /proc/meminfo"], timeout=5))
-    add("df",         run_cmd(["sh", "-c", "df -h 2>/dev/null"], timeout=8))
-    add("dfi",        run_cmd(["sh", "-c", "df -i 2>/dev/null"], timeout=8))
-    add("uptime",     run_cmd(["sh", "-c", "uptime; echo; cat /proc/loadavg; echo; cat /proc/stat | head -n 1"], timeout=5))
-    add("vmstat",     run_cmd(["sh", "-c", "vmstat 1 3 2>/dev/null || (echo 'vmstat unavailable'; cat /proc/stat | head -n 1)"], timeout=8))
-    add("dmesg",      run_cmd(["sh", "-c", "(dmesg --time-format=iso 2>/dev/null || dmesg 2>/dev/null) | tail -n 80"], timeout=8))
-    # journalctl: a few angles — recent system-wide, the sashimono agent unit,
-    # and any unit whose name contains 'sashi'/'hp'/'evernode' (covers the
-    # per-instance services regardless of exact naming).
-    add("journalctl", run_cmd(["sh", "-c",
-        "journalctl --since '-5 min' -n 900 --no-pager 2>/dev/null || echo 'journalctl unavailable'"], timeout=14))
-    add("journalctl_agent", run_cmd(["sh", "-c",
-        "for u in sashimono-agent.service sashimono.service sashi-agent.service mb-xrpl.service; do "
-        "  echo \"=== $u ===\"; journalctl -u \"$u\" -n 300 --no-pager 2>/dev/null || echo '(no such unit)'; echo; "
-        "done"], timeout=14))
-    add("journalctl_units", run_cmd(["sh", "-c",
-        "for u in $(systemctl list-units --no-legend --plain 'sashi*' 'hp*' 'evernode*' '*sashimono*' 2>/dev/null | awk '{print $1}' | sort -u); do "
-        "  echo \"=== $u ===\"; journalctl -u \"$u\" -n 200 --no-pager 2>/dev/null; echo; "
-        "done | tail -n 900 || echo 'no matching units / not systemd'"], timeout=18))
-    add("chronyc",    run_cmd(["sh", "-c", "chronyc tracking 2>/dev/null; echo '---'; chronyc sources 2>/dev/null; echo '---'; timedatectl 2>/dev/null"], timeout=8))
-    add("du",         run_cmd(["sh", "-c", "du -sh /var/lib/sashimono/* 2>/dev/null; du -sh /home/sashi*/.* 2>/dev/null | tail -n 40; du -sh /home/sashi* 2>/dev/null"], timeout=25))
-
-    # --- Network captures (spell-only) ----------------------------------
-    # Discover peer_ports for this host's HotPocket instances. Outbound peer
-    # links use the OTHER host's peer_port as dport (and an ephemeral sport),
-    # so a filter built only from local peer_ports misses outbound sessions
-    # (Test #5, §11.3). Cover the HotPocket peer-port band as a range to
-    # catch them regardless of direction, and union with the exact local set.
-    peer_ports: list[int] = []
-    try:
-        for row in store.list_instances():
-            p = row.get("peer_port")
-            if isinstance(p, int) and p > 0:
-                peer_ports.append(p)
-    except Exception:
-        pass
-    peer_ports = sorted(set(peer_ports))
-    # Sashimono allocates peer_ports starting at 22861; this band covers any
-    # reasonable cluster on one host. Override via SASHIMON_PEER_PORT_BAND
-    # as "LOW-HIGH" if your deployment uses a different range.
-    band = os.environ.get("SASHIMON_PEER_PORT_BAND", "22861-22890")
-    try:
-        lo_s, hi_s = band.split("-", 1)
-        band_lo, band_hi = int(lo_s), int(hi_s)
-    except Exception:
-        band_lo, band_hi = 22861, 22890
-    band_clause = (f"( sport >= :{band_lo} and sport <= :{band_hi} )"
-                   f" or ( dport >= :{band_lo} and dport <= :{band_hi} )")
-    if peer_ports:
-        local_clause = " or ".join(f"sport = :{p} or dport = :{p}" for p in peer_ports)
-        pp_filter = f"{band_clause} or {local_clause}"
-    else:
-        pp_filter = band_clause
-    pp_expr = f"'( {pp_filter} )'"
-
-    # Full TCP socket info incl. RTT / retransmits / cwnd / rto.
-    add("ss_tcp_info", run_cmd(["sh", "-c",
-        "ss -tnpi --no-header 2>/dev/null | head -n 400"], timeout=8))
-    # Connections matching the HotPocket peer ports (the consensus mesh).
-    if pp_expr:
-        add("ss_peer_mesh", run_cmd(["sh", "-c",
-            f"echo '=== established ==='; ss -tnpi state established {pp_expr} 2>/dev/null; "
-            f"echo; echo '=== non-established (syn/fin/close-wait/time-wait) ==='; "
-            f"ss -tnpi state syn-sent state syn-recv state fin-wait-1 state fin-wait-2 "
-            f"state close-wait state last-ack state time-wait {pp_expr} 2>/dev/null"], timeout=10))
-        add("ss_peer_listen", run_cmd(["sh", "-c",
-            f"ss -lntp {pp_expr} 2>/dev/null"], timeout=6))
-    # Aggregate socket counters + TCP stats / drop counters.
-    add("ss_summary", run_cmd(["sh", "-c",
-        "ss -s 2>/dev/null; echo; echo '=== nstat -az ==='; nstat -az 2>/dev/null | head -n 200"], timeout=8))
-    add("proc_net_snmp", run_cmd(["sh", "-c",
-        "cat /proc/net/snmp 2>/dev/null; echo; echo '=== /proc/net/netstat ==='; cat /proc/net/netstat 2>/dev/null"], timeout=4))
-    # Per-iface error counters (rx errs/drop/fifo/frame/crc, tx errs/drop/fifo/coll/carrier).
-    add("ip_link_stats", run_cmd(["sh", "-c",
-        "ip -s -s link 2>/dev/null || cat /proc/net/dev 2>/dev/null"], timeout=5))
-    # NAT table — slirp4netns and host conntrack can run out / drop entries.
-    add("conntrack", run_cmd(["sh", "-c",
-        "(conntrack -L 2>/dev/null || cat /proc/net/nf_conntrack 2>/dev/null) | head -n 300; "
-        "echo; echo '=== conntrack -S (per-cpu stats: drops, invalid, search_restart) ==='; "
-        "conntrack -S 2>/dev/null; "
-        "echo; echo '=== /proc/sys/net/netfilter/nf_conntrack_count / _max ==='; "
-        "cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null; "
-        "cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null"], timeout=10))
-    # Firewall counters (UFW chains include drop counts → useful if peer ports got blocked).
-    add("iptables", run_cmd(["sh", "-c",
-        "echo '=== filter ==='; iptables -L -nv 2>/dev/null | head -n 200; "
-        "echo; echo '=== nat ==='; iptables -t nat -L -nv 2>/dev/null | head -n 200; "
-        "echo; echo '=== ufw ==='; ufw status verbose 2>/dev/null || echo '(ufw unavailable)'"], timeout=10))
-    # Kernel-only journal — separates conntrack/nf/slirp4netns/OOM-net from app noise.
-    add("journalctl_kernel", run_cmd(["sh", "-c",
-        "journalctl -k --since '-5 min' -n 400 --no-pager 2>/dev/null || dmesg -T 2>/dev/null | tail -n 200"], timeout=10))
-    # MTU / routing / neighbour cache (catches ARP flaps, blackhole routes).
-    add("ip_route_neigh", run_cmd(["sh", "-c",
-        "echo '=== ip route ==='; ip route 2>/dev/null; "
-        "echo; echo '=== ip -6 route ==='; ip -6 route 2>/dev/null; "
-        "echo; echo '=== ip neigh ==='; ip neigh 2>/dev/null; "
-        "echo; echo '=== ip addr ==='; ip -br addr 2>/dev/null"], timeout=6))
-    # Per-peer reachability: pull established peer remote IPs from ss, then
-    # send 3 quick ICMP probes each (1s deadline) to measure round-trip jitter
-    # at spell moment. Cheap, only runs during a spell snapshot.
-    if pp_expr:
-        add("peer_ping", run_cmd(["sh", "-c",
-            f"peers=$(ss -tn state established {pp_expr} 2>/dev/null "
-            f"  | awk 'NR>1 {{print $4}}' | sed 's/:[0-9]*$//' | sort -u); "
-            f"for p in $peers; do "
-            f"  echo \"=== $p ===\"; "
-            f"  ping -c 3 -W 1 -i 0.3 \"$p\" 2>&1 | tail -n 4; "
-            f"done"], timeout=20))
-
-    for name in (instances or []):
-        try:
-            lines = store.recent_log_lines(name, limit=200)
-            txt = "\n".join(
-                f"{datetime.fromtimestamp(l['ts'], timezone.utc).isoformat()} "
-                f"[{l.get('level')}][{l.get('module')}] ({l.get('tag')}) {l.get('msg')}"
-                for l in lines
-            )
-            add("logtail", txt or "(no recent log lines captured)", inst=name)
-        except Exception:
-            pass
-
-
-class SpellManager:
-    """Tracks per-instance error-spell state from the event stream and, on the
-    transition *into* a spell, kicks off a metrics boost + a diagnostic snapshot
-    burst. Closes a spell (recovered) on the next `ledger_created`."""
-
-    def __init__(self, store: Store, stop_event: threading.Event, sashi_bin: str,
-                 metrics: MetricsCollector | None, instances_ref: dict,
-                 boost_cooldown: float = METRICS_BOOST_COOLDOWN,
-                 recapture_s: float = SNAPSHOT_RECAPTURE,
-                 max_captures: int = SNAPSHOT_MAX_CAPTURES,
-                 policy: "PolicyManager | None" = None):
-        self.store = store
-        self.stop = stop_event
-        self.sashi_bin = sashi_bin
-        self.metrics = metrics
-        self.instances_ref = instances_ref
-        self.boost_cooldown = boost_cooldown
-        self.recapture_s = recapture_s
-        self.max_captures = max_captures
-        self.policy = policy
-        self.lock = threading.Lock()
-        self.state: dict[str, dict] = {}
-        # Re-attach to spells left open by a previous run. We also kick off a
-        # deferred capture for each re-attached spell that has no captures yet
-        # (or whose captures are stale by > 5 min) so an instance that was
-        # *already* stuck when the monitor came up still produces at least
-        # one fresh diagnostic snapshot — Test #5 §11.3 caught test-devnet
-        # like this: monitor attached mid-fork, `on_event` only fires on a
-        # *transition* into a spell, so no capture ever ran.
-        reattach_targets: list[tuple[str, str]] = []
-        try:
-            for r in store.open_spells():
-                self.state[r["instance"]] = {
-                    "in_spell": True, "spell_id": r["spell_id"],
-                    "start_ts": r["start_ts"], "last_error_ts": r["start_ts"],
-                    "last_ledger_ts": 0.0,
-                    "severity": tag_severity(r.get("trigger_tag", "")),
-                    "trigger_tag": r.get("trigger_tag"),
-                }
-                # If the spell carries no captures yet, the instance has been
-                # stuck since before this monitor process attached → fire one.
-                if (r.get("captures") or 0) < 1:
-                    reattach_targets.append((r["spell_id"], r["instance"]))
-        except Exception:
-            pass
-        for sid, inst in reattach_targets:
-            print(f"[spell] {inst[:16]}: re-attach to open spell {sid} — "
-                  f"firing deferred capture (none / stale)")
-            threading.Thread(
-                target=self._snapshot_loop, args=(sid, inst),
-                daemon=True, name=f"snap-reattach-{sid[-12:]}",
-            ).start()
-
-    def current_spell(self, instance: str) -> dict | None:
-        """Return a snapshot of the active spell for `instance`, or None.
-        Used by PolicyManager to decide whether to gate event inserts."""
-        with self.lock:
-            s = self.state.get(instance)
-            if not s or not s.get("in_spell"):
-                return None
-            return {
-                "spell_id":    s.get("spell_id"),
-                "severity":    s.get("severity", "high"),
-                "trigger_tag": s.get("trigger_tag"),
-                "start_ts":    s.get("start_ts"),
-            }
-
-    def _st(self, instance: str) -> dict:
-        return self.state.setdefault(instance, {
-            "in_spell": False, "spell_id": None, "start_ts": 0.0,
-            "last_error_ts": 0.0, "last_ledger_ts": 0.0,
-        })
-
-    def on_event(self, instance: str, ev: dict) -> bool:
-        """Returns True when this event opened a new spell (so the caller can
-        force-track the trigger even when policy would normally drop it)."""
-        tag = ev.get("tag")
-        if tag not in ERROR_TAGS and tag != "ledger_created":
-            return False
-        ts = ev.get("ts") or time.time()
-        with self.lock:
-            s = self._st(instance)
-            if tag == "ledger_created":
-                s["last_ledger_ts"] = ts
-                if s["in_spell"]:
-                    sid = s["spell_id"]
-                    s["in_spell"] = False
-                    s["spell_id"] = None
-                    self.store.close_spell(sid, ts, recovered=1)
-                    print(f"[spell] {instance[:16]}: recovered ({sid})")
-                return False
-            # error tag
-            s["last_error_ts"] = ts
-            if s["in_spell"]:
-                return False
-            sid = f"{instance}-{int(ts)}"
-            severity = tag_severity(tag)
-            s["in_spell"] = True
-            s["spell_id"] = sid
-            s["start_ts"] = ts
-            s["severity"] = severity
-            s["trigger_tag"] = tag
-            self.store.open_spell(sid, instance, ts, tag, ev.get("msg", ""))
-            actions = (self.policy.spell_actions(severity)
-                       if self.policy is not None
-                       else {"boost": True, "snapshot": True, "events": True})
-            print(f"[spell] {instance[:16]}: ENTERED spell {sid} [{tag}] "
-                  f"severity={severity} actions={actions} "
-                  f"{(ev.get('msg') or '')[:90]}")
-            if self.metrics and actions.get("boost", True):
-                self.metrics.boost(sid, self.boost_cooldown)
-                self.metrics.sample_now(spell_id=sid, during_spell=1)
-            if actions.get("snapshot", True):
-                threading.Thread(target=self._snapshot_loop, args=(sid, instance),
-                                 daemon=True, name=f"snap-{sid[-12:]}").start()
-            return True
-
-    def is_active(self, spell_id: str) -> bool:
-        with self.lock:
-            return any(s["in_spell"] and s["spell_id"] == spell_id
-                       for s in self.state.values())
-
-    def tick(self) -> None:
-        """If a spell had no error for boost_cooldown and a ledger arrived after
-        it started, close it (recovered). Open spells with no ledger since stay
-        open — a query treats those older than HARD_FORK_AFTER as hard forks."""
+    def _line(self, raw):
+        raw = ANSI_RE.sub("", raw).rstrip("\r").lstrip("﻿")   # plog starts each file with a BOM
+        m = LINE_RE.match(raw)
         now = time.time()
         with self.lock:
-            for inst, s in self.state.items():
-                if (s["in_spell"] and now - s["last_error_ts"] > self.boost_cooldown
-                        and s["last_ledger_ts"] > s["start_ts"]):
-                    sid = s["spell_id"]
-                    s["in_spell"] = False
-                    s["spell_id"] = None
-                    self.store.close_spell(sid, s["last_ledger_ts"], recovered=1)
-                    print(f"[spell] {inst[:16]}: closed late ({sid})")
-
-    def _instances(self) -> list[str]:
-        names = set(self.instances_ref.keys()) | set(self.state.keys())
-        return sorted(names)
-
-    def _snapshot_loop(self, spell_id: str, instance: str) -> None:
-        captures = 0
-        while captures < self.max_captures and not self.stop.is_set():
-            try:
-                capture_snapshot(self.store, spell_id, self.sashi_bin, self._instances())
-                self.store.spell_inc_captures(spell_id)
-            except Exception as e:
-                print(f"[snapshot {spell_id}] {e}", file=sys.stderr)
-            captures += 1
-            waited = 0.0
-            while waited < self.recapture_s and not self.stop.is_set():
-                self.stop.wait(min(5.0, self.recapture_s - waited))
-                waited += 5.0
-                if not self.is_active(spell_id):
-                    return
-            if not self.is_active(spell_id):
+            self.ring.append(raw)
+            self.read_ts = now
+            if not m:
                 return
-
-
-# --------------------------------------------------------------------------
-# Comprehensive text report (for hand-off to an analyst / LLM)
-# --------------------------------------------------------------------------
-#
-# One plain-text document covering every HotPocket instance this monitor sees,
-# focused on error spells: spell metadata, the HotPocket/contract log around
-# the spell start, host metrics around it (including the 3s boosted samples),
-# and the captured journalctl/dmesg/ps/df/... snapshots. If --report-peers is
-# set, the report from each peer monitor is fetched and appended, so a multi-VM
-# cluster produces one document covering all nodes.
-
-_RULE = "=" * 80
-_RULE2 = "#" * 78
-
-
-def _iso(ts):
-    try:
-        return datetime.fromtimestamp(float(ts), timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    except Exception:
-        return str(ts)
-
-
-def _agewords(s):
-    if s is None:
-        return "—"
-    s = float(s)
-    if s < 60:
-        return f"{s:.0f}s"
-    if s < 3600:
-        return f"{s/60:.1f}m"
-    if s < 86400:
-        return f"{s/3600:.1f}h"
-    return f"{s/86400:.1f}d"
-
-
-def _clip(text, max_chars=40000):
-    if text is None:
-        return "(none)"
-    text = str(text)
-    if len(text) <= max_chars:
-        return text
-    head = text[: max_chars - 200]
-    return head + f"\n... [truncated — {len(text)-len(head)} more chars; full content is in the monitor DB / dashboard] ..."
-
-
-def _metrics_table(rows):
-    """rows = host_metrics rows (ASC). Returns an aligned text table."""
-    if not rows:
-        return "(no host-metric samples in this window — metrics disabled, or none recorded)"
-    cols = [
-        ("ts (UTC)", lambda r: _iso(r["ts"]), 26),
-        ("B", lambda r: "B" if r.get("during_spell") else "", 1),
-        ("cpu%", lambda r: _fmtnum(r.get("cpu_pct")), 6),
-        ("steal%", lambda r: _fmtnum(r.get("steal_pct")), 7),
-        ("load1", lambda r: _fmtnum(r.get("load1")), 6),
-        ("mem%", lambda r: _fmtnum(r.get("mem_used_pct")), 6),
-        ("memMB", lambda r: _fmtnum(r.get("mem_avail_mb"), 0), 8),
-        ("swapMB", lambda r: _fmtnum(r.get("swap_used_mb"), 0), 8),
-        ("diskFreeMB", lambda r: _fmtnum(r.get("disk_free_mb"), 0), 11),
-        ("inode%", lambda r: _fmtnum(r.get("inode_used_pct")), 7),
-        ("rxKB", lambda r: _fmtnum(r.get("net_rx_kbps"), 0), 7),
-        ("txKB", lambda r: _fmtnum(r.get("net_tx_kbps"), 0), 7),
-        ("sysFds", lambda r: _fmtnum(r.get("sys_open_fds"), 0), 8),
-        ("ntpMs", lambda r: _fmtnum(r.get("ntp_offset_ms")), 8),
-        ("sync", lambda r: ("" if r.get("ntp_synced") is None else str(int(r["ntp_synced"]))), 4),
-    ]
-    out = ["  ".join(name.ljust(w) for name, _, w in cols)]
-    for r in rows:
-        out.append("  ".join(str(fn(r)).ljust(w) for name, fn, w in cols))
-    return "\n".join(out)
-
-
-def _proc_metrics_table(rows):
-    rows = [r for r in rows if r.get("instance") is not None]
-    if not rows:
-        return "(no per-process samples — HP process not found, or metrics disabled)"
-    cols = [
-        ("ts (UTC)", lambda r: _iso(r["ts"]), 26),
-        ("B", lambda r: "B" if r.get("during_spell") else "", 1),
-        ("instance", lambda r: str(r.get("instance") or "")[:24], 24),
-        ("rss_mb", lambda r: _fmtnum(r.get("proc_rss_mb"), 0), 8),
-        ("open_fds", lambda r: _fmtnum(r.get("proc_open_fds"), 0), 9),
-        ("pid", lambda r: _fmtnum(r.get("proc_pid"), 0), 8),
-    ]
-    out = ["  ".join(name.ljust(w) for name, _, w in cols)]
-    for r in rows:
-        out.append("  ".join(str(fn(r)).ljust(w) for name, fn, w in cols))
-    return "\n".join(out)
-
-
-def _fmtnum(x, d=1):
-    if x is None:
-        return ""
-    try:
-        x = float(x)
-    except Exception:
-        return str(x)
-    if abs(x) >= 1000 or d == 0:
-        return str(int(round(x)))
-    return f"{x:.{d}f}"
-
-
-def _events_block(rows):
-    if not rows:
-        return "(no log events captured for this instance in this window)"
-    return "\n".join(
-        f"{_iso(r['ts'])} [{r.get('level') or '?'}][{r.get('module') or '?'}] ({r.get('tag') or '?'}) {r.get('msg') or ''}"
-        for r in rows
-    )
-
-
-# Order in which artifact kinds are printed within a capture burst.
-_REPORT_ARTIFACT_ORDER = [
-    "logtail", "journalctl", "journalctl_agent", "journalctl_units",
-    "journalctl_kernel", "dmesg",
-    "ps", "free", "vmstat", "uptime", "df", "dfi", "chronyc", "du",
-    # Network captures (only added on spell open; see capture_snapshot).
-    "ss_peer_mesh", "ss_peer_listen", "ss_tcp_info", "ss_summary",
-    "proc_net_snmp", "ip_link_stats", "ip_route_neigh",
-    "conntrack", "iptables", "peer_ping",
-]
-
-
-def _fetch_peer_report(url, window):
-    """Fetch /api/report?self=1 from a peer monitor. Returns text or an error note."""
-    u = url.rstrip("/") + f"/api/report?self=1&window={window}"
-    try:
-        req = urllib.request.Request(u, headers={"User-Agent": "sashimon-report"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        return f"\n{_RULE}\nPEER {url}: UNREACHABLE — {e}\n{_RULE}\n"
-
-
-def build_report(store: Store, window_seconds: int, sashi_bin: str,
-                 hostname: str, report_peers=None, include_peers=True,
-                 roundtime_ms: int = DEFAULT_ROUNDTIME_MS) -> str:
-    now = time.time()
-    all_time = window_seconds <= 0
-    since = 0.0 if all_time else now - window_seconds
-    span_txt = "all recorded history" if all_time else f"last {window_seconds}s (since {_iso(since)})"
-    sashi_ver = (run_cmd([sashi_bin, "version"], timeout=4) or run_cmd([sashi_bin, "--version"], timeout=4) or "").strip().splitlines()
-    sashi_ver = sashi_ver[0] if sashi_ver else "(unknown)"
-
-    instances = store.list_instances()
-    summ = {s["name"]: s for s in store.summary(window_seconds, roundtime_ms)}
-    L = []
-    L.append(_RULE)
-    L.append("SASHIMON ERROR-SPELL REPORT")
-    L.append(f"generated   : {_iso(now)} (epoch {now:.0f})")
-    L.append(f"monitor host: {hostname}")
-    L.append(f"sashi       : {sashi_bin}   version: {sashi_ver}")
-    L.append(f"roundtime   : {roundtime_ms} ms (configured in this monitor; the cluster's effective value is in the HotPocket logs / 'getledger')")
-    L.append(f"window      : {span_txt}")
-    L.append(f"instances on this VM ({len(instances)}): {', '.join(i['name'] for i in instances) or '(none)'}")
-    L.append("")
-    L.append("NOTE: each sashimon instance sees only the HotPocket instances on its own VM. If your cluster")
-    L.append("spans multiple VMs, either run 'export report' on each VM and concatenate the files, or start")
-    L.append("the monitors with --report-peers so this export fetches and appends the others.")
-    if report_peers and include_peers:
-        L.append(f"report-peers configured: {', '.join(report_peers)} (their sections are appended below)")
-    L.append(_RULE)
-    L.append("")
-    L.append("READING GUIDE")
-    L.append("  - 'No consensus on last shard hash. won:X needed:Y' / 'Cannot close ledger. Possible fork")
-    L.append("    condition' = a vote split. Recoverable if one side >= ceil(threshold% x UNL); a hard fork")
-    L.append("    (no recovery) when no side reaches that, so look at X vs Y and which nodes are odd-one-out.")
-    L.append("  - For each spell below: the HotPocket/contract log just before & during it, host metrics around")
-    L.append("    it (rows marked 'B' are the 3-second boosted samples taken while the spell was active), and")
-    L.append("    the captured journalctl/dmesg/ps/df/chronyc/du/contract-log snapshots.")
-    L.append("  - Cross-correlate by the UTC timestamps + epoch seconds. Suspects for an unrecoverable hard")
-    L.append("    fork on a small cluster: a 2nd node faulting while a 1st is recovering; disk full (ledger")
-    L.append("    persist fails); OOM/restart; clock drift > 2x roundtime; CPU steal; a contract determinism")
-    L.append("    bug (different output/state hash); cross-host peer-link jitter (see network captures).")
-    L.append("  - Network captures (only taken at spell open):")
-    L.append("      * ss_peer_mesh    — TCP state for HotPocket peer-port connections (RTT, retransmits,")
-    L.append("                          cwnd, rto, lost). High retrans or unestablished sessions to a peer")
-    L.append("                          right before the spell = that peer's link was the trigger.")
-    L.append("      * ss_tcp_info     — same fields for every TCP socket on the host (broader view).")
-    L.append("      * ss_summary      — ss -s totals + nstat -az (TCPRetransSegs, TCPLostRetransmit,")
-    L.append("                          TCPSynRetrans, TCPTimeouts deltas).")
-    L.append("      * proc_net_snmp   — /proc/net/snmp + /proc/net/netstat (same counters, raw).")
-    L.append("      * ip_link_stats   — per-interface rx/tx errs/drop/fifo/frame/crc counters. Non-zero")
-    L.append("                          drop counters on the egress NIC = local NIC/driver issue.")
-    L.append("      * ip_route_neigh  — routes + ARP/ND cache (catches blackhole routes, ARP flaps).")
-    L.append("      * conntrack       — NAT table (slirp4netns sits on rootless conntrack). Look for")
-    L.append("                          'table full', 'drop' or 'invalid' counts; nf_conntrack_count near")
-    L.append("                          nf_conntrack_max = peer sessions getting evicted.")
-    L.append("      * iptables        — filter+nat chains with packet counters; UFW status. Non-zero drop")
-    L.append("                          counters on input chain or peer ports denied = firewall caused it.")
-    L.append("      * journalctl_kernel — kernel-only journal: catches nf_conntrack/TCP/slirp4netns errors")
-    L.append("                            that the system-wide journalctl can bury under app noise.")
-    L.append("      * peer_ping       — 3 ICMP probes per established peer at spell moment. High RTT")
-    L.append("                          variance or packet loss here = cross-host link is the trigger.")
-    L.append("")
-
-    for inst in instances:
-        name = inst["name"]
-        s = summ.get(name, {})
-        c = s.get("counts", {}) or {}
-        latest = None
-        try:
-            hm = store.host_metrics_window(None, now - 600, now)   # last 10 min, machine rows
-            latest = next((r for r in hm if r.get("instance") is None), None)
-        except Exception:
-            latest = None
-        latest_proc = None
-        try:
-            pm = store.host_metrics_window(name, now - 600, now)
-            latest_proc = next((r for r in pm if r.get("instance") == name), None)
-        except Exception:
-            latest_proc = None
-
-        L.append("")
-        L.append(_RULE2)
-        L.append(f"# INSTANCE: {name}")
-        L.append(f"#   contract_id={inst.get('contract_id')}  tenant={inst.get('tenant')}  image={inst.get('image')}")
-        L.append(f"#   user_port={inst.get('user_port')}  peer_port={inst.get('peer_port')}  sashi_status={inst.get('status')}")
-        L.append(f"#   health={s.get('health','?')}  uptime_est(window)={s.get('uptime_pct','?')}%  "
-                 f"last_ledger={_agewords(s.get('last_ledger_age_s'))} ago  last_event={_agewords(s.get('last_event_age_s'))} ago")
-        L.append(f"#   event counts (window): " + (", ".join(f"{k}={v}" for k, v in sorted(c.items())) or "(none)"))
-        if latest:
-            L.append(f"#   latest host metrics (this VM, machine) @ {_iso(latest['ts'])}: "
-                     f"cpu={_fmtnum(latest.get('cpu_pct'))}% steal={_fmtnum(latest.get('steal_pct'))}% load1={_fmtnum(latest.get('load1'))} "
-                     f"mem={_fmtnum(latest.get('mem_used_pct'))}% memAvail={_fmtnum(latest.get('mem_avail_mb'),0)}MB "
-                     f"diskFree={_fmtnum(latest.get('disk_free_mb'),0)}MB inode={_fmtnum(latest.get('inode_used_pct'))}% "
-                     f"ntp={_fmtnum(latest.get('ntp_offset_ms'))}ms sync={latest.get('ntp_synced')} extra={latest.get('extra')}")
-        if latest_proc:
-            L.append(f"#   latest HP process @ {_iso(latest_proc['ts'])}: rss={_fmtnum(latest_proc.get('proc_rss_mb'),0)}MB "
-                     f"open_fds={_fmtnum(latest_proc.get('proc_open_fds'),0)} pid={latest_proc.get('proc_pid')}")
-        L.append(_RULE2)
-
-        # recent context: last 60 events (all tags)
-        L.append("")
-        L.append(f"----- recent log events on {name} (last 60, all tags) -----")
-        L.append(_events_block(store.recent_log_lines(name, limit=60)))
-
-        # spells for this instance, oldest first (so the doc reads chronologically)
-        try:
-            spells = sorted(store.spells_log_window(since, now, name, limit=1000), key=lambda x: x["start_ts"])
-        except Exception as e:
-            spells = []
-            L.append(f"(error loading spells: {e})")
-        if not spells:
-            L.append("")
-            L.append(f"(no error spells recorded for {name} in this window)")
-        for sp in spells:
-            sid = sp["spell_id"]
-            st0 = float(sp["start_ts"])
-            st1 = float(sp["end_ts"]) if sp.get("end_ts") else now
-            ev0, ev1 = st0 - 300, st1 + 60          # HotPocket log: 5 min before .. 1 min after
-            m0, m1 = st0 - 180, st1 + 60            # host metrics: 3 min before .. 1 min after
-            L.append("")
-            L.append("=" * 80)
-            L.append(f"ERROR SPELL  {sid}")
-            L.append(f"  instance : {name}")
-            L.append(f"  state    : {sp.get('state')}   recovered: {'yes' if sp.get('recovered') else ('no — STILL OPEN' if sp.get('end_ts') is None else 'no')}")
-            L.append(f"  start    : {_iso(st0)} (epoch {st0:.0f})")
-            L.append(f"  end      : {('(open, ' + _agewords(now - st0) + ' so far)') if sp.get('end_ts') is None else _iso(sp['end_ts']) + ' (epoch %.0f)' % float(sp['end_ts'])}")
-            L.append(f"  duration : {_agewords(sp.get('duration_s'))}")
-            L.append(f"  trigger  : {sp.get('trigger_tag')}  ::  {sp.get('trigger_msg')}")
-            L.append(f"  captures : {sp.get('captures', 0)}")
-            L.append("=" * 80)
-
-            try:
-                evs = sorted(store.events_window(name, ev0, ev1, None, 5000), key=lambda x: x["ts"])
-            except Exception as e:
-                evs = []
-                L.append(f"(error loading events: {e})")
-            L.append("")
-            L.append(f"--- HotPocket / contract log around the spell  ({name}, {_iso(ev0)} .. {_iso(ev1)}, {len(evs)} lines) ---")
-            L.append(_events_block(evs))
-
-            try:
-                hmw = sorted(store.host_metrics_window(None, m0, m1, 20000), key=lambda x: (x["ts"], 0 if x.get("instance") is None else 1))
-            except Exception as e:
-                hmw = []
-                L.append(f"(error loading host metrics: {e})")
-            mach_rows = [r for r in hmw if r.get("instance") is None]
-            proc_rows = [r for r in hmw if r.get("instance") is not None]
-            boosted_n = sum(1 for r in hmw if r.get("during_spell"))
-            L.append("")
-            L.append(f"--- host metrics around the spell  (machine, {_iso(m0)} .. {_iso(m1)}, {len(mach_rows)} samples, {boosted_n} boosted) ---")
-            L.append(_metrics_table(mach_rows))
-            if proc_rows:
-                L.append("")
-                L.append(f"--- per-process metrics around the spell  ({len(proc_rows)} samples) ---")
-                L.append(_proc_metrics_table(proc_rows))
-
-            # captured snapshots, grouped by capture burst
-            try:
-                arts = store.spell_artifacts(sid)
-            except Exception as e:
-                arts = []
-                L.append(f"(error loading artifacts: {e})")
-            if not arts:
-                L.append("")
-                L.append("--- captured snapshots: none (spell may be new, or capture tools unavailable on this host) ---")
-            else:
-                arts_sorted = sorted(arts, key=lambda a: (a["ts"], _REPORT_ARTIFACT_ORDER.index(a["kind"]) if a["kind"] in _REPORT_ARTIFACT_ORDER else 99))
-                groups = []
-                for a in arts_sorted:
-                    g = next((g for g in groups if abs(g["ts"] - a["ts"]) < 5), None)
-                    if not g:
-                        g = {"ts": a["ts"], "items": []}
-                        groups.append(g)
-                    g["items"].append(a)
-                for gi, g in enumerate(groups):
-                    L.append("")
-                    L.append(f"--- captured snapshot {gi+1}/{len(groups)}  @ {_iso(g['ts'])} ---")
-                    for a in g["items"]:
-                        ins = f"  ({a.get('instance')})" if a.get("instance") else ""
-                        L.append("")
-                        L.append(f"[{a['kind']}{ins}  captured {_iso(a['ts'])}]")
-                        L.append(_clip(a.get("content")))
-        L.append("")
-
-    L.append("")
-    L.append(_RULE)
-    L.append(f"END OF REPORT — {hostname}")
-    L.append(_RULE)
-
-    text = "\n".join(L) + "\n"
-
-    if report_peers and include_peers:
-        for peer in report_peers:
-            text += "\n\n" + ("#" * 80) + f"\n# PEER MONITOR: {peer}\n" + ("#" * 80) + "\n\n"
-            text += _fetch_peer_report(peer, window_seconds)
-
-    return text
-
-
-# --------------------------------------------------------------------------
-# Embedded HTTP dashboard
-# --------------------------------------------------------------------------
-
-DASHBOARD_HTML = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Sashimon</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-  /* sashi.mon — control-room console. dark, monospace-forward, amber accent,
-     red for fork conditions. data is the hero; chrome is hairlines. */
-  :root {
-    color-scheme: dark;
-    --bg: #07090c; --bg1: #0d1117; --bg2: #11161d; --bg3: #161c25;
-    --line: #232c38; --line2: #2f3a48;
-    --fg: #c9d4e0; --fg-dim: #6b7989; --fg-faint: #4a5765;
-    --ok: #3fb950; --ok-dim: #1f7a33;
-    --warn: #e0a82e; --warn-dim: #8a6512;
-    --bad: #ff5a52; --bad-dim: #8f2420;
-    --info: #58a6ff; --accent: #e0a82e;
-    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
-    --sans: 'IBM Plex Sans', -apple-system, Segoe UI, Roboto, sans-serif;
-  }
-  * { box-sizing: border-box; }
-  body { font-family: var(--sans); margin: 0; background: var(--bg); color: var(--fg);
-         -webkit-font-smoothing: antialiased;
-         background-image:
-           radial-gradient(900px 400px at 90% -10%, rgba(224,168,46,.05), transparent 60%),
-           repeating-linear-gradient(0deg, rgba(255,255,255,.012) 0 1px, transparent 1px 3px);
-  }
-  ::selection { background: rgba(224,168,46,.3); }
-  header { padding: 12px 22px; background: var(--bg1);
-           border-bottom: 1px solid var(--line);
-           display: flex; align-items: baseline; gap: 14px; position: sticky; top: 0; z-index: 50;
-           box-shadow: 0 1px 0 rgba(0,0,0,.5); }
-  header h1 { margin: 0; font-family: var(--mono); font-size: 16px; font-weight: 700;
-              letter-spacing: .06em; color: var(--fg); }
-  header h1 .dot { color: var(--accent); }
-  header .meta { font-size: 11px; color: var(--fg-dim); font-family: var(--mono); }
-  header .live { margin-left: auto; font-family: var(--mono); font-size: 10px;
-                 color: var(--fg-dim); display: flex; align-items: center; gap: 6px; }
-  header .live::before { content:""; width:6px; height:6px; border-radius:50%; background: var(--ok);
-                         box-shadow: 0 0 6px var(--ok); animation: pulse 2.2s ease-in-out infinite; }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.25} }
-  main { padding: 18px 22px 60px; max-width: 1480px; margin: 0 auto; }
-  .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 18px;
-              font-family: var(--mono); font-size: 11px; color: var(--fg-dim); }
-  .controls label { display:flex; align-items:center; gap:6px; text-transform:uppercase; letter-spacing:.05em; }
-  select, button { background: var(--bg2); color: var(--fg); border: 1px solid var(--line);
-                   padding: 5px 10px; font-family: var(--mono); font-size: 11px; border-radius: 3px; }
-  button { cursor: pointer; }
-  button:hover, select:hover { border-color: var(--line2); }
-  button.danger { color: var(--bad); border-color: var(--bad-dim); }
-  button.danger .dbsz { color: var(--fg-faint); font-weight: 500; margin-left: 4px;
-                        font-variant-numeric: tabular-nums; }
-  button.danger:hover .dbsz { color: var(--bad-dim); }
-  .policy-ctl { display:inline-flex; align-items:center; gap:6px; padding:0;
-                color: var(--fg-dim); font-family: var(--mono); font-size: 10.5px;
-                text-transform: uppercase; letter-spacing: .05em; }
-  .policy-ctl select { color: var(--accent); border-color: var(--line2);
-                       text-transform: lowercase; letter-spacing: 0; }
-  .policy-ctl select:disabled { opacity: .55; cursor: progress; }
-
-  /* --- cluster picker + filter --- */
-  #clusterPanel .pb { padding: 12px; }
-  .ph { display:flex; align-items:center; gap:10px; }
-  .clist { display:grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap:8px; }
-  .crow { display:flex; align-items:stretch; gap:0; background: var(--bg2);
-          border:1px solid var(--line); border-radius:5px; overflow:hidden;
-          font-family: var(--mono); transition: border-color .12s; }
-  .crow.mon { border-color: var(--ok-dim); }
-  .crow.act { border-color: var(--ok); box-shadow: inset 0 0 0 1px var(--ok); }
-  .crow .tg { flex:0 0 auto; display:flex; align-items:center; padding:0 12px;
-              background: var(--bg3); border-right:1px solid var(--line); cursor:pointer; }
-  .crow .tg input { display:none; }
-  .crow .tg .sw { width:30px; height:16px; border-radius:999px; background: var(--line);
-                  position:relative; transition: background .15s; }
-  .crow .tg .sw::after { content:''; position:absolute; left:2px; top:2px; width:12px; height:12px;
-                         border-radius:50%; background: var(--fg-dim); transition: transform .15s, background .15s; }
-  .crow .tg input:checked + .sw { background: var(--ok-dim); }
-  .crow .tg input:checked + .sw::after { transform: translateX(14px); background: var(--ok); }
-  .crow .info { flex:1 1 auto; padding:9px 12px; min-width:0; cursor:pointer; }
-  .crow .info:hover { background: rgba(255,255,255,.02); }
-  .crow .info:disabled, .crow .info.dis { cursor: default; opacity: .55; }
-  .crow .id-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap;
-                  font-size:11px; font-weight:600; color: var(--fg); }
-  .crow .id-row .cid { background:var(--bg); padding:1px 6px; border-radius:3px;
-                       font-size:10.5px; color:var(--fg); }
-  .crow .id-row .np  { font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px;
-                       background: rgba(91,102,122,.25); color: var(--fg-dim); }
-  .crow .id-row .np.hot { background: rgba(63,185,80,.18); color: var(--ok); }
-  .crow .meta-row { margin-top:3px; font-size:10px; color:var(--fg-dim); display:flex; gap:4px 12px; flex-wrap:wrap; }
-  .crow .meta-row b { font-size:9px; color:var(--fg-faint); text-transform:uppercase;
-                      letter-spacing:.05em; font-weight:700; margin-right:3px; }
-  .all-row { grid-column: 1 / -1; }
-  .all-row .info::before { content:"●"; color: var(--ok); margin-right:8px; }
-  .cluster-banner { display:flex; align-items:center; gap:10px; flex-wrap:wrap;
-                    padding:8px 12px; margin-bottom:14px;
-                    background: rgba(63,185,80,.06);
-                    border:1px solid var(--ok-dim); border-radius:4px;
-                    font-family: var(--mono); font-size: 11px; }
-  .cluster-banner .lbl { font-size:9px; color:var(--fg-dim); text-transform:uppercase;
-                         letter-spacing:.07em; }
-  .cluster-banner .cid { background: var(--bg); padding:2px 7px; border-radius:3px;
-                         color: var(--fg); word-break: break-all; }
-  .cluster-banner .clr { margin-left:auto; cursor:pointer; background:none;
-                         border:1px solid var(--line); color: var(--fg-dim);
-                         padding:2px 9px; border-radius:3px; font-family:inherit; font-size:10px; }
-  .cluster-banner .clr:hover { color: var(--fg); border-color: var(--line2); }
-
-  /* --- per-card delete + modal --- */
-  .card .card-actions { display:flex; gap:6px; margin-top:8px; flex-wrap:wrap; }
-  .card .del-btn {
-    font-family: var(--mono); font-size: 10.5px;
-    padding: 3px 9px; border-radius: 3px;
-    background: rgba(255,90,82,.08);
-    color: var(--bad); border: 1px solid var(--bad-dim);
-    cursor: pointer;
-    display: inline-flex; align-items: center; gap: 5px;
-  }
-  .card .del-btn:hover { background: rgba(255,90,82,.18); border-color: var(--bad); }
-  .card .del-btn:disabled { opacity:.55; cursor: progress; }
-  .modal { position: fixed; inset: 0; z-index: 200; display: flex;
-           align-items: center; justify-content: center; }
-  .modal .modal-bg { position: absolute; inset: 0; background: rgba(0,0,0,.62);
-                     backdrop-filter: blur(2px); }
-  .modal .modal-box { position: relative; width: min(640px, 94vw);
-                      max-height: 86vh; overflow: auto;
-                      background: var(--bg1); border: 1px solid var(--line2);
-                      border-radius: 5px; box-shadow: 0 20px 60px rgba(0,0,0,.55);
-                      font-family: var(--mono); }
-  .modal .modal-h { display:flex; align-items:center; padding: 10px 14px;
-                    border-bottom: 1px solid var(--line); gap: 10px; }
-  .modal .modal-h h2 { margin:0; font-size:12px; font-weight:700;
-                       text-transform: uppercase; letter-spacing: .08em; color: var(--fg); }
-  .modal .modal-h .x { margin-left:auto; background:none; border:1px solid var(--line);
-                       color: var(--fg-dim); width:24px; height:24px; border-radius:3px;
-                       cursor:pointer; line-height:1; font-size:14px; }
-  .modal .modal-h .x:hover { color: var(--fg); border-color: var(--line2); }
-  .modal .modal-body { padding: 12px 14px; font-size: 11.5px; line-height: 1.55; color: var(--fg); }
-  .modal .modal-body pre { background: var(--bg); padding: 10px 12px;
-                           border: 1px solid var(--line); border-radius: 3px;
-                           max-height: 320px; overflow: auto;
-                           font-size: 10.5px; white-space: pre-wrap; word-break: break-word; }
-  .modal .modal-body .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
-                            margin-bottom: 10px; font-size: 11px; }
-  .modal .modal-body code { background: var(--bg); padding: 1px 6px; border-radius: 3px;
-                            color: var(--fg); font-size: 10.5px; }
-  .modal .modal-body .actions { display:flex; gap:8px; margin-top: 12px; justify-content: flex-end; }
-  .modal .modal-body button { font-family: var(--mono); font-size: 11px; padding: 5px 12px;
-                              border-radius: 3px; cursor: pointer; }
-  .modal .modal-body button.go { background: var(--bad-dim); color: #fff; border: 1px solid var(--bad); }
-  .modal .modal-body button.go:hover { background: var(--bad); }
-  .modal .modal-body button.go:disabled { opacity:.55; cursor: progress; }
-  .modal .modal-body button.cancel { background: var(--bg2); color: var(--fg-dim);
-                                     border: 1px solid var(--line); }
-  .modal .modal-body button.cancel:hover { color: var(--fg); border-color: var(--line2); }
-  .modal .modal-body .status-line { font-size: 11px; color: var(--warn); margin-top: 8px; }
-  .modal .modal-body .status-line.ok { color: var(--ok); }
-  .modal .modal-body .status-line.bad { color: var(--bad); }
-  .panel { margin-bottom: 18px; background: var(--bg1); border: 1px solid var(--line);
-           border-radius: 4px; }
-  .panel > .ph { padding: 9px 14px; border-bottom: 1px solid var(--line);
-                 display:flex; align-items:baseline; gap:10px; }
-  .panel > .ph h2 { margin:0; font-family: var(--mono); font-size: 12px; font-weight: 600;
-                    letter-spacing:.08em; text-transform: uppercase; color: var(--fg); }
-  .panel > .ph .hint { font-family: var(--mono); font-size:10px; color: var(--fg-dim); }
-  .panel > .pb { padding: 14px; }
-  /* --- tag filter chips (above the error-events chart) --- */
-  .tagchips { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; font-family:var(--mono); font-size:10px; align-items:center; }
-  .tagchips .lbl { color:var(--fg-faint); text-transform:uppercase; letter-spacing:.06em; margin-right:2px; }
-  .tagchips .c { cursor:pointer; padding:2px 8px; border-radius:2px; border:1px solid var(--line);
-                 color:var(--fg-dim); background:transparent; user-select:none; display:inline-flex; align-items:center; gap:5px; }
-  .tagchips .c::before { content:""; width:8px; height:8px; border-radius:2px; background:currentColor; opacity:.35; }
-  .tagchips .c.on { color:var(--cc, var(--fg)); border-color:currentColor; background:rgba(255,255,255,.04); }
-  .tagchips .c.on::before { opacity:1; }
-  .tagchips .c:hover { border-color:var(--line2); }
-  .tagchips .q { cursor:pointer; padding:2px 8px; border-radius:2px; border:1px solid var(--line); color:var(--fg-dim); background:var(--bg2); }
-  .tagchips .q:hover { color:var(--fg); border-color:var(--line2); }
-  .tagchips .q.danger { color:var(--bad); border-color:var(--bad-dim); }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 14px; }
-  .card { background: var(--bg1); border: 1px solid var(--line); border-radius: 4px; padding: 12px 14px; }
-  .card h2 { margin: 0 0 4px; font-size: 12px; font-family: var(--mono); word-break: break-all; }
-  .card .sub { font-size: 11px; color: var(--fg-dim); margin-bottom: 10px; font-family: var(--mono); }
-  .health, .pill { display: inline-block; padding: 1px 7px; font-family: var(--mono);
-            font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing:.06em;
-            border:1px solid currentColor; border-radius: 2px; }
-  .h-healthy, .pill.ok       { color: var(--ok); }
-  .h-consensus_loss, .pill.warn { color: var(--warn); }
-  .h-forked, .pill.bad       { color: var(--bad); }
-  .h-stalled                 { color: #b083ff; }
-  .h-unknown, .pill.dim      { color: var(--fg-dim); }
-  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 3px 14px;
-           font-size: 11px; margin-bottom: 10px; font-family: var(--mono); }
-  .stats span:nth-child(odd) { color: var(--fg-dim); text-transform:uppercase; letter-spacing:.04em; }
-  canvas { width: 100% !important; height: 88px !important; }
-  .global canvas { height: 200px !important; }
-  .empty { text-align: center; color: var(--fg-dim); padding: 50px 0; font-family: var(--mono); }
-
-  /* --- per-instance card: current metrics + spell list --- */
-  .card .pmet { font-family: var(--mono); font-size: 10.5px; color: var(--fg-dim);
-                display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 8px 0 4px;
-                padding: 6px 8px; background: var(--bg); border: 1px solid var(--line); border-radius: 3px; }
-  .card .pmet b { color: var(--fg); font-weight: 600; }
-  .card .pmet b.alert { color: var(--bad); }
-  .card .pmet .lbl { color: var(--fg-faint); text-transform: uppercase; letter-spacing: .04em; }
-  .card .cspells { margin-top: 8px; }
-  .card .cspells .hdr { font-family: var(--mono); font-size: 9.5px; text-transform: uppercase;
-                        letter-spacing: .06em; color: var(--fg-dim); margin-bottom: 4px; }
-  .card .sp { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 10.5px;
-              padding: 3px 6px; border: 1px solid var(--line); border-radius: 3px; margin-bottom: 3px;
-              cursor: pointer; transition: background .1s, border-color .1s; }
-  .card .sp:hover { background: var(--bg2); border-color: var(--line2); }
-  .card .sp::before { content: "\25CF"; }
-  .card .sp.recovered::before { color: var(--warn); }
-  .card .sp.active::before    { color: var(--bad); }
-  .card .sp.potentialfork::before  { color: var(--bad); text-shadow: 0 0 6px var(--bad-dim); }
-  .card .sp.ended::before     { color: var(--fg-faint); }
-  .card .sp .st  { flex: 0 0 70px; color: var(--fg); }
-  .card .sp .tg  { color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .card .sp .tm  { margin-left: auto; color: var(--fg-faint); white-space: nowrap; }
-  .card .sp.noclick { cursor: default; color: var(--fg-faint); }
-  .card .sp.noclick:hover { background: transparent; border-color: var(--line); }
-  .card .sp.noclick::before { content: ""; }
-  .card .cspells .more { font-family: var(--mono); font-size: 9.5px; color: var(--fg-faint);
-                         cursor: pointer; margin-top: 2px; }
-  .card .cspells .more:hover { color: var(--fg-dim); text-decoration: underline; }
-
-  /* --- error-spell timeline ribbon --- */
-  .ribbon { position:relative; height: 46px; background:
-              repeating-linear-gradient(90deg, var(--line) 0 1px, transparent 1px 25%);
-            border:1px solid var(--line); border-radius:3px; overflow:hidden; }
-  .ribbon .now { position:absolute; right:0; top:0; bottom:0; width:1px; background: var(--accent); }
-  .ribbon .blk { position:absolute; top:6px; bottom:6px; min-width:3px; border-radius:2px;
-                 cursor:pointer; opacity:.88; transition: opacity .12s, transform .12s; }
-  .ribbon .blk:hover { opacity:1; transform: scaleY(1.12); }
-  .ribbon .blk.recovered { background: var(--warn); }
-  .ribbon .blk.active    { background: var(--bad); animation: pulse 1.4s ease-in-out infinite; }
-  .ribbon .blk.potentialfork  { background: var(--bad); box-shadow: 0 0 0 1px var(--bad), 0 0 8px var(--bad-dim) inset; }
-  .ribbon .blk.ended     { background: var(--fg-faint); }
-  .ribbon .axl { position:absolute; bottom:1px; font-family:var(--mono); font-size:9px; color:var(--fg-faint); }
-  .ribbon-legend { font-family:var(--mono); font-size:9px; color:var(--fg-dim); margin-top:5px;
-                   display:flex; gap:14px; }
-  .ribbon-legend i { font-style:normal; display:inline-flex; align-items:center; gap:5px; }
-  .ribbon-legend i::before { content:""; width:9px; height:9px; border-radius:2px; }
-  .ribbon-legend .l-rec::before  { background: var(--warn); }
-  .ribbon-legend .l-act::before  { background: var(--bad); }
-  .ribbon-legend .l-hf::before   { background: var(--bad); box-shadow:0 0 5px var(--bad-dim); }
-  .ribbon-legend .l-end::before  { background: var(--fg-faint); }
-
-  /* --- host metric sparkline tiles --- */
-  .hostgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr));
-              gap: 12px; margin-top: 12px; }
-  .mc { background: var(--bg); border:1px solid var(--line); border-radius:3px; padding:9px 10px 6px; }
-  .mc h3 { margin:0 0 2px; font-family:var(--mono); font-size:9.5px; color:var(--fg-dim);
-           font-weight:600; text-transform:uppercase; letter-spacing:.07em;
-           display:flex; justify-content:space-between; align-items:baseline; }
-  .mc h3 b { font-size:13px; font-weight:700; color:var(--fg); }
-  .mc h3 b.alert { color: var(--bad); }
-  .mc canvas { height: 64px !important; }
-  .verdict { margin-top:12px; font-family:var(--mono); font-size:11.5px; line-height:1.6;
-             color: var(--warn); border-left:2px solid var(--warn-dim); padding-left:10px; }
-  .verdict:empty { display:none; }
-
-  /* --- host status bar (homescreen at-a-glance) --- */
-  #statusbar { display:flex; align-items:stretch; margin-bottom:18px; border:1px solid var(--line);
-               border-radius:4px; overflow:hidden; cursor:pointer; font-family:var(--mono); flex-wrap:wrap; }
-  #statusbar .sx { padding:9px 16px; display:flex; flex-direction:column; gap:2px; justify-content:center;
-                   min-width:104px; border-left:1px solid var(--line); }
-  #statusbar .sx:first-child { border-left:none; }
-  #statusbar .sx .l { font-size:9px; text-transform:uppercase; letter-spacing:.07em; color:var(--fg-faint); }
-  #statusbar .sx .v { font-size:13px; font-weight:700; color:var(--fg); }
-  #statusbar .sx .v.bad { color:var(--bad); } #statusbar .sx .v.warn { color:var(--warn); } #statusbar .sx .v.ok { color:var(--ok); }
-  #statusbar .stat { min-width:148px; }
-  #statusbar .stat .v { font-size:16px; letter-spacing:.12em; }
-  #statusbar .stat.ok       { background:linear-gradient(180deg, rgba(63,185,80,.16), transparent); border-left:3px solid var(--ok); }
-  #statusbar .stat.watch    { background:linear-gradient(180deg, rgba(224,168,46,.16), transparent); border-left:3px solid var(--warn); }
-  #statusbar .stat.critical { background:linear-gradient(180deg, rgba(255,90,82,.20), transparent); border-left:3px solid var(--bad);
-                              animation: pulse 1.6s ease-in-out infinite; }
-  #statusbar .note { flex:1; min-width:240px; padding:9px 16px; font-size:10.5px; color:var(--warn);
-                     display:flex; align-items:center; border-left:1px solid var(--line); }
-  #statusbar .note:empty::after { content:"all clear"; color:var(--fg-faint); }
-
-  /* --- error-spell list (inline-expandable rows) --- */
-  .spelllist { margin-top:14px; display:flex; flex-direction:column; gap:6px; }
-  .spell-item { border:1px solid var(--line); border-left-width:2px; border-radius:3px; overflow:hidden; background:var(--bg); }
-  .spell-item.recovered { border-left-color:var(--warn); }
-  .spell-item.active    { border-left-color:var(--bad); }
-  .spell-item.potentialfork  { border-left-color:var(--bad); box-shadow:inset 3px 0 14px var(--bad-dim); }
-  .spell-item.ended     { border-left-color:var(--fg-faint); }
-  .spell-item > summary { list-style:none; cursor:pointer; padding:7px 12px; display:flex; gap:12px; align-items:center;
-                          font-family:var(--mono); font-size:11px; }
-  .spell-item > summary::-webkit-details-marker { display:none; }
-  .spell-item > summary::before { content:"\25B8"; color:var(--fg-dim); transition:transform .12s; flex:0 0 auto; }
-  .spell-item[open] > summary::before { transform:rotate(90deg); }
-  .spell-item[open] > summary { border-bottom:1px solid var(--line); background:var(--bg2); }
-  .spell-item > summary:hover { background:var(--bg2); }
-  .spell-item .st { flex:0 0 86px; font-weight:600; }
-  .spell-item.recovered .st { color:var(--warn); } .spell-item.active .st { color:var(--bad); }
-  .spell-item.potentialfork .st { color:var(--bad); } .spell-item.ended .st { color:var(--fg-faint); }
-  .spell-item .ins { flex:0 0 150px; color:var(--fg); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .spell-item .tg  { flex:0 0 124px; color:var(--bad); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .spell-item .ms  { flex:1 1 120px; color:var(--fg-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .spell-item .tm  { flex:0 0 auto; color:var(--fg-faint); white-space:nowrap; }
-  .spell-item > .sd { padding:14px; }
-  .spelllist .empty-row { font-family:var(--mono); font-size:11px; color:var(--fg-faint); padding:10px; }
-
-  /* --- shared spell-detail body (used inline in a row AND in the drawer) --- */
-  .spell-detail h4 { font-family:var(--mono); font-size:10px; text-transform:uppercase; letter-spacing:.08em;
-                     color:var(--fg-dim); margin:20px 0 8px; padding-bottom:5px; border-bottom:1px solid var(--line); }
-  .spell-detail h4:first-child { margin-top:0; }
-  .spell-detail .hdrline { font-family:var(--mono); font-size:11px; color:var(--fg-dim); margin-bottom:2px; line-height:1.6; }
-  .spell-detail .hdrline b { color:var(--fg); } .spell-detail .hdrline b.bad { color:var(--bad); }
-  .dgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(220px,1fr)); gap:10px; }
-  .dgrid .mc canvas { height:56px !important; }
-  .evtline { font-family:var(--mono); font-size:10.5px; max-height:200px; overflow-y:auto;
-             border:1px solid var(--line); border-radius:3px; }
-  .evtline .e { display:flex; gap:10px; padding:2px 8px; border-bottom:1px solid rgba(255,255,255,.03); }
-  .evtline .e:last-child { border-bottom:none; }
-  .evtline .e .t { color:var(--fg-faint); flex:0 0 64px; }
-  .evtline .e .g { flex:0 0 110px; }
-  .evtline .e.fork_warn .g, .evtline .e.error .g { color:var(--bad); }
-  .evtline .e.consensus_lost .g, .evtline .e.out_of_sync .g { color:var(--warn); }
-  .evtline .e.ledger_created .g { color:var(--ok); }
-  .evtline .e.vote_kept .g { color:var(--ok); }
-  .evtline .e.vote_erased .g { color:var(--fg-dim); text-decoration:line-through; }
-  .evtline .e.ledger_selected .g { color:var(--warn); font-weight:700; }
-  .evtline .e .m { color:var(--fg-dim); white-space:pre-wrap; word-break:break-word; }
-  .chain-split-badge { display:inline-block; padding:1px 7px; margin-left:6px; font-family:var(--mono);
-    font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.06em;
-    color:var(--bad); border:1px solid var(--bad); border-radius:2px;
-    box-shadow:0 0 6px var(--bad-dim); animation: pulse 1.6s ease-in-out infinite; }
-  #forkEvents:empty { display:none; }
-  #forkEvents { margin:0 0 10px; padding:8px 10px; border:1px solid var(--bad); border-radius:3px;
-    background: rgba(255,90,82,.06); font-family:var(--mono); font-size:11px; }
-  #forkEvents .fe-h { color:var(--bad); font-weight:700; text-transform:uppercase; letter-spacing:.05em;
-    font-size:10px; margin-bottom:5px; }
-  #forkEvents .fe-row { display:flex; gap:10px; flex-wrap:wrap; padding:2px 0; color:var(--fg-dim); }
-  #forkEvents .fe-row b { color:var(--fg); }
-  #forkEvents .fe-row .hash-a { color:var(--warn); }
-  #forkEvents .fe-row .hash-b { color:var(--bad); }
-  /* artifact "pills" — nested expandable <details> inside a spell */
-  .arts .cap-h { font-family:var(--mono); font-size:9.5px; color:var(--fg-dim); margin:12px 0 6px; display:flex; gap:8px; align-items:center; }
-  .arts .cap-h:first-child { margin-top:0; }
-  .arts .a { border:1px solid var(--line); border-radius:3px; margin-bottom:7px; overflow:hidden; }
-  .arts .a > summary { cursor:pointer; padding:6px 10px; font-family:var(--mono); font-size:10.5px;
-                       display:flex; gap:10px; align-items:center; list-style:none; background:var(--bg2); }
-  .arts .a > summary::-webkit-details-marker { display:none; }
-  .arts .a > summary::before { content:"\25B8"; color:var(--fg-dim); transition:transform .1s; }
-  .arts .a[open] > summary::before { transform:rotate(90deg); }
-  .arts .a > summary .k { color:var(--info); font-weight:600; }
-  .arts .a > summary .when { color:var(--fg-faint); }
-  .arts .a > summary .ins { color:var(--accent); }
-  .arts .a > summary .sz { color:var(--fg-faint); }
-  .arts .a > summary .grep { margin-left:auto; }
-  .arts .a > summary .grep input { background:var(--bg); border:1px solid var(--line); color:var(--fg);
-                                   font-family:var(--mono); font-size:10px; padding:1px 6px; width:130px; border-radius:2px; }
-  .arts .a pre { margin:0; padding:10px 12px; background:var(--bg); font-family:var(--mono); font-size:10.5px;
-                 line-height:1.5; overflow:auto; max-height:340px; white-space:pre-wrap; word-break:break-word; color:var(--fg); }
-  .arts .a pre mark { background:rgba(224,168,46,.35); color:inherit; }
-  .badge-cap { font-family:var(--mono); font-size:9px; color:var(--fg-dim);
-               border:1px solid var(--line); border-radius:2px; padding:0 4px; }
-
-  /* --- spell detail drawer (still used by per-instance card clicks) --- */
-  #scrim { position:fixed; inset:0; background:rgba(0,0,0,.55); backdrop-filter:blur(2px);
-           opacity:0; pointer-events:none; transition:opacity .18s; z-index:90; }
-  #scrim.on { opacity:1; pointer-events:auto; }
-  #drawer { position:fixed; top:0; right:0; bottom:0; width:min(880px,94vw); z-index:100;
-            background: var(--bg1); border-left:1px solid var(--line2);
-            box-shadow:-24px 0 60px rgba(0,0,0,.5); transform:translateX(100%);
-            transition: transform .22s cubic-bezier(.4,0,.2,1); display:flex; flex-direction:column; }
-  #drawer.on { transform:translateX(0); }
-  #drawer .dh { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:12px; }
-  #drawer .dh h2 { margin:0; font-family:var(--mono); font-size:14px; font-weight:600; }
-  #drawer .dh .x { margin-left:auto; background:none; border:1px solid var(--line); color:var(--fg-dim);
-                   width:26px; height:26px; border-radius:3px; cursor:pointer; font-size:14px; line-height:1; }
-  #drawer .dh .x:hover { color:var(--fg); border-color:var(--line2); }
-  #drawer .db { overflow-y:auto; padding:16px 18px 40px; flex:1; }
-</style>
-</head>
-<body>
-<header>
-  <h1>sashi<span class="dot">.</span>mon</h1>
-  <span class="meta">// hotpocket consensus &amp; host monitor</span>
-  <span class="live" id="lastUpdate">connecting…</span>
-</header>
-<main>
-  <div class="controls">
-    <label>timeline
-      <select id="window">
-        <option value="900">15m</option>
-        <option value="3600">1h</option>
-        <option value="21600">6h</option>
-        <option value="86400">24h</option>
-        <option value="all" selected>all</option>
-      </select>
-    </label>
-    <label>granularity
-      <select id="bucket">
-        <option value="30">30s</option>
-        <option value="60" selected>1 min</option>
-        <option value="300">5 min</option>
-        <option value="3600">1 hour</option>
-      </select>
-    </label>
-    <label>auto
-      <select id="refresh">
-        <option value="0">off</option>
-        <option value="5000" selected>5s</option>
-        <option value="15000">15s</option>
-        <option value="60000">60s</option>
-      </select>
-    </label>
-    <button id="reload">reload</button>
-    <span style="flex:1"></span>
-    <label class="policy-ctl" id="policyLabel" title="DB tracking policy. Balanced (default): low-impact spells (consensus_lost, out_of_sync, warning) skip metric-boost + snapshots, and during the spell their event flood is dropped. Forks still get full treatment. Full: track everything always. Minimal: only fork-class events.">tracking
-      <select id="policy" disabled>
-        <option value="balanced">balanced</option>
-        <option value="full">full</option>
-        <option value="minimal">minimal</option>
-      </select>
-    </label>
-    <button id="export" title="download one plain-text report — every instance, every error spell, with the HotPocket log + journalctl + host metrics around each spell start; hand it to an analyst / LLM">export report</button>
-    <button id="updateBtn" title="re-run the install one-liner to pull the latest sashi.mon. systemd restarts the service when the install finishes.">update sashi.mon</button>
-    <button id="clearDb" class="danger" title="wipe ALL stored data: log events, host metrics, error spells & their artifacts, instances. Live tailing/sampling continues; history starts fresh.">clear dbs <span class="dbsz" id="dbSize">(—)</span></button>
-  </div>
-
-  <div id="modal" class="modal" style="display:none">
-    <div class="modal-bg" data-close="1"></div>
-    <div class="modal-box">
-      <div class="modal-h"><h2 id="modalTitle">Title</h2><button class="x" data-close="1">×</button></div>
-      <div class="modal-body" id="modalBody"></div>
-    </div>
-  </div>
-
-  <div id="clusterBanner" class="cluster-banner" style="display:none;">
-    <span class="lbl">viewing cluster</span>
-    <code class="cid" id="cbId"></code>
-    <span id="cbMeta"></span>
-    <button class="clr" id="cbClear">view all monitored ×</button>
-  </div>
-
-  <div class="panel" id="clusterPanel">
-    <div class="ph">
-      <h2>clusters</h2>
-      <span class="hint" id="clusterHint">discovered Sashimono clusters on this VM. tick to monitor; click row to scope dashboard.</span>
-      <span style="flex:1"></span>
-      <button id="discoverBtn" title="run `sashi list` now to refresh the cluster list">discover</button>
-    </div>
-    <div class="pb" id="clusterList"></div>
-  </div>
-
-  <div id="statusbar" title="host status — click to jump to host metrics"></div>
-
-  <div class="panel">
-    <div class="ph">
-      <h2>error events</h2>
-      <span class="hint" id="globalHint">all instances · errors per minute · whole timeline</span>
-    </div>
-    <div class="pb">
-      <div class="tagchips" id="tagChips"></div>
-      <div class="global"><canvas id="globalChart"></canvas></div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="ph">
-      <h2>host · this vm</h2>
-      <span class="hint" id="hostMeta"></span>
-    </div>
-    <div class="pb">
-      <div class="hostgrid">
-        <div class="mc"><h3>disk free <span>MB · min mount</span><b id="v_disk">—</b></h3><canvas id="m_disk"></canvas></div>
-        <div class="mc"><h3>mem used <span>%</span><b id="v_mem">—</b></h3><canvas id="m_mem"></canvas></div>
-        <div class="mc"><h3>cpu / steal <span>%</span><b id="v_cpu">—</b></h3><canvas id="m_cpu"></canvas></div>
-        <div class="mc"><h3>load <span>1m</span><b id="v_load">—</b></h3><canvas id="m_load"></canvas></div>
-        <div class="mc"><h3>ntp offset <span>ms</span><b id="v_ntp">—</b></h3><canvas id="m_ntp"></canvas></div>
-        <div class="mc"><h3>hp rss <span>MB · per inst</span><b id="v_rss">—</b></h3><canvas id="m_rss"></canvas></div>
-      </div>
-      <div class="verdict" id="hostVerdict"></div>
-    </div>
-  </div>
-
-  <div class="panel">
-    <div class="ph">
-      <h2>error spells</h2>
-      <span class="hint">consensus_loss / fork / out_of_sync · click a row to expand → host metrics &amp; journalctl/log artifacts for that spell</span>
-    </div>
-    <div class="pb">
-      <div class="ribbon" id="ribbon"><div class="now"></div></div>
-      <div class="ribbon-legend">
-        <i class="l-rec">recovered (ledger resumed)</i>
-        <i class="l-act">active now</i>
-        <i class="l-hf">potential fork (open &gt;120s, no ledger)</i>
-        <i class="l-end">ended</i>
-        <span style="margin-left:auto" id="spellCount"></span>
-      </div>
-      <div id="forkEvents"></div>
-      <div class="spelllist" id="spellRows"></div>
-    </div>
-  </div>
-
-  <div id="cards" class="grid"></div>
-</main>
-
-<div id="scrim"></div>
-<aside id="drawer">
-  <div class="dh">
-    <h2 id="dwTitle">spell</h2>
-    <span class="pill" id="dwState">—</span>
-    <button class="x" id="dwClose">&times;</button>
-  </div>
-  <div class="db" id="dwBody"></div>
-</aside>
-<script>
-// All event tags, in render order. `err` marks the ones shown by default.
-const TAGS = [
-  { id:'fork_warn',        label:'fork',            color:'#f85149', err:true  },
-  { id:'consensus_lost',   label:'consensus lost',  color:'#d29922', err:true  },
-  { id:'out_of_sync',      label:'out of sync',     color:'#bc8cff', err:true  },
-  { id:'error',            label:'error',           color:'#ff7b72', err:true  },
-  { id:'warning',          label:'warning',         color:'#e3b341', err:false },
-  { id:'ledger_created',   label:'ledger created',  color:'#3fb950', err:false },
-  { id:'contract_running', label:'contract run',    color:'#1f6feb', err:false },
-  { id:'hp_started',       label:'hp started',      color:'#79c0ff', err:false },
-  { id:'hp_stopped',       label:'hp stopped',      color:'#8b949e', err:false },
-  { id:'role_change',      label:'role change',     color:'#56d4dd', err:false },
-  { id:'info_other',       label:'info / other',    color:'#484f58', err:false },
-];
-const TAG_BY_ID = Object.fromEntries(TAGS.map(t => [t.id, t]));
-const TAG_COLORS = Object.fromEntries(TAGS.map(t => [t.id, t.color]));   // legacy refs (per-instance bars)
-let VISIBLE_TAGS = new Set(TAGS.filter(t => t.err).map(t => t.id));      // default: error tags only
-
-let charts = {};
-let globalChart = null;
-let timer = null;
-let LAST_GLOBAL_BUCKETS = [];
-let LAST_GLOBAL_BUCKETSEC = 60;
-let LAST_INST_BUCKETS = {};
-
-function fmtAge(s) {
-  if (s == null) return '—';
-  if (s < 60) return s.toFixed(0) + 's';
-  if (s < 3600) return (s/60).toFixed(1) + 'm';
-  return (s/3600).toFixed(1) + 'h';
-}
-function bucketLabel(sec) { return sec >= 86400 ? 'day' : sec >= 3600 ? 'hour' : sec >= 60 ? 'minute' : 'tick'; }
-function hexA(hex, a) { const n = parseInt(hex.replace('#',''),16); return `rgba(${(n>>16)&255},${(n>>8)&255},${n&255},${a})`; }
-
-async function fetchJSON(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(url + ' ' + r.status);
-  return r.json();
-}
-
-// --- tag filter chips ---
-function renderTagChips() {
-  const host = document.getElementById('tagChips'); if (!host) return;
-  let html = `<span class="lbl">show</span>`;
-  for (const t of TAGS) {
-    const on = VISIBLE_TAGS.has(t.id);
-    html += `<span class="c${on?' on':''}" data-tag="${t.id}" style="--cc:${t.color}">${esc(t.label)}</span>`;
-  }
-  html += `<span style="flex:1"></span>` +
-    `<span class="q danger" data-quick="err">errors only</span>` +
-    `<span class="q" data-quick="all">all</span>` +
-    `<span class="q" data-quick="none">none</span>`;
-  host.innerHTML = html;
-  host.querySelectorAll('.c[data-tag]').forEach(c => c.onclick = () => {
-    const id = c.dataset.tag;
-    if (VISIBLE_TAGS.has(id)) VISIBLE_TAGS.delete(id); else VISIBLE_TAGS.add(id);
-    renderTagChips(); renderGlobalChart(); rerenderInstanceCharts();
-  });
-  host.querySelectorAll('.q[data-quick]').forEach(q => q.onclick = () => {
-    const m = q.dataset.quick;
-    VISIBLE_TAGS = m === 'all' ? new Set(TAGS.map(t=>t.id))
-                 : m === 'none' ? new Set()
-                 : new Set(TAGS.filter(t=>t.err).map(t=>t.id));
-    renderTagChips(); renderGlobalChart(); rerenderInstanceCharts();
-  });
-}
-
-// --- the main "error events" line chart ---
-function lineDatasets(buckets, tagIds, fill) {
-  return tagIds.filter(id => buckets.some(b => (b[id]||0) > 0)).map(id => {
-    const t = TAG_BY_ID[id] || { color:'#888', label:id };
-    return {
-      label: t.label,
-      data: buckets.map(b => ({ x: b.bucket_start*1000, y: b[id] || 0 })),
-      borderColor: t.color, backgroundColor: fill ? hexA(t.color, 0.16) : 'transparent',
-      fill: !!fill, tension: 0.3, borderWidth: 1.8, pointRadius: 0, pointHoverRadius: 3, spanGaps: true,
-    };
-  });
-}
-function renderGlobalChart() {
-  const el = document.getElementById('globalChart'); if (!el) return;
-  const buckets = LAST_GLOBAL_BUCKETS, sec = LAST_GLOBAL_BUCKETSEC;
-  const vis = TAGS.filter(t => VISIBLE_TAGS.has(t.id)).map(t => t.id);
-  const ds = lineDatasets(buckets, vis, true);
-  const cfg = {
-    type: 'line',
-    data: { datasets: ds.length ? ds : [{ label:'(no matching events)', data:[], borderColor:'#3a4452' }] },
-    options: {
-      responsive:true, maintainAspectRatio:false, animation:false, parsing:false, normalized:true,
-      interaction:{ mode:'index', intersect:false },
-      plugins:{
-        legend:{ display:true, position:'bottom',
-          labels:{ color:'#8b949e', font:{family:"'IBM Plex Mono', monospace", size:10}, usePointStyle:true, boxWidth:8, boxHeight:8, padding:10 } },
-        tooltip:{ titleFont:{family:"'IBM Plex Mono', monospace", size:10}, bodyFont:{family:"'IBM Plex Mono', monospace", size:10},
-          callbacks:{ title:items => items.length ? new Date(items[0].parsed.x).toLocaleString() : '' } },
-      },
-      scales:{
-        x:{ type:'time', time:{ unit: sec>=86400?'day':sec>=3600?'hour':'minute',
-              displayFormats:{ minute:'HH:mm', hour:'MMM d HH:mm', day:'MMM d' } },
-            ticks:{ color:'#6b7989', font:{family:"'IBM Plex Mono', monospace", size:9}, maxRotation:0, autoSkipPadding:18 },
-            grid:{ display:false } },
-        y:{ beginAtZero:true, ticks:{ color:'#6b7989', font:{family:"'IBM Plex Mono', monospace", size:9}, maxTicksLimit:5, precision:0 },
-            grid:{ color:'rgba(255,255,255,.05)' } },
-      },
-    },
-  };
-  try {
-    if (globalChart && globalChart.canvas !== el) { try{globalChart.destroy();}catch(e){} globalChart = null; }
-    if (!globalChart) globalChart = new Chart(el, cfg);
-    else { globalChart.data = cfg.data; globalChart.options = cfg.options; globalChart.update('none'); }
-  } catch(e) {
-    cfg.options.scales.x = { ticks:{display:false}, grid:{display:false} };
-    cfg.data.datasets.forEach(d => d.data = d.data.map(p => p && p.y));
-    cfg.data.labels = buckets.map(b => tsLabel(b.bucket_start));
-    if (globalChart) { try{globalChart.destroy();}catch(_){} }
-    globalChart = new Chart(el, cfg);
-  }
-}
-
-// --- per-instance card mini-charts: small bars, same tag filter ---
-function buildBarDatasets(buckets) {
-  const vis = TAGS.filter(t => VISIBLE_TAGS.has(t.id)).map(t => t.id);
-  const labels = buckets.map(b => tsLabel(b.bucket_start));
-  const datasets = vis.filter(id => buckets.some(b => (b[id]||0) > 0)).map(id => ({
-    label: (TAG_BY_ID[id]||{}).label || id, data: buckets.map(b => b[id] || 0),
-    backgroundColor: (TAG_BY_ID[id]||{}).color || '#888', stack:'a',
-  }));
-  return { labels, datasets };
-}
-function barOpts() {
-  return { responsive:true, maintainAspectRatio:false, animation:false,
-    plugins:{ legend:{ display:false } },
-    scales:{ x:{ stacked:true, ticks:{color:'#4a5765', font:{family:"'IBM Plex Mono', monospace", size:8}, maxTicksLimit:4}, grid:{display:false} },
-             y:{ stacked:true, ticks:{color:'#4a5765', font:{family:"'IBM Plex Mono', monospace", size:8}, maxTicksLimit:3, precision:0}, grid:{color:'rgba(255,255,255,.04)'} } } };
-}
-function rerenderInstanceCharts() {
-  for (const [name, buckets] of Object.entries(LAST_INST_BUCKETS)) {
-    const cv = document.getElementById('ch-' + name); if (!cv) continue;
-    const data = buildBarDatasets(buckets);
-    if (!charts[name]) charts[name] = new Chart(cv, { type:'bar', data, options: barOpts() });
-    else { charts[name].data = data; charts[name].update('none'); }
-  }
-  if (typeof updateGlobalHint === 'function') updateGlobalHint();
-}
-
-// ---- host metrics + error-spell console -----------------------------
-const lineCharts = {};
-function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
-function tsLabel(t){ return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}); }
-function tsClock(t){ return new Date(t*1000).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}); }
-function pick(rows, key){ return rows.map(r => (r[key]==null ? null : r[key])); }
-function num(x, d){ return x==null ? '—' : (typeof x==='number' ? (Math.abs(x)>=100?Math.round(x):x.toFixed(d==null?1:d)) : x); }
-function setVal(id, txt, alert){
-  const el = document.getElementById(id); if(!el) return;
-  el.textContent = txt; el.classList.toggle('alert', !!alert);
-}
-
-function lineChart(id, datasets, opts) {
-  const el = document.getElementById(id); if (!el) return;
-  opts = opts || {};
-  const cfg = {
-    type: 'line',
-    data: { datasets: datasets.map(d => ({
-      label: d.label, data: d.points, borderColor: d.color,
-      backgroundColor: (d.fill ? d.color + '22' : 'transparent'), fill: !!d.fill,
-      borderWidth: 1.4, tension: 0.18, pointRadius: 0, spanGaps: true,
-    })) },
-    options: {
-      responsive: true, maintainAspectRatio: false, animation: false,
-      parsing: false, normalized: true,
-      plugins: { legend: { display: datasets.length > 1, position: 'bottom',
-                   labels:{ color:'#6b7989', font:{family:"'IBM Plex Mono', monospace", size:9}, boxWidth:8, boxHeight:8, padding:6 } },
-                 tooltip: { mode:'index', intersect:false,
-                   titleFont:{family:"'IBM Plex Mono', monospace", size:10}, bodyFont:{family:"'IBM Plex Mono', monospace", size:10} } },
-      scales: {
-        x: { type:'time', time:{ unit:'minute', displayFormats:{minute:'HH:mm'} },
-             ticks:{ color:'#4a5765', font:{family:"'IBM Plex Mono', monospace", size:8}, maxTicksLimit:4, maxRotation:0 },
-             grid:{ color:'rgba(255,255,255,.03)' } },
-        y: { ticks:{ color:'#4a5765', font:{family:"'IBM Plex Mono', monospace", size:8}, maxTicksLimit:4 },
-             grid:{ color:'rgba(255,255,255,.05)' }, beginAtZero: !opts.noZero,
-             suggestedMin: opts.suggestedMin, suggestedMax: opts.suggestedMax },
-      },
-    },
-  };
-  // If a prior chart bound a now-stale canvas (drawer reopened / row re-rendered), drop it.
-  if (lineCharts[id] && lineCharts[id].canvas !== el) {
-    try { lineCharts[id].destroy(); } catch(e) {}
-    delete lineCharts[id];
-  }
-  // Chart.js time scale needs adapters; fall back to category if 'time' fails.
-  try {
-    if (!lineCharts[id]) lineCharts[id] = new Chart(el, cfg);
-    else { lineCharts[id].data = cfg.data; lineCharts[id].options = cfg.options; lineCharts[id].update('none'); }
-  } catch(e) {
-    // No time adapter loaded — degrade to a plain index axis.
-    cfg.options.scales.x = { ticks:{display:false}, grid:{display:false} };
-    cfg.data.datasets.forEach(d => d.data = d.data.map(p => p && p.y));
-    if (lineCharts[id]) { try { lineCharts[id].destroy(); } catch(_) {} }
-    lineCharts[id] = new Chart(el, cfg);
-  }
-}
-function destroyCharts(pred) {
-  for (const k of Object.keys(lineCharts)) if (pred(k)) { try { lineCharts[k].destroy(); } catch(e) {} delete lineCharts[k]; }
-}
-const xy = (rows, key) => rows.filter(r => r[key] != null).map(r => ({ x: r.ts*1000, y: r[key] }));
-const PAL = ['#3fb950','#58a6ff','#e0a82e','#b083ff','#ff5a52','#56d4dd','#d2a8ff'];
-
-let LAST_SPELLS = [];        // all spells (24h), cached for ribbon + per-card lists
-let LAST_PROC_LATEST = {};   // instance -> most recent per-process host_metrics row
-let CARD_SPELLS_ALL = {};    // instance -> bool: card showing all its spells vs first few
-let OPEN_SPELLS = new Set(); // spell_ids currently expanded in the spells panel (kept across refreshes)
-let SPELL_LIST_KEY = '';     // signature of the rendered spell list, to avoid needless rebuilds
-
-async function refreshHost(win) {
-  let machine = [], procRows = [], spells = [], forkEvents = [];
-  try {
-    [machine, procRows, spells, forkEvents] = await Promise.all([
-      fetchJSON(`/api/host_metrics?instance=machine&window=${win}`),
-      fetchJSON(`/api/host_metrics?window=${win}&limit=20000`),
-      fetchJSON(`/api/spells_log?window=86400` + clusterQS()),
-      fetchJSON(`/api/fork_events?window=86400` + (ACTIVE_CLUSTER ? '&contract_id=' + encodeURIComponent(ACTIVE_CLUSTER) : '')),
-    ]);
-  } catch (e) { document.getElementById('hostMeta').textContent = 'host: ' + e.message; return; }
-  machine = machine.slice().reverse();                 // API returns DESC
-  const last = machine[machine.length - 1] || null;
-
-  // ---- headline values + sparkline tiles ----
-  if (last) {
-    let dl = '';
-    try { dl = Object.entries(JSON.parse(last.extra||'{}').disks||{})
-      .map(([m,d]) => `${m}:${d.used_pct}%`).join(' '); } catch(e){}
-    document.getElementById('hostMeta').textContent =
-      `${fmtAge((Date.now()/1000)-last.ts)} ago · ${machine.length} samples` + (dl ? ` · ${dl}` : '') +
-      (last.ntp_synced===0 ? ' · NTP NOT SYNCED' : '');
-    setVal('v_disk', num(last.disk_free_mb,0), last.disk_free_mb!=null && last.disk_free_mb < 1024);
-    setVal('v_mem',  num(last.mem_used_pct), last.mem_used_pct!=null && last.mem_used_pct > 92);
-    setVal('v_cpu',  `${num(last.cpu_pct)}/${num(last.steal_pct)}`, (last.steal_pct||0) > 10);
-    setVal('v_load', num(last.load1), false);
-    setVal('v_ntp',  num(last.ntp_offset_ms), last.ntp_synced===0 || Math.abs(last.ntp_offset_ms||0) > 1000);
-  } else {
-    document.getElementById('hostMeta').textContent = 'no host samples yet (metrics disabled?)';
-  }
-  lineChart('m_disk', [{label:'free MB', color:PAL[0], points: xy(machine,'disk_free_mb'), fill:true}]);
-  lineChart('m_mem',  [{label:'mem %', color:PAL[2], points: xy(machine,'mem_used_pct')},
-                       {label:'swap MB', color:PAL[3], points: xy(machine,'swap_used_mb')}], {suggestedMax:100});
-  lineChart('m_cpu',  [{label:'cpu %', color:PAL[1], points: xy(machine,'cpu_pct')},
-                       {label:'steal %', color:PAL[4], points: xy(machine,'steal_pct')}], {suggestedMax:100});
-  lineChart('m_load', [{label:'load1', color:PAL[5], points: xy(machine,'load1'), fill:true}]);
-  lineChart('m_ntp',  [{label:'ntp ms', color:PAL[1], points: xy(machine,'ntp_offset_ms')}], {noZero:true});
-
-  // per-instance HP-process RSS (procRows arrives ts-DESC → first per inst = latest)
-  LAST_PROC_LATEST = {};
-  for (const r of procRows) if (r.instance && !(r.instance in LAST_PROC_LATEST)) LAST_PROC_LATEST[r.instance] = r;
-  const byInst = {};
-  for (const r of procRows) if (r.instance && r.proc_rss_mb != null) (byInst[r.instance] ||= []).push(r);
-  const rssDs = Object.entries(byInst).map(([name, rows], i) => {
-    rows.sort((a,b)=>a.ts-b.ts);
-    return { label: name.slice(0,12), color: PAL[i % PAL.length], points: rows.map(r=>({x:r.ts*1000, y:r.proc_rss_mb})) };
-  });
-  lineChart('m_rss', rssDs.length ? rssDs : [{label:'rss', color:'#3a4452', points:[]}]);
-  const lastRss = rssDs.length ? rssDs.map(d => d.points.length ? Math.round(d.points[d.points.length-1].y) : null).filter(x=>x!=null) : [];
-  setVal('v_rss', lastRss.length ? lastRss.join('/') : '—',
-         lastRss.some(x => x > 700));
-
-  // ---- verdict heuristic ----
-  const v = [];
-  if (last) {
-    if (last.disk_free_mb!=null && last.disk_free_mb < 1024) v.push(`disk min-free ${Math.round(last.disk_free_mb)}MB — near full → ledger persistence fails (set history=custom / bigger disk)`);
-    if (last.inode_used_pct!=null && last.inode_used_pct > 85) v.push(`inodes ${last.inode_used_pct}% used`);
-    if ((last.steal_pct||0) > 10) v.push(`CPU steal ${last.steal_pct}% — burstable/noisy VM → missed round windows`);
-    if (last.ntp_synced===0 || Math.abs(last.ntp_offset_ms||0) > 1000) v.push(`clock ${last.ntp_synced===0?'NOT SYNCED':('off '+Math.round(last.ntp_offset_ms||0)+'ms')} — round-boundary desync risk (run chrony)`);
-    if (last.mem_avail_mb!=null && last.mem_avail_mb < 256) v.push(`only ${Math.round(last.mem_avail_mb)}MB free — OOM risk → node restart = a fault`);
-  }
-  for (const [name, rows] of Object.entries(byInst)) {
-    if (rows.length >= 5) { const a=rows[0].proc_rss_mb, b=rows[rows.length-1].proc_rss_mb;
-      if (a>0 && b>a*2 && b-a>100) v.push(`${name.slice(0,16)} RSS ${Math.round(a)}→${Math.round(b)}MB this window — possible leak → eventual OOM`); }
-  }
-  const openHF = spells.filter(s => s.state === 'potential_fork' || s.state === 'active');
-  if (openHF.length) v.unshift(`${openHF.length} spell(s) OPEN now — ${openHF.map(s=>(s.instance||'').slice(0,12)).join(', ')}`);
-  document.getElementById('hostVerdict').innerHTML = v.length ? v.map(t=>'⚠ '+esc(t)).join('<br>') : '';
-
-  // ---- status bar + spell ribbon + inline-expandable spell list ----
-  LAST_SPELLS = spells;
-  const lastAge = last ? (Date.now()/1000 - last.ts) : null;
-  renderStatusBar(last, v, openHF, lastAge, byInst);
-  renderRibbon(spells);
-  renderSpellsPanel(spells);
-  renderForkEvents(forkEvents);
-}
-
-// Confirmed chain splits (fork_events): two+ instances closed DIFFERENT
-// hashes at the SAME ledger seq_no. Distinct from — and a stronger signal
-// than — the ribbon's "potential fork" (which only infers from spell age).
-function renderForkEvents(events) {
-  const host = document.getElementById('forkEvents');
-  if (!host) return;
-  if (!events || !events.length) { host.innerHTML = ''; return; }
-  const ord = events.slice().sort((a, b) => b.ts - a.ts);
-  host.innerHTML = `<div class="fe-h">⚠ ${ord.length} confirmed chain split${ord.length===1?'':'s'} — different lcl hash at the same ledger, not just a fork_warn blip</div>` +
-    ord.map(e => `<div class="fe-row">` +
-      `<span>${esc(new Date(e.ts * 1000).toLocaleString())}</span>` +
-      `<span>seq <b>${e.seq_no}</b></span>` +
-      `<span class="hash-a">${esc(shortHash(e.hash_a))} <b>(${(e.instances_a||[]).map(n=>esc(n.slice(0,12))).join(', ')})</b></span>` +
-      `<span>vs</span>` +
-      `<span class="hash-b">${esc(shortHash(e.hash_b))} <b>(${(e.instances_b||[]).map(n=>esc(n.slice(0,12))).join(', ')})</b></span>` +
-    `</div>`).join('');
-}
-
-// ---- host status bar (homescreen at-a-glance) -----------------------
-function renderStatusBar(m, verdictLines, openSpells, lastAge, byInst) {
-  const sb = document.getElementById('statusbar'); if (!sb) return;
-  const open = (openSpells || []).length;
-  let level, word;
-  if (open) { level = 'critical'; word = open + ' SPELL' + (open > 1 ? 'S' : '') + ' OPEN'; }
-  else if ((verdictLines || []).length) { level = 'watch'; word = 'WATCH'; }
-  else if (!m) { level = 'watch'; word = 'NO HOST DATA'; }
-  else { level = 'ok'; word = 'OK'; }
-  const cell = (l, val, cls) => `<div class="sx"><span class="l">${l}</span><span class="v ${cls || ''}">${val}</span></div>`;
-  const ninst = byInst ? Object.keys(byInst).length : 0;
-  let html = `<div class="sx stat ${level}"><span class="l">cluster · host</span><span class="v">${esc(word)}</span></div>`;
-  if (m) {
-    html += cell('disk free', m.disk_free_mb != null ? Math.round(m.disk_free_mb) + 'M' : '—', (m.disk_free_mb != null && m.disk_free_mb < 1024) ? 'bad' : '');
-    html += cell('mem used', m.mem_used_pct != null ? m.mem_used_pct + '%' : '—', (m.mem_used_pct || 0) > 92 ? 'bad' : '');
-    html += cell('cpu/steal', `${num(m.cpu_pct)}/${num(m.steal_pct)}`, (m.steal_pct || 0) > 10 ? 'warn' : '');
-    html += cell('load1', num(m.load1), (m.load1 || 0) > 8 ? 'warn' : '');
-    html += cell('ntp', m.ntp_synced === 0 ? 'NOSYNC' : (m.ntp_offset_ms != null ? num(m.ntp_offset_ms) + 'ms' : '—'), (m.ntp_synced === 0 || Math.abs(m.ntp_offset_ms || 0) > 1000) ? 'bad' : '');
-    html += cell('hp inst', String(ninst));
-    html += cell('sampled', lastAge != null ? fmtAge(lastAge) + ' ago' : '—', (lastAge != null && lastAge > 120) ? 'warn' : '');
-  }
-  html += cell('spells 24h', String((LAST_SPELLS || []).length), open ? 'bad' : '');
-  const notes = (verdictLines || []).slice();
-  html += `<div class="note">${notes.slice(0, 2).map(esc).join('  ·  ')}${notes.length > 2 ? '  ·  +' + (notes.length - 2) + ' more' : ''}</div>`;
-  sb.className = level === 'critical' ? 'critical' : '';
-  sb.innerHTML = html;
-  sb.onclick = () => { const el = document.getElementById('hostVerdict') || document.getElementById('m_disk'); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' }); };
-}
-
-// ---- 24h spell timeline ribbon --------------------------------------
-function renderRibbon(spells) {
-  const rb = document.getElementById('ribbon');
-  rb.querySelectorAll('.blk, .axl').forEach(e => e.remove());
-  const now = Date.now() / 1000, span = 86400, t0 = now - span;
-  for (let h = 0; h <= 24; h += 6) {
-    const ax = document.createElement('div'); ax.className = 'axl';
-    ax.style.left = (100 * h / 24) + '%';
-    ax.textContent = h === 0 ? '-24h' : (h === 24 ? 'now' : '-' + (24 - h) + 'h');
-    rb.appendChild(ax);
-  }
-  for (const s of spells) {
-    const a = Math.max(s.start_ts, t0), b = Math.min(s.end_ts || now, now);
-    if (b <= t0) continue;
-    const blk = document.createElement('div');
-    blk.className = 'blk ' + spellCls(s);
-    blk.style.left = (100 * (a - t0) / span) + '%';
-    blk.style.width = Math.max(0.25, 100 * (b - a) / span) + '%';
-    blk.title = `${s.instance} · ${s.state} · ${tsClock(s.start_ts)} · ${fmtAge(s.duration_s)} · ${s.trigger_tag || ''}`;
-    blk.onclick = () => expandSpellRow(s.spell_id);
-    rb.appendChild(blk);
-  }
-}
-
-function expandSpellRow(spellId) {
-  const it = document.querySelector(`.spell-item[data-sid="${CSS.escape(spellId)}"]`);
-  if (!it) { openSpellDrawer(spellId); return; }   // not in the panel list (e.g. clicked from a card) → drawer
-  if (!it.open) it.open = true;                     // toggle listener lazy-loads the body
-  it.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  it.style.outline = '1px solid var(--accent)';
-  setTimeout(() => { it.style.outline = ''; }, 1400);
-}
-
-// ---- inline-expandable spell list (spells panel) --------------------
-const spellCls = s => s.state === 'recovered' ? 'recovered' : s.state === 'active' ? 'active' : s.state === 'potential_fork' ? 'potentialfork' : 'ended';
-const durBucket = s => String(Math.round((s.duration_s || 0) / 30));
-const spellPrefix = id => 'r' + String(id).replace(/[^a-zA-Z0-9]/g, '_');
-function spellSummaryHTML(s) {
-  return `<span class="st">${esc(s.state)}</span>` +
-    `<span class="ins">${esc((s.instance || '').slice(0, 22))}</span>` +
-    `<span class="tg">${esc(s.trigger_tag || '')}</span>` +
-    `<span class="ms">${esc((s.trigger_msg || '').slice(0, 220))}</span>` +
-    `<span class="tm">${tsClock(s.start_ts)} · ${fmtAge(s.duration_s)} · cap ${s.captures || 0}</span>`;
-}
-
-function renderSpellsPanel(spells) {
-  const host = document.getElementById('spellRows');
-  document.getElementById('spellCount').textContent = spells.length
-    ? `${spells.length} in 24h · ${spells.filter(s => s.state !== 'recovered' && s.state !== 'ended').length} unresolved` : '';
-  // only rebuild when something an expanded row would care about changed
-  const key = spells.map(s => `${s.spell_id}|${s.state}|${durBucket(s)}|${s.captures || 0}`).join('~');
-  if (key === SPELL_LIST_KEY && host.childElementCount) return;   // unchanged → keep the DOM (and any expanded rows)
-  SPELL_LIST_KEY = key;
-  destroyCharts(k => k[0] === 'r');                 // tear down old inline-row charts before rebuilding
-  host.innerHTML = '';
-  if (!spells.length) { host.innerHTML = '<div class="empty-row">— no error spells in the last 24h —</div>'; return; }
-  for (const s of spells) {
-    const det = document.createElement('details');
-    det.className = 'spell-item ' + spellCls(s);
-    det.dataset.sid = s.spell_id;
-    det.innerHTML = `<summary>${spellSummaryHTML(s)}</summary>` +
-      `<div class="sd"><div style="color:var(--fg-dim);font-family:var(--mono);font-size:11px">expand to load host metrics &amp; journalctl/log artifacts…</div></div>`;
-    const sd = det.querySelector('.sd');
-    const loadDetail = () => {
-      const want = durBucket(s);
-      if (det.dataset.loadedDur === want) return;   // body already current
-      det.dataset.loadedDur = want;
-      renderSpellDetail(sd, s.spell_id, spellPrefix(s.spell_id));
-    };
-    det.addEventListener('toggle', () => {
-      if (det.open) { OPEN_SPELLS.add(s.spell_id); loadDetail(); }
-      else { OPEN_SPELLS.delete(s.spell_id); }
-    });
-    host.appendChild(det);
-    if (OPEN_SPELLS.has(s.spell_id)) { det.open = true; loadDetail(); }   // restore expansion across refreshes
-  }
-}
-
-// ---- shared spell-detail renderer (used by inline rows AND the drawer) ----
-const ARTIFACT_ORDER = ['logtail', 'journalctl', 'journalctl_agent', 'journalctl_units', 'journalctl_kernel', 'dmesg', 'ps', 'free', 'vmstat', 'uptime', 'df', 'dfi', 'chronyc', 'du', 'ss_peer_mesh', 'ss_peer_listen', 'ss_tcp_info', 'ss_summary', 'proc_net_snmp', 'ip_link_stats', 'ip_route_neigh', 'conntrack', 'iptables', 'peer_ping'];
-
-async function renderSpellDetail(container, spellId, prefix) {
-  const meta = LAST_SPELLS.find(s => s.spell_id === spellId) || {};
-  container.innerHTML = '<div style="color:var(--fg-dim);font-family:var(--mono);font-size:11px">loading…</div>';
-  const startTs = meta.start_ts || (Date.now() / 1000 - 600);
-  const endTs = meta.end_ts || (Date.now() / 1000);
-  const p0 = startTs - 90, p1 = endTs + 90;
-  let arts = [], hm = [], evs = [], votes = [];
-  try {
-    [arts, hm, evs, votes] = await Promise.all([
-      fetchJSON('/api/spell_artifacts?spell_id=' + encodeURIComponent(spellId)),
-      fetchJSON(`/api/host_metrics?window=86400&limit=20000`),
-      fetchJSON(`/api/events?instance=${encodeURIComponent(meta.instance || '')}&since=${p0}&until=${p1}&limit=2000`),
-      fetchJSON(`/api/proposal_votes?instance=${encodeURIComponent(meta.instance || '')}&since=${p0}&until=${p1}&limit=2000`),
-    ]);
-  } catch (e) { container.innerHTML = '<div style="color:var(--bad)">error: ' + esc(e.message) + '</div>'; return; }
-
-  const win = hm.filter(r => r.ts >= p0 && r.ts <= p1);
-  const mach = win.filter(r => r.instance == null).sort((a, b) => a.ts - b.ts);
-  const procByInst = {};
-  for (const r of win) if (r.instance && r.proc_rss_mb != null) (procByInst[r.instance] ||= []).push(r);
-  const boosted = win.filter(r => r.during_spell === 1).length;
-  const dur = meta.duration_s != null ? fmtAge(meta.duration_s) : '—';
-  const cid = k => `${prefix}_${k}`;
-
-  let html = `<div class="spell-detail">`;
-  html += `<div class="hdrline">id <b>${esc(spellId)}</b> · instance <b>${esc(meta.instance || '?')}</b> · ` +
-    `state <b class="${(meta.state && meta.state !== 'recovered' && meta.state !== 'ended') ? 'bad' : ''}">${esc(meta.state || '?')}</b> · ` +
-    `started <b>${esc(new Date(startTs * 1000).toLocaleString())}</b> · duration <b>${dur}</b> · ` +
-    `trigger <b class="bad">${esc(meta.trigger_tag || '?')}</b> ${esc((meta.trigger_msg || '').slice(0, 160))}</div>` +
-    `<div class="hdrline">${arts.length} artifacts · ${boosted} boosted (3s) host samples · ${evs.length} log events · ${votes.length} vote lines in window</div>`;
-
-  html += `<h4>host metrics — spell window ±90s${boosted ? ` · ${boosted} boosted samples` : ''}</h4>`;
-  html += `<div class="dgrid">` +
-    `<div class="mc"><h3>disk free <span>MB</span></h3><canvas id="${cid('disk')}"></canvas></div>` +
-    `<div class="mc"><h3>mem used <span>%</span></h3><canvas id="${cid('mem')}"></canvas></div>` +
-    `<div class="mc"><h3>cpu / steal <span>%</span></h3><canvas id="${cid('cpu')}"></canvas></div>` +
-    `<div class="mc"><h3>load <span>1m</span></h3><canvas id="${cid('load')}"></canvas></div>` +
-    `<div class="mc"><h3>ntp offset <span>ms</span></h3><canvas id="${cid('ntp')}"></canvas></div>` +
-    `<div class="mc"><h3>hp rss <span>MB</span></h3><canvas id="${cid('rss')}"></canvas></div></div>`;
-
-  html += `<h4>events around the spell (${evs.length})</h4>`;
-  if (!evs.length) html += `<div style="color:var(--fg-faint);font-family:var(--mono);font-size:11px">no log events captured for this instance in the window</div>`;
-  else {
-    const ord = evs.slice().sort((a, b) => a.ts - b.ts);
-    html += `<div class="evtline">` + ord.map(e =>
-      `<div class="e ${esc(e.tag)}"><span class="t">${tsClock(e.ts)}</span><span class="g">${esc(e.tag)}</span><span class="m">${esc((e.msg || '').slice(0, 400))}</span></div>`
-    ).join('') + `</div>`;
-  }
-
-  html += `<h4>consensus votes around the spell (${votes.length}) — who this node's stage-3 counted, kept, or erased, and what it closed</h4>`;
-  if (!votes.length) html += `<div style="color:var(--fg-faint);font-family:var(--mono);font-size:11px">no vote lines captured — set log.log_level to "dbg" in hp.cfg.override to enable this</div>`;
-  else {
-    const vord = votes.slice().sort((a, b) => a.ts - b.ts);
-    html += `<div class="evtline">` + vord.map(v => {
-      const who = v.from_pubkey === 'self' ? 'self' : shortHash(v.from_pubkey || '');
-      let msg;
-      if (v.kind === 'selected') msg = `closed with root_hash ${shortHash(v.root_hash)}`;
-      else msg = `s${v.stage ?? '?'} ${v.kind} root_hash:${shortHash(v.root_hash)} frm:${who}` +
-        (v.latency_ms != null ? ` lat:${v.latency_ms}ms` : '') +
-        (v.last_primary_shard_id ? ` ps:${shortHash(v.last_primary_shard_id)}` : '') +
-        (v.state_hash ? ` state:${shortHash(v.state_hash)}` : '');
-      const tag = v.kind === 'kept' ? 'vote_kept' : v.kind === 'erased' ? 'vote_erased' : 'ledger_selected';
-      return `<div class="e ${tag}"><span class="t">${tsClock(v.ts)}</span><span class="g">${esc(tag)}</span><span class="m">${esc(msg)}</span></div>`;
-    }).join('') + `</div>`;
-  }
-
-  html += `<h4>captured snapshots — journalctl / dmesg / ps / df / chronyc / contract log (${arts.length}) — each is its own expandable pill with a grep box</h4>`;
-  if (!arts.length) html += `<div style="color:var(--fg-faint);font-family:var(--mono);font-size:11px">no artifacts yet — spell may be new, or capture tools (ps/df/journalctl) unavailable on this host</div>`;
-  else {
-    const sorted = arts.slice().sort((a, b) => (a.ts - b.ts) || (ARTIFACT_ORDER.indexOf(a.kind) - ARTIFACT_ORDER.indexOf(b.kind)));
-    const groups = [];
-    for (const a of sorted) { let g = groups.find(g => Math.abs(g.ts - a.ts) < 5); if (!g) { g = { ts: a.ts, items: [] }; groups.push(g); } g.items.push(a); }
-    html += `<div class="arts">` + groups.map((g, gi) =>
-      `<div class="cap-h"><span class="badge-cap">capture ${gi + 1}/${groups.length}</span> ${esc(new Date(g.ts * 1000).toLocaleString())}</div>` +
-      g.items.map((a, ai) => {
-        const id = `${prefix}_art_${gi}_${ai}`;
-        const sz = (a.content || '').length;
-        const openDef = ['logtail', 'journalctl_agent', 'journalctl', 'journalctl_kernel', 'dmesg', 'ss_peer_mesh', 'peer_ping', 'conntrack'].includes(a.kind) && gi === 0;
-        return `<details class="a"${openDef ? ' open' : ''}><summary>` +
-          `<span class="k">${esc(a.kind)}</span>` + (a.instance ? `<span class="ins">${esc(a.instance.slice(0, 18))}</span>` : '') +
-          `<span class="when">${tsClock(a.ts)}</span><span class="sz">${sz > 2048 ? Math.round(sz / 1024) + 'K' : sz + 'B'}</span>` +
-          `<span class="grep"><input placeholder="grep…" data-tgt="${id}" oninput="grepArtifact(this)"></span></summary>` +
-          `<pre id="${id}" data-raw="${esc(a.content || '')}">${esc(a.content || '(empty)')}</pre></details>`;
-      }).join('')
-    ).join('') + `</div>`;
-  }
-  html += `</div>`;
-  container.innerHTML = html;
-
-  lineChart(cid('disk'), [{ label: 'free MB', color: PAL[0], points: xy(mach, 'disk_free_mb'), fill: true }]);
-  lineChart(cid('mem'), [{ label: 'mem %', color: PAL[2], points: xy(mach, 'mem_used_pct') }, { label: 'swap MB', color: PAL[3], points: xy(mach, 'swap_used_mb') }], { suggestedMax: 100 });
-  lineChart(cid('cpu'), [{ label: 'cpu %', color: PAL[1], points: xy(mach, 'cpu_pct') }, { label: 'steal %', color: PAL[4], points: xy(mach, 'steal_pct') }], { suggestedMax: 100 });
-  lineChart(cid('load'), [{ label: 'load1', color: PAL[5], points: xy(mach, 'load1'), fill: true }]);
-  lineChart(cid('ntp'), [{ label: 'ntp ms', color: PAL[1], points: xy(mach, 'ntp_offset_ms') }], { noZero: true });
-  const dwRss = Object.entries(procByInst).map(([n, rows], i) => { rows.sort((a, b) => a.ts - b.ts);
-    return { label: n.slice(0, 12), color: PAL[i % PAL.length], points: rows.map(r => ({ x: r.ts * 1000, y: r.proc_rss_mb })) }; });
-  lineChart(cid('rss'), dwRss.length ? dwRss : [{ label: 'rss', color: '#3a4452', points: [] }]);
-}
-
-// ---- spell detail drawer (kept for per-instance card clicks) --------
-function closeDrawer(){ document.getElementById('drawer').classList.remove('on'); document.getElementById('scrim').classList.remove('on'); }
-document.getElementById('dwClose').onclick = closeDrawer;
-document.getElementById('scrim').onclick = closeDrawer;
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeDrawer(); });
-
-async function openSpellDrawer(spellId) {
-  const meta = LAST_SPELLS.find(s => s.spell_id === spellId) || {};
-  document.getElementById('dwTitle').textContent = spellId;
-  const stEl = document.getElementById('dwState');
-  stEl.className = 'pill ' + (meta.state === 'recovered' ? 'ok' : meta.state === 'ended' ? 'dim' : 'bad');
-  stEl.textContent = meta.state || '—';
-  document.getElementById('drawer').classList.add('on');
-  document.getElementById('scrim').classList.add('on');
-  await renderSpellDetail(document.getElementById('dwBody'), spellId, 'dw');
-}
-
-function grepArtifact(inp) {
-  const pre = document.getElementById(inp.dataset.tgt); if (!pre) return;
-  const raw = pre.dataset.raw || '';
-  const q = inp.value.trim();
-  if (!q) { pre.innerHTML = esc(raw); return; }
-  const lit = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');   // treat the query as a literal substring
-  let rx; try { rx = new RegExp(lit, 'i'); } catch(e) { return; }
-  const lines = raw.split('\n').filter(l => rx.test(l));
-  const hrx = new RegExp(lit, 'ig');
-  pre.innerHTML = (lines.length ? lines : ['(no match)']).map(l =>
-    esc(l).replace(hrx, m => '<mark>' + esc(m) + '</mark>')
-  ).join('\n');
-}
-
-// ---- per-instance card: current metrics + clickable spell list ------
-function renderCardMetrics(card, name) {
-  const el = card.querySelector('[data-pmet]'); if (!el) return;
-  const m = LAST_PROC_LATEST[name];
-  if (!m) {
-    el.innerHTML = `<span class="lbl">host metrics</span><b>—</b>` +
-      `<span style="color:var(--fg-faint)">(hp process not found, or --no-metrics)</span>`;
-    return;
-  }
-  const age = fmtAge((Date.now()/1000) - m.ts);
-  const rssAlert = m.proc_rss_mb != null && m.proc_rss_mb > 700;
-  el.innerHTML =
-    `<span class="lbl">rss</span><b class="${rssAlert?'alert':''}">${m.proc_rss_mb!=null?Math.round(m.proc_rss_mb)+'MB':'—'}</b>` +
-    `<span class="lbl">open fds</span><b>${m.proc_open_fds!=null?m.proc_open_fds:'—'}</b>` +
-    `<span class="lbl">pid</span><b>${m.proc_pid!=null?m.proc_pid:'—'}</b>` +
-    `<span class="lbl">sampled</span><b>${age} ago</b>`;
-}
-
-function renderCardSpells(card, name) {
-  const el = card.querySelector('[data-spells]'); if (!el) return;
-  const mine = LAST_SPELLS.filter(s => s.instance === name).sort((a,b)=>b.start_ts-a.start_ts);
-  if (!mine.length) {
-    el.innerHTML = `<div class="hdr">error spells · 24h</div><div class="sp noclick">— clean —</div>`;
-    return;
-  }
-  const showAll = !!CARD_SPELLS_ALL[name];
-  const list = showAll ? mine : mine.slice(0, 5);
-  const unresolved = mine.filter(s => s.state === 'active' || s.state === 'potential_fork').length;
-  let html = `<div class="hdr">error spells · 24h — ${mine.length}${unresolved ? ` · <b style="color:var(--bad)">${unresolved} open</b>` : ''} · click → expand</div>`;
-  html += list.map(s => {
-    const cls = s.state==='recovered'?'recovered' : s.state==='active'?'active' : s.state==='potential_fork'?'potentialfork' : 'ended';
-    return `<div class="sp ${cls}" data-sid="${esc(s.spell_id)}" title="${esc(s.state)} · ${esc(s.trigger_tag||'')} · ${esc(new Date(s.start_ts*1000).toLocaleString())}">` +
-      `<span class="st">${esc(s.state)}</span>` +
-      `<span class="tg">${esc(s.trigger_tag||'')}${s.trigger_msg?' · '+esc((s.trigger_msg||'').slice(0,38)):''}</span>` +
-      `<span class="tm">${tsClock(s.start_ts)} · ${fmtAge(s.duration_s)} · cap ${s.captures||0}</span></div>`;
-  }).join('');
-  if (mine.length > 5) html += `<div class="more" data-toggle="1">${showAll ? '▴ fewer' : '▾ +' + (mine.length - 5) + ' more'}</div>`;
-  el.innerHTML = html;
-  el.querySelectorAll('.sp[data-sid]').forEach(d => d.onclick = () => expandSpellRow(d.dataset.sid));
-  const more = el.querySelector('.more[data-toggle]');
-  if (more) more.onclick = () => { CARD_SPELLS_ALL[name] = !CARD_SPELLS_ALL[name]; renderCardSpells(card, name); };
-}
-
-function windowParam() {
-  const raw = document.getElementById('window').value;
-  return raw === 'all' ? 'all' : (+raw || 3600);
-}
-function updateGlobalHint() {
-  const w = document.getElementById('window');
-  const wt = (w.value === 'all') ? 'whole timeline' : (w.selectedOptions[0] ? w.selectedOptions[0].text : w.value);
-  const onlyErr = VISIBLE_TAGS.size === TAGS.filter(t=>t.err).length && [...VISIBLE_TAGS].every(id => (TAG_BY_ID[id]||{}).err);
-  const what = VISIBLE_TAGS.size === 0 ? 'nothing selected' : onlyErr ? 'errors' : (VISIBLE_TAGS.size === TAGS.length ? 'all tags' : VISIBLE_TAGS.size + ' tags');
-  document.getElementById('globalHint').textContent = `all instances · ${what} per ${bucketLabel(LAST_GLOBAL_BUCKETSEC)} · ${wt}`;
-}
-
-async function refresh() {
-  const wp = windowParam();
-  const bucketSec = +document.getElementById('bucket').value || 60;
-
-  const [summary, globalBuckets] = await Promise.all([
-    fetchJSON('/api/summary?window=' + wp + clusterQS()),
-    fetchJSON(`/api/histogram?window=${wp}&bucket=${bucketSec}` + clusterQS()),
-  ]);
-  // populate the host panel + LAST_SPELLS / LAST_PROC_LATEST before rendering cards
-  try { await refreshHost(wp); }
-  catch (e) { document.getElementById('hostMeta').textContent = 'host: ' + e.message; }
-
-  // Main "error events" line chart (default tags = errors; toggle via chips)
-  LAST_GLOBAL_BUCKETS = globalBuckets; LAST_GLOBAL_BUCKETSEC = bucketSec;
-  renderTagChips();
-  renderGlobalChart();
-  updateGlobalHint();
-
-  // Per-instance cards
-  const cards = document.getElementById('cards');
-  if (!summary.length) {
-    cards.innerHTML = '<div class="empty">No Sashimono instances detected yet. ' +
-      'Confirm <code>sashi list</code> works on this VM.</div>';
-    return;
-  }
-
-  const seen = new Set();
-  for (const inst of summary) {
-    seen.add(inst.name);
-    let card = document.getElementById('c-' + inst.name);
-    if (!card) {
-      card = document.createElement('div');
-      card.id = 'c-' + inst.name;
-      card.className = 'card';
-      card.setAttribute('data-card-name', inst.name);
-      card.innerHTML = `
-        <h2>${inst.name}</h2>
-        <div class="sub" data-sub></div>
-        <div class="stats" data-stats></div>
-        <div class="pmet" data-pmet></div>
-        <canvas id="ch-${inst.name}"></canvas>
-        <div class="cspells" data-spells></div>
-        <div class="card-actions" data-card-actions></div>`;
-      cards.appendChild(card);
-    }
-    const actionsEl = card.querySelector('[data-card-actions]');
-    if (actionsEl) actionsEl.innerHTML = renderCardActions(inst.name);
-    bindCardActions(card);
-    card.querySelector('[data-sub]').innerHTML =
-      `<span class="health h-${inst.health}">${inst.health}</span> · sashi: ${inst.sashi_status || '—'}`;
-    const c = inst.counts || {};
-    card.querySelector('[data-stats]').innerHTML = `
-      <span>Last ledger</span><span>${fmtAge(inst.last_ledger_age_s)} ago</span>
-      <span>Last event</span><span>${fmtAge(inst.last_event_age_s)} ago</span>
-      <span>Ledgers</span><span>${c.ledger_created || 0}</span>
-      <span>Consensus loss</span><span>${c.consensus_lost || 0}</span>
-      <span>Fork warnings</span><span>${c.fork_warn || 0}</span>
-      <span>Errors</span><span>${c.error || 0}</span>
-      <span>Uptime est.</span><span>${inst.uptime_pct}%</span>
-      <span>lcl</span><span class="mono">${inst.last_lcl || '—'}</span>
-      <span>state</span><span class="mono">${inst.last_state || '—'}</span>
-      <span>patch</span><span class="mono">${inst.last_patch || '—'}</span>`;
-    renderCardMetrics(card, inst.name);
-    renderCardSpells(card, inst.name);
-
-    const buckets = await fetchJSON(
-      `/api/histogram?window=${wp}&bucket=${bucketSec}&instance=${encodeURIComponent(inst.name)}` + clusterQS());
-    LAST_INST_BUCKETS[inst.name] = buckets;
-    const data = buildBarDatasets(buckets);
-    if (!charts[inst.name]) charts[inst.name] = new Chart(document.getElementById('ch-' + inst.name), { type:'bar', data, options: barOpts() });
-    else { charts[inst.name].data = data; charts[inst.name].update('none'); }
-  }
-  // Drop cards / charts for vanished instances
-  for (const k of Object.keys(charts)) {
-    if (!seen.has(k)) {
-      const el = document.getElementById('c-' + k);
-      if (el) el.remove();
-      try { charts[k].destroy(); } catch(e) {}
-      delete charts[k]; delete LAST_INST_BUCKETS[k];
-    }
-  }
-  document.getElementById('lastUpdate').textContent = 'updated ' + new Date().toLocaleTimeString();
-}
-
-function scheduleRefresh() {
-  if (timer) clearInterval(timer);
-  const ms = +document.getElementById('refresh').value;
-  if (ms > 0) timer = setInterval(refresh, ms);
-}
-
-// ---- cluster picker + filter ----------------------------------------
-let ACTIVE_CLUSTER = (function(){
-  try { const v = localStorage.getItem('sashimon.cluster'); return (v && v !== '__all__') ? v : null; }
-  catch { return null; }
-})();
-let CLUSTERS = [];
-let INSTANCE_CID = {};   // instance name -> contract_id
-let HARD_FORK_CIDS = new Set();
-function instCid(name) { return INSTANCE_CID[name] || null; }
-function instHardForked(name) {
-  const cid = instCid(name);
-  return cid != null && HARD_FORK_CIDS.has(cid);
-}
-
-function clusterQS() { return ACTIVE_CLUSTER ? ('&contract_id=' + encodeURIComponent(ACTIVE_CLUSTER)) : ''; }
-
-function shortCid(id) {
-  if (!id) return '—';
-  if (id === '_unknown') return '(no contract_id)';
-  return id.length > 16 ? id.slice(0,8) + '…' + id.slice(-4) : id;
-}
-function shortHash(s) {
-  if (!s) return '—';
-  return s.length > 14 ? s.slice(0,6) + '…' + s.slice(-4) : s;
-}
-function shortImage(s) {
-  if (!s) return '';
-  return s.replace(/^evernode(?:dev)?\//, '');
-}
-
-function setActiveCluster(cid) {
-  ACTIVE_CLUSTER = cid || null;
-  try { localStorage.setItem('sashimon.cluster', ACTIVE_CLUSTER || ''); } catch {}
-  updateClusterBanner();
-  renderClusters();
-  hardReload();
-}
-
-function updateClusterBanner() {
-  const banner = document.getElementById('clusterBanner');
-  const panel  = document.getElementById('clusterPanel');
-  if (!banner) return;
-  if (!ACTIVE_CLUSTER) {
-    banner.style.display = 'none';
-    if (panel) panel.style.display = '';
-    return;
-  }
-  const c = CLUSTERS.find(x => x.contract_id === ACTIVE_CLUSTER);
-  banner.style.display = '';
-  if (panel) panel.style.display = 'none';
-  document.getElementById('cbId').textContent = ACTIVE_CLUSTER;
-  document.getElementById('cbMeta').textContent = c
-    ? `· ${c.node_count} node${c.node_count===1?'':'s'}${c.images && c.images.length ? ' · ' + shortImage(c.images[0]) : ''}${c.chain_split ? ' · CHAIN SPLIT' : ''}`
-    : '';
-}
-
-async function loadClusters() {
-  try {
-    CLUSTERS = await fetchJSON('/api/clusters');
-    INSTANCE_CID = {};
-    HARD_FORK_CIDS = new Set();
-    for (const c of CLUSTERS) {
-      if (c.hard_forked) HARD_FORK_CIDS.add(c.contract_id);
-      for (const i of (c.instances || [])) INSTANCE_CID[i.name] = c.contract_id;
-    }
-    // If active cluster vanished or is unmonitored, fall back to All.
-    if (ACTIVE_CLUSTER) {
-      const c = CLUSTERS.find(x => x.contract_id === ACTIVE_CLUSTER);
-      if (!c || !c.monitored) ACTIVE_CLUSTER = null;
-    }
-    renderClusters();
-    updateClusterBanner();
-    // Re-render any visible card delete buttons.
-    document.querySelectorAll('[data-card-name]').forEach(card => {
-      const name = card.getAttribute('data-card-name');
-      const a = card.querySelector('[data-card-actions]');
-      if (a) a.innerHTML = renderCardActions(name);
-      bindCardActions(card);
-    });
-  } catch (e) {
-    const host = document.getElementById('clusterList');
-    if (host) host.innerHTML = '<div style="color:var(--bad);font-family:var(--mono);font-size:11px">' + esc(e.message || String(e)) + '</div>';
-  }
-}
-
-function renderClusters() {
-  const host = document.getElementById('clusterList');
-  if (!host) return;
-  if (!CLUSTERS.length) {
-    host.innerHTML = '<div style="color:var(--fg-dim);font-family:var(--mono);font-size:11px">no clusters discovered yet — click <b>discover</b> above</div>';
-    return;
-  }
-  const sorted = CLUSTERS.slice().sort((a,b) =>
-    (Number(b.monitored)-Number(a.monitored)) || (b.node_count-a.node_count)
-    || ((b.last_seen||0)-(a.last_seen||0))
-  );
-  const monNodes = sorted.filter(c=>c.monitored).reduce((a,c)=>a+(c.node_count||0),0);
-  const monCount = sorted.filter(c=>c.monitored).length;
-  let html = '<div class="clist">';
-  html += `<div class="crow all-row${ACTIVE_CLUSTER==null?' act':''}">` +
-    `<div class="info" data-cid="" title="show every monitored cluster">` +
-    `<div class="id-row"><b>All monitored</b><span class="np${monNodes>0?' hot':''}">${monCount} clusters · ${monNodes} nodes</span></div>` +
-    `</div></div>`;
-  for (const c of sorted) {
-    const cls = (c.monitored?'mon ':'') + (ACTIVE_CLUSTER===c.contract_id?'act':'');
-    const tenants = (c.tenants||[]).map(shortHash).join(', ');
-    const images  = (c.images||[]).map(shortImage).join(', ');
-    const seen = c.last_seen ? new Date(c.last_seen*1000).toLocaleString() : '';
-    html += `<div class="crow ${cls}">` +
-      `<label class="tg" data-cid="${esc(c.contract_id)}" title="${c.monitored?'stop monitoring':'start monitoring'}">` +
-        `<input type="checkbox"${c.monitored?' checked':''}><span class="sw"></span></label>` +
-      `<div class="info${c.monitored?'':' dis'}" data-cid="${esc(c.contract_id)}" title="${c.monitored?'scope dashboard to this cluster':'monitor this cluster first'}">` +
-        `<div class="id-row">` +
-          `<span class="cid">${esc(shortCid(c.contract_id))}</span>` +
-          `<span class="np${c.node_count>0?' hot':''}">${c.node_count} node${c.node_count===1?'':'s'}</span>` +
-          (c.chain_split ? `<span class="chain-split-badge" title="two+ instances confirmed on different lcl hashes at the same seq_no">chain split</span>` : '') +
-        `</div>` +
-        `<div class="meta-row">` +
-          (tenants?`<span><b>tenant</b>${esc(tenants)}</span>`:'') +
-          (images?`<span><b>image</b>${esc(images)}</span>`:'') +
-          (seen?`<span><b>seen</b>${esc(seen)}</span>`:'') +
-        `</div>` +
-      `</div></div>`;
-  }
-  html += '</div>';
-  host.innerHTML = html;
-  host.querySelectorAll('.tg input').forEach(inp => {
-    inp.onchange = async (e) => {
-      const cid = inp.closest('.tg').dataset.cid;
-      const want = inp.checked;
-      inp.disabled = true;
-      try {
-        await fetch('/api/clusters/monitor', {
-          method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({contract_id: cid, monitored: want}),
-        });
-        await loadClusters();
-        if (!want && ACTIVE_CLUSTER === cid) setActiveCluster(null);
-        else hardReload();
-      } catch (err) {
-        alert('cluster toggle failed: ' + err.message);
-        inp.checked = !want;
-      } finally { inp.disabled = false; }
-    };
-  });
-  host.querySelectorAll('.info[data-cid]').forEach(el => {
-    el.onclick = () => {
-      const cid = el.dataset.cid;
-      if (cid && el.classList.contains('dis')) return;
-      setActiveCluster(cid || null);
-    };
-  });
-}
-
-document.getElementById('discoverBtn').onclick = async () => {
-  const btn = document.getElementById('discoverBtn');
-  const prev = btn.textContent; btn.textContent = 'discovering…'; btn.disabled = true;
-  try {
-    const r = await fetch('/api/discover_now', { method:'POST' });
-    await r.json().catch(()=>({}));
-    await loadClusters();
-    hardReload();
-  } catch (e) { alert('discover failed: ' + e.message); }
-  btn.textContent = prev; btn.disabled = false;
-};
-document.getElementById('cbClear').onclick = () => setActiveCluster(null);
-
-// ---- modal -------------------------------------------------------------
-function openModal(title, html) {
-  document.getElementById('modalTitle').textContent = title;
-  document.getElementById('modalBody').innerHTML = html;
-  document.getElementById('modal').style.display = 'flex';
-}
-function closeModal() { document.getElementById('modal').style.display = 'none'; }
-document.querySelectorAll('#modal [data-close]').forEach(el => el.onclick = closeModal);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
-
-// ---- per-card actions (Delete on hard-forked clusters) -----------------
-function renderCardActions(name) {
-  if (!instHardForked(name)) return '';
-  const cid = instCid(name);
-  return `<button class="del-btn" data-del="${esc(name)}" title="cluster ${esc(cid || '?')} is hard-forked. evernode delete this node and verify via sashi list.">` +
-         `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>` +
-         `delete instance</button>`;
-}
-function bindCardActions(card) {
-  card.querySelectorAll('[data-del]').forEach(btn => {
-    btn.onclick = (e) => { e.stopPropagation(); confirmDeleteInstance(btn.dataset.del); };
-  });
-}
-function confirmDeleteInstance(name) {
-  const cid = instCid(name);
-  const html =
-    `<div class="row"><b>instance</b><code>${esc(name)}</code></div>` +
-    `<div class="row"><b>cluster</b><code>${esc(cid || '?')}</code></div>` +
-    `<p>This will run <code>evernode delete ${esc(name)}</code> on the host and then ` +
-    `re-run <code>sashi list</code> to confirm. The action is gated by the daemon to ` +
-    `clusters currently in a hard-fork state and cannot be undone.</p>` +
-    `<div class="actions">` +
-      `<button class="cancel" id="dm_cancel">cancel</button>` +
-      `<button class="go" id="dm_go">delete</button>` +
-    `</div>` +
-    `<div class="status-line" id="dm_status"></div>`;
-  openModal('Delete instance', html);
-  document.getElementById('dm_cancel').onclick = closeModal;
-  document.getElementById('dm_go').onclick = async () => {
-    const btn = document.getElementById('dm_go');
-    const stat = document.getElementById('dm_status');
-    btn.disabled = true;
-    document.getElementById('dm_cancel').disabled = true;
-    stat.className = 'status-line'; stat.textContent = 'running evernode delete (this can take a minute)…';
-    try {
-      const r = await fetch('/api/instances/delete', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name}),
-      });
-      const j = await r.json().catch(()=>({}));
-      let cls = j.ok ? 'ok' : 'bad';
-      stat.className = 'status-line ' + cls;
-      stat.textContent = j.ok
-        ? `deleted. exit ${j.exit_code}; sashi list confirms instance gone.`
-        : `failed: ${j.error || ('still present, exit ' + j.exit_code)}`;
-      if (j.transcript) {
-        const pre = document.createElement('pre');
-        pre.textContent = j.transcript;
-        stat.parentElement.appendChild(pre);
-      }
-      if (j.ok) {
-        await loadClusters();
-        hardReload();
-      }
-    } catch (e) {
-      stat.className = 'status-line bad';
-      stat.textContent = 'request failed: ' + e.message;
-    } finally {
-      btn.disabled = false;
-      document.getElementById('dm_cancel').disabled = false;
-    }
-  };
-}
-
-// ---- update sashi.mon -------------------------------------------------
-document.getElementById('updateBtn').onclick = () => {
-  const html =
-    `<p>This re-runs the install one-liner on the host:</p>` +
-    `<pre>curl -fsSL &lt;install-url&gt; | sudo bash</pre>` +
-    `<p>systemd will restart sashimon when the install completes. The dashboard ` +
-    `will reload itself once <code>/healthz</code> answers again (usually ~30–60s).</p>` +
-    `<div class="actions">` +
-      `<button class="cancel" id="up_cancel">cancel</button>` +
-      `<button class="go" id="up_go" style="background:var(--ok-dim);border-color:var(--ok);">update now</button>` +
-    `</div>` +
-    `<div class="status-line" id="up_status"></div>`;
-  openModal('Update sashi.mon', html);
-  document.getElementById('up_cancel').onclick = closeModal;
-  document.getElementById('up_go').onclick = async () => {
-    const go = document.getElementById('up_go');
-    const stat = document.getElementById('up_status');
-    go.disabled = true;
-    document.getElementById('up_cancel').disabled = true;
-    stat.className = 'status-line'; stat.textContent = 'spawning installer…';
-    try {
-      const r = await fetch('/api/self_update', { method: 'POST' });
-      const j = await r.json().catch(()=>({}));
-      if (!j.ok) throw new Error(j.error || ('HTTP ' + r.status));
-      stat.textContent = 'installer running. waiting for service to come back…';
-      // Poll /healthz; expect 1+ failures during restart, then green.
-      let downSeen = false;
-      for (let i = 0; i < 90; i++) {
-        await new Promise(res => setTimeout(res, 2000));
-        try {
-          const h = await fetch('/healthz', {cache:'no-store'});
-          if (h.ok) {
-            if (downSeen) {
-              stat.className = 'status-line ok';
-              stat.textContent = 'service is back. reloading dashboard…';
-              setTimeout(() => location.reload(), 1500);
-              return;
+            d, t, lvl, _mod, msg = m.groups()
+            ts = parse_ts(d, t)
+            self.line_ts = ts
+            if self.frozen_since:
+                self.app.detector.node_unfrozen(self, ts)
+                self.frozen_since = None
+            self._bump(ts, "lines")
+            if lvl == "err":
+                self._bump(ts, "errors")
+            elif lvl == "wrn":
+                self._bump(ts, "warnings")
+            self._parse(ts, lvl, msg)
+
+    def _parse(self, ts, lvl, msg):
+        c0 = msg[:1]
+        if c0 == "*" and "Ledger created" in msg:
+            mm = RE_CREATED.search(msg)
+            if mm:
+                seq, h = int(mm.group(1)), mm.group(2)
+                self.seq, self.hash, self.close_ts = seq, h, ts
+                self._bump(ts, "closes")
+                self._bump(ts, "max_seq", seq)
+                self.app.detector.ledger(self, seq, h, ts)
+            return
+        if msg.startswith(HIGH_VOLUME_PREFIXES):
+            # High-volume debug lines (candidate proposals, waits, stage starts, own proposals): nothing to record.
+            return
+        if msg.startswith("Skipped "):
+            mm = RE_SKIPPED.match(msg)
+            if mm:
+                self._bump(ts, "skipped_rounds", int(mm.group(1)))
+            return
+        if msg.startswith("Vote status: "):
+            mm = RE_VOTE_STATUS.match(msg)
+            if mm:
+                self.vote_status = int(mm.group(1))
+                if self.vote_status == 1:
+                    self._bump(ts, "unreliable")
+            return
+        if msg.startswith("Missed stage"):
+            self._bump(ts, "missed_stage")
+            return
+        if msg.startswith("Cannot close ledger"):
+            mm = RE_WON.search(msg)
+            self._bump(ts, "vote_split")
+            if mm:
+                self.last_votes = "won %s/%s" % mm.groups()
+            return
+        if msg.startswith("Not enough stage 3"):
+            self._bump(ts, "few_votes")
+            return
+        if msg.startswith("Not enough peers proposing"):
+            mm = RE_VOTES.search(msg)
+            self._bump(ts, "consensus_lost")
+            if mm:
+                self.last_votes = "votes %s/%s" % mm.groups()
+            return
+        if msg.startswith("No consensus on last shard hash"):
+            mm = RE_WON.search(msg)
+            self._bump(ts, "shard_split")
+            if mm:
+                self.last_votes = "shard %s/%s" % mm.groups()
+            return
+        if msg.startswith("We are not on the consensus ledger"):
+            self._bump(ts, "desync")
+            return
+        if msg.startswith("Hpfs ldgr sync: Target added") or msg.startswith("Hpfs cont sync: Target added"):
+            self._bump(ts, "sync_target")
+            return
+        if msg.startswith("Proposal queue full") or msg.startswith("Proposal rejected. Maximum proposal count"):
+            self._bump(ts, "queue_full")
+            return
+        if msg.startswith("Ledger closed after waiting"):
+            self._bump(ts, "late_close")
+            return
+        if msg.startswith("Peer proved a closed ledger"):
+            self._bump(ts, "fast_forward")
+            mm = RE_FF.search(msg)
+            self.app.detector.node_event(self, ts, "fast_forward", "info",
+                                         "fast-forward %s -> %s" % ((mm.group(1), mm.group(3)) if mm else ("?", "?")),
+                                         {"line": msg}, dedupe_s=30)
+            return
+        if msg.startswith("Winning proposal was not built"):
+            self._bump(ts, "refused")
+            mm = RE_REFUSED.search(msg)
+            self.app.detector.node_event(self, ts, "refused_close", "warn",
+                                         "refused close (would have forked)%s" % (
+                                             ": ours %s, votes on %s" % (mm.group(1), mm.group(3)) if mm else ""),
+                                         {"line": msg}, dedupe_s=20)
+            return
+        if msg.startswith("Consensus stats"):
+            mm = RE_STATS.search(msg)
+            if mm:
+                data = {k: int(v) for k, v in RE_KV.findall(mm.group(2))}
+                self.stats = dict(data, ts=ts)
+                self.app.store.put("INSERT OR REPLACE INTO stats(node_id, ts, rounds, data) VALUES (?,?,?,?)",
+                                   (self.id, ts, int(mm.group(1)), json.dumps(data)))
+            return
+        if msg.startswith("Contract config updated from patch file"):
+            self.app.detector.node_event(self, ts, "config_patch", "info", "config patch applied (UNL/settings)",
+                                         {"line": msg}, dedupe_s=5)
+            return
+        if msg.startswith("Applying pending patch"):
+            mm = RE_PATCH_SYNC.search(msg)
+            self.app.detector.node_event(self, ts, "patch_after_sync", "info",
+                                         "pending patch applied after sync%s" % (" at %s" % mm.group(1) if mm else ""),
+                                         {"line": msg}, dedupe_s=5)
+            return
+        if msg.startswith("Invalid ledger certificate"):
+            self.app.detector.node_event(self, ts, "invalid_cert", "high", "invalid ledger certificate", {"line": msg},
+                                         dedupe_s=60)
+            return
+        if msg.startswith("Conflicting certified ledgers"):
+            self.app.detector.node_event(self, ts, "conflicting_cert", "critical", msg[:200], {"line": msg}, dedupe_s=60)
+            return
+        if c0 == "H" and msg.startswith("HotPocket "):
+            mm = RE_VERSION.match(msg)
+            if mm:
+                self.version = mm.group(1)
+                self.app.store.put("UPDATE nodes SET version=? WHERE id=?", (self.version, self.id))
+                self.app.detector.node_event(self, ts, "node_start", "info", "HotPocket %s started" % self.version,
+                                             {}, dedupe_s=5)
+            return
+        if msg.startswith("Public key: "):
+            mm = RE_PUBKEY.match(msg)
+            if mm:
+                self.pubkey = mm.group(1)
+                self.app.store.put("UPDATE nodes SET pubkey=? WHERE id=?", (self.pubkey, self.id))
+            return
+        if lvl == "err":
+            self.app.detector.node_event(self, ts, "error", "warn", msg[:200], {"line": msg}, dedupe_s=60)
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            return {
+                "name": self.name, "short": self.short, "host": self.app.host, "contract_id": self.contract_id,
+                "version": self.version, "pubkey": self.pubkey, "image": self.image,
+                "seq": self.seq, "hash": self.hash, "close_ts": self.close_ts, "line_ts": self.line_ts,
+                "read_ts": self.read_ts, "idle_s": round(now - self.read_ts, 1) if self.read_ts else None,
+                "vote_status": VOTE_STATUS_NAMES.get(self.vote_status), "last_votes": self.last_votes,
+                "frozen_since": self.frozen_since, "proc": self.proc, "stats": self.stats,
             }
-          }
-        } catch { downSeen = true; }
-        stat.textContent = `installer running… (~${(i+1)*2}s)`;
-      }
-      stat.className = 'status-line bad';
-      stat.textContent = 'service did not come back within ~180s. check /tmp/sashimon-update.log on the host.';
-    } catch (e) {
-      stat.className = 'status-line bad';
-      stat.textContent = 'update failed: ' + e.message;
-    } finally {
-      go.disabled = false;
-      document.getElementById('up_cancel').disabled = false;
-    }
-  };
-};
 
-loadClusters();
-setInterval(loadClusters, 30000);
-
-// ---- DB tracking policy + db-size badge -----------------------------
-async function loadPolicy() {
-  try {
-    const p = await fetchJSON('/api/policy');
-    const sel = document.getElementById('policy');
-    sel.innerHTML = '';
-    const modes = (p.modes && p.modes.length) ? p.modes : ['balanced','full','minimal'];
-    for (const m of modes) {
-      const o = document.createElement('option');
-      o.value = m; o.textContent = m;
-      sel.appendChild(o);
-    }
-    sel.value = p.mode || 'balanced';
-    sel.disabled = false;
-    sel.onchange = async () => {
-      sel.disabled = true;
-      try {
-        const r = await fetch('/api/policy', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({mode: sel.value}),
-        });
-        const j = await r.json().catch(()=>({}));
-        if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP '+r.status));
-      } catch (e) {
-        alert('Policy save failed: ' + e.message);
-        try { await loadPolicy(); } catch {}
-      } finally { sel.disabled = false; }
-    };
-  } catch (e) { /* leave dropdown disabled */ }
-}
-async function loadDbSize() {
-  try {
-    const s = await fetchJSON('/api/db_size');
-    const el = document.getElementById('dbSize');
-    if (el) el.textContent = '(' + (s.human || '—') + ')';
-  } catch {}
-}
-loadPolicy(); loadDbSize();
-setInterval(loadDbSize, 15000);
-
-document.getElementById('reload').onclick = refresh;
-document.getElementById('export').onclick = () => {
-  const btn = document.getElementById('export');
-  const prev = btn.textContent; btn.textContent = 'building…'; btn.disabled = true;
-  // navigating triggers the download; re-enable after a moment (we can't observe completion of a navigation download)
-  window.location = '/api/report?window=' + windowParam();
-  setTimeout(() => { btn.textContent = prev; btn.disabled = false; }, 4000);
-};
-document.getElementById('clearDb').onclick = async () => {
-  const sz = (document.getElementById('dbSize') || {}).textContent || '';
-  if (!confirm('Wipe ALL stored data ' + sz + ' — log events, host metrics, error spells + their captured artifacts, instances?\\n\\nLive tailing & metric sampling keep running; history just starts fresh. This cannot be undone.')) return;
-  const btn = document.getElementById('clearDb');
-  const prev = btn.innerHTML; btn.textContent = 'clearing…'; btn.disabled = true;
-  try {
-    const r = await fetch('/api/clear', { method: 'POST' });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok || j.ok === false) throw new Error(j.error || ('HTTP ' + r.status));
-    if (j.db_size_human) {
-      const el = document.getElementById('dbSize');
-      if (el) el.textContent = '(' + j.db_size_human + ')';
-    }
-  } catch (e) {
-    alert('Clear failed: ' + e.message);
-    btn.innerHTML = prev; btn.disabled = false; return;
-  }
-  // reset client-side state and rebuild from the now-empty DB
-  OPEN_SPELLS.clear(); SPELL_LIST_KEY = '';
-  LAST_SPELLS = []; LAST_PROC_LATEST = {}; LAST_GLOBAL_BUCKETS = []; LAST_INST_BUCKETS = {};
-  closeDrawer();
-  hardReload();
-  btn.innerHTML = prev; btn.disabled = false;
-  loadDbSize();
-};
-function hardReload() {
-  for (const k of Object.keys(charts)) { try { charts[k].destroy(); } catch(e) {} }
-  charts = {}; LAST_INST_BUCKETS = {};
-  if (globalChart) { try { globalChart.destroy(); } catch(e) {} globalChart = null; }
-  destroyCharts(() => true);                          // host-panel + inline-spell + drawer sparklines
-  document.getElementById('cards').innerHTML = '';
-  document.getElementById('spellRows').innerHTML = '';
-  refresh();
-}
-document.getElementById('window').onchange = hardReload;
-document.getElementById('bucket').onchange = hardReload;
-document.getElementById('refresh').onchange = scheduleRefresh;
-
-renderTagChips();
-refresh().catch(e => {
-  document.getElementById('cards').innerHTML = '<div class="empty">Error: ' + e.message + '</div>';
-});
-scheduleRefresh();
-</script>
-</body>
-</html>
-"""
+    def ring_text(self, since_ts=None):
+        with self.lock:
+            lines = list(self.ring)
+        return "\n".join(lines)
 
 
-def _human_bytes(n: int) -> str:
-    """Compact size — 1.2 MB / 850 KB / 12 B."""
+def find_hpcore_pid(user):
     try:
-        n = int(n)
+        uid = int(subprocess.run(["id", "-u", user], capture_output=True, text=True, timeout=5).stdout.strip())
     except Exception:
-        return "?"
-    units = ("B", "KB", "MB", "GB", "TB")
-    i = 0
-    f = float(n)
-    while f >= 1024.0 and i < len(units) - 1:
-        f /= 1024.0
-        i += 1
-    if i == 0:
-        return f"{int(f)} {units[i]}"
-    return f"{f:.1f} {units[i]}"
+        return None
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            if os.stat("/proc/" + pid).st_uid != uid:
+                continue
+            with open("/proc/%s/cmdline" % pid, "rb") as fh:
+                cmd = fh.read().replace(b"\0", b" ")
+            if b"hpcore run" in cmd:
+                return int(pid)
+        except OSError:
+            continue
+    return None
 
 
-def _parse_window(raw: str | None) -> int:
-    """Returns seconds. 0 means 'all-time'."""
-    if raw is None:
-        return 3600
-    s = raw.strip().lower()
-    if s in ("all", "0", ""):
-        return 0
+def diagnose_proc(user):
+    """Where are the hpcore threads waiting? A thread inside write() to fd 1 means stdout is not being drained."""
+    pid = find_hpcore_pid(user)
+    if not pid:
+        return {"pid": None}
+    threads = []
+    blocked_stdout = False
+    for t in sorted(os.listdir("/proc/%d/task" % pid)):
+        base = "/proc/%d/task/%s/" % (pid, t)
+        try:
+            wchan = open(base + "wchan").read().strip()
+            sysc = open(base + "syscall").read().split()
+            state = [l for l in open(base + "status") if l.startswith("State:")][0].split()[1]
+        except OSError:
+            continue
+        nr = sysc[0] if sysc else ""
+        arg0 = sysc[1] if len(sysc) > 1 else ""
+        if nr == "1" and arg0 in ("0x1", "0x2"):
+            blocked_stdout = True
+        threads.append({"tid": int(t), "state": state, "wchan": wchan, "syscall": nr, "arg0": arg0})
     try:
-        return max(0, int(s))
-    except ValueError:
-        return 3600
+        stdout = os.readlink("/proc/%d/fd/1" % pid)
+    except OSError:
+        stdout = None
+    return {"pid": pid, "stdout": stdout, "blocked_in_stdout_write": blocked_stdout, "threads": threads}
 
 
-def make_handler(store: Store, static_html_path: str | None,
-                 roundtime_ms: int = DEFAULT_ROUNDTIME_MS,
-                 metrics: "MetricsCollector | None" = None,
-                 spell_manager: "SpellManager | None" = None,
-                 sashi_bin: str = "sashi",
-                 report_peers: list | None = None,
-                 policy: "PolicyManager | None" = None,
-                 discoverer: "Discoverer | None" = None,
-                 evernode_bin: str = "evernode",
-                 install_url: str = "https://raw.githubusercontent.com/du1ana/sashi-monitor/main/install.sh"):
-    hostname = socket.gethostname()
+# ---------------------------------------------------------------------------------------------------------
+# Incident detection (node-level from log lines, cluster-level from the merged multi-host view)
+# ---------------------------------------------------------------------------------------------------------
 
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_args) -> None:  # silence default logger
+class Detector:
+    def __init__(self, app):
+        self.app = app
+        self.lock = threading.Lock()
+        self.recent = {}          # (cluster_id, seq) -> {hash: set(names)} for local nodes, last ~512 seqs
+        self.open = {}            # (cluster_id, kind, key) -> incident id
+        self.last_event = {}      # (node name, kind) -> ts
+        self.cluster_state = {}   # contract_id -> {"max_seq", "advance_ts"}
+
+    # -- local ledgers
+    def ledger(self, node, seq, h, ts):
+        with self.lock:
+            hashes = self.recent.setdefault((node.cluster_id, seq), {})
+            hashes.setdefault(h, set()).add(node.short)
+            if len(self.recent) > 4096:
+                for k in sorted(self.recent)[:1024]:
+                    del self.recent[k]
+            nodes = ",".join(sorted(hashes[h]))
+        self.app.store.put(
+            "INSERT INTO ledgers(cluster_id, seq, hash, nodes, first_ts, last_ts) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(cluster_id, seq, hash) DO UPDATE SET nodes=excluded.nodes, last_ts=excluded.last_ts",
+            (node.cluster_id, seq, h, nodes, ts, ts))
+
+    def local_recent(self, cluster_id, min_seq):
+        with self.lock:
+            return {seq: {h: sorted(n) for h, n in v.items()}
+                    for (cid, seq), v in self.recent.items() if cid == cluster_id and seq >= min_seq}
+
+    # -- node events
+    def node_event(self, node, ts, kind, severity, summary, detail, dedupe_s=0):
+        key = (node.name, kind)
+        last = self.last_event.get(key)
+        if last and ts - last < dedupe_s:
+            return None
+        self.last_event[key] = ts
+        iid = self.app.store.insert_incident(node.cluster_id, node.id, kind, severity, ts, summary, detail)
+        self.app.store.put("UPDATE incidents SET end_ts=? WHERE id=?", (ts, iid))
+        if severity in ("high", "critical", "warn") and kind != "error":
+            self.capture(iid, node.cluster_id, [node])
+        return iid
+
+    def node_unfrozen(self, node, ts):
+        k = (node.cluster_id, "freeze", node.name)
+        iid = self.open.pop(k, None)
+        if iid:
+            self.app.store.put("UPDATE incidents SET end_ts=? WHERE id=?", (ts, iid))
+
+    # -- cluster incidents (open/close)
+    def _open(self, cluster_id, kind, key, severity, summary, detail, node_id=None, capture_nodes=None):
+        k = (cluster_id, kind, key)
+        if k in self.open:
+            return self.open[k]
+        iid = self.app.store.insert_incident(cluster_id, node_id, kind, severity, time.time(), summary, detail)
+        self.open[k] = iid
+        if capture_nodes:
+            self.capture(iid, cluster_id, capture_nodes)
+        return iid
+
+    def _close(self, cluster_id, kind, key):
+        iid = self.open.pop((cluster_id, kind, key), None)
+        if iid:
+            self.app.store.put("UPDATE incidents SET end_ts=? WHERE id=?", (time.time(), iid))
+
+    def capture(self, iid, cluster_id, nodes):
+        now = time.time()
+        for n in nodes:
+            text = n.ring_text()
+            if text:
+                self.app.store.put("INSERT INTO captures(incident_id, node_id, ts, kind, data) VALUES (?,?,?,?,?)",
+                                   (iid, n.id, now, "log", zlib.compress(text.encode(), 6)))
+
+    # -- periodic evaluation over the merged (all hosts) view
+    def evaluate(self):
+        app = self.app
+        now = time.time()
+        local = app.local_nodes()
+        merged = app.merged_nodes()
+        by_cluster = collections.defaultdict(list)
+        for n in merged:
+            by_cluster[n["contract_id"]].append(n)
+
+        # Frozen local nodes: hpcore process alive but no log line for a while.
+        for node in local:
+            idle = now - node.read_ts if node.read_ts else None
+            if idle is not None and idle > app.freeze_s and not node.frozen_since:
+                node.frozen_since = node.line_ts or node.read_ts
+                node.proc = diagnose_proc(node.user) if node.user else None
+                blocked = bool(node.proc and node.proc.get("blocked_in_stdout_write"))
+                iid = self._open(node.cluster_id, "freeze", node.name, "high",
+                                 "node %s silent for %ds%s" % (node.short, idle,
+                                                              " - blocked writing stdout" if blocked else ""),
+                                 {"node": node.name, "proc": node.proc}, node_id=node.id, capture_nodes=[node])
+                if node.proc:
+                    app.store.put("INSERT INTO captures(incident_id, node_id, ts, kind, data) VALUES (?,?,?,?,?)",
+                                  (iid, node.id, now, "proc", zlib.compress(json.dumps(node.proc).encode())))
+            if node.frozen_since:
+                with node.lock:
+                    node._bump(now, "frozen_s", 5)
+
+        # Clusters that no longer have any live node: close whatever is still open for them.
+        live_cids = {app.store.cluster_id(c) for c in by_cluster}
+        for (cid, kind, key) in list(self.open):
+            if cid not in live_cids:
+                self._close(cid, kind, key)
+
+        for contract_id, nodes in by_cluster.items():
+            cid = app.store.cluster_id(contract_id)
+            local_cluster_nodes = [n for n in local if n.contract_id == contract_id]
+            alive = [n for n in nodes if n.get("idle_s") is not None and n["idle_s"] < app.freeze_s]
+            seqs = [n["seq"] for n in nodes if n.get("seq") is not None]
+            if not seqs:
+                continue
+            max_seq = max(seqs)
+            st = self.cluster_state.setdefault(contract_id, {"max_seq": max_seq, "advance_ts": now})
+            if max_seq > st["max_seq"]:
+                st["max_seq"], st["advance_ts"] = max_seq, now
+
+            # Stall: nobody closed a ledger for stall_s.
+            stalled_for = now - st["advance_ts"]
+            if stalled_for > app.stall_s:
+                self._open(cid, "stall", "", "critical",
+                           "no ledger closed for %ds (stuck at %d)" % (stalled_for, max_seq),
+                           {"max_seq": max_seq, "heights": {n["short"]: n.get("seq") for n in nodes},
+                            "votes": {n["short"]: n.get("last_votes") for n in nodes}},
+                           capture_nodes=local_cluster_nodes)
+            else:
+                self._close(cid, "stall", "")
+
+            # Height split: live nodes more than split_seq ledgers behind the leader.
+            behind = sorted(n["short"] for n in alive if n.get("seq") is not None and max_seq - n["seq"] > app.split_seq)
+            if behind:
+                self._open(cid, "height_split", "", "high",
+                           "%d node(s) more than %d ledgers behind %d" % (len(behind), app.split_seq, max_seq),
+                           {"max_seq": max_seq, "behind": behind,
+                            "heights": {n["short"]: n.get("seq") for n in nodes}},
+                           capture_nodes=[n for n in local_cluster_nodes if n.short in behind])
+            else:
+                self._close(cid, "height_split", "")
+
+            # Forks: the same ledger number with different hashes (across all hosts).
+            for seq, hashes in app.merged_recent(contract_id, max_seq - 256).items():
+                if len(hashes) > 1:
+                    key = str(seq)
+                    if (cid, "fork", key) not in self.open:
+                        self._open(cid, "fork", key, "critical",
+                                   "fork at ledger %d: %s" % (seq, " vs ".join(
+                                       "%s(%d)" % (h, len(ns)) for h, ns in hashes.items())),
+                                   {"seq": seq, "hashes": hashes}, capture_nodes=local_cluster_nodes)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Host metrics
+# ---------------------------------------------------------------------------------------------------------
+
+class HostMetrics:
+    def __init__(self, app):
+        self.app = app
+        self.prev = None
+        self.prev_self = None
+        self.now = {}
+        self.acc = []
+
+    def _cpu(self):
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        return sum(v), v[3] + v[4], v[4]
+
+    def sample(self):
+        try:
+            total, idle, iowait = self._cpu()
+            selfcpu = sum(os.times()[:2])
+            cpu = io = sc = None
+            if self.prev:
+                dt = total - self.prev[0]
+                if dt > 0:
+                    cpu = 100.0 * (1 - (idle - self.prev[1]) / dt)
+                    io = 100.0 * (iowait - self.prev[2]) / dt
+            if self.prev_self is not None and self.prev:
+                ncpu = os.cpu_count() or 1
+                wall = (total - self.prev[0]) / ncpu / (os.sysconf("SC_CLK_TCK") or 100)
+                if wall > 0:
+                    sc = 100.0 * (selfcpu - self.prev_self) / wall
+            self.prev = (total, idle, iowait)
+            self.prev_self = selfcpu
+            mem = {}
+            with open("/proc/meminfo") as f:
+                for l in f:
+                    k, v = l.split(":", 1)
+                    mem[k] = int(v.split()[0])
+            mem_pct = 100.0 * (1 - mem["MemAvailable"] / mem["MemTotal"])
+            swap_mb = (mem["SwapTotal"] - mem["SwapFree"]) / 1024
+            du = shutil.disk_usage("/")
+            self.now = {
+                "ts": time.time(), "load": os.getloadavg(), "cpus": os.cpu_count(), "cpu": cpu, "iowait": io,
+                "mem_pct": mem_pct, "swap_mb": swap_mb, "disk_free_mb": du.free / 1048576,
+                "disk_pct": 100.0 * du.used / du.total, "sashimon_cpu": sc,
+                "db_mb": self.app.store.size_bytes() / 1048576, "db_queue_dropped": self.app.store.dropped,
+            }
+            self.acc.append(self.now)
+            minute = int(time.time() // 60)
+            if len(self.acc) >= 6 or (self.acc and int(self.acc[0]["ts"] // 60) != minute):
+                a = self.acc
+                avg = lambda k: (sum(x[k] for x in a if x.get(k) is not None) /
+                                 max(1, sum(1 for x in a if x.get(k) is not None)))
+                self.app.store.put(
+                    "INSERT OR REPLACE INTO host_minutes(minute, load1, cpu, iowait, mem_pct, swap_mb, disk_free_mb, "
+                    "sashimon_cpu) VALUES (?,?,?,?,?,?,?,?)",
+                    (int(a[0]["ts"] // 60), sum(x["load"][0] for x in a) / len(a), avg("cpu"), avg("iowait"),
+                     avg("mem_pct"), avg("swap_mb"), avg("disk_free_mb"), avg("sashimon_cpu")))
+                self.acc = []
+        except Exception:
+            traceback.print_exc()
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Application: discovery, peers, loops
+# ---------------------------------------------------------------------------------------------------------
+
+class App:
+    def __init__(self, args):
+        self.args = args
+        self.host = args.host_label or socket.gethostname()
+        self.ring_lines = args.ring_lines
+        self.freeze_s = args.freeze_seconds
+        self.stall_s = args.stall_seconds
+        self.split_seq = args.split_ledgers
+        self.store = Store(args.db, args.max_db_mb, args.retention_hours)
+        self.detector = Detector(self)
+        self.metrics = HostMetrics(self)
+        self.nodes = {}               # name -> Node
+        self.nodes_lock = threading.Lock()
+        self.peers = {p.rstrip("/"): {"url": p.rstrip("/"), "ok": False, "error": None, "data": None, "ts": None}
+                      for p in args.peer}
+        self.peer_ctx = ssl.create_default_context()
+        self.peer_ctx.check_hostname = False
+        self.peer_ctx.verify_mode = ssl.CERT_NONE
+        self.started = time.time()
+
+    # -- discovery
+    def discover(self):
+        found = []
+        if self.args.instances_dir:
+            pattern = self.args.instances_dir
+            if not any(ch in pattern for ch in "*?["):
+                pattern = os.path.join(pattern, "*")
+            for d in sorted(glob.glob(pattern)):
+                cfg = os.path.join(d, "cfg", "hp.cfg")
+                if not os.path.exists(cfg):
+                    continue
+                try:
+                    contract_id = json.load(open(cfg))["contract"]["id"]
+                except Exception:
+                    continue
+                found.append({"name": os.path.basename(d).upper(), "dir": d, "user": None,
+                              "contract_id": contract_id, "image": "local"})
+        else:
+            try:
+                out = subprocess.run([self.args.sashi, "list"], capture_output=True, text=True, timeout=30).stdout
+                for i in json.loads(out or "[]"):
+                    if i.get("status") != "running":
+                        continue
+                    d = "/home/%s/%s" % (i["user"], i["name"])
+                    found.append({"name": i["name"], "dir": d, "user": i["user"],
+                                  "contract_id": i.get("contract_id", "?"), "image": i.get("image", "")})
+            except Exception:
+                traceback.print_exc()
+                return
+        names = set()
+        for i in found:
+            log_dir = os.path.join(i["dir"], "log")
+            if not os.path.isdir(log_dir):
+                continue
+            names.add(i["name"])
+            self.store.put("UPDATE clusters SET last_seen=? WHERE contract_id=?", (time.time(), i["contract_id"]))
+            with self.nodes_lock:
+                if i["name"] not in self.nodes:
+                    self.nodes[i["name"]] = Node(self, i["name"], i["contract_id"], i["user"], log_dir, i["image"],
+                                                 os.path.join(i["dir"], "cfg", "hp.cfg"))
+        with self.nodes_lock:
+            for name in list(self.nodes):
+                if name not in names:
+                    n = self.nodes.pop(name)
+                    n.stop.set()
+                    with n.lock:
+                        n._flush()
+
+    def local_nodes(self):
+        with self.nodes_lock:
+            return list(self.nodes.values())
+
+    # -- federation
+    def live(self):
+        nodes = [n.snapshot() for n in self.local_nodes()]
+        recent = {}
+        for n in self.local_nodes():
+            if n.contract_id not in recent and n.seq is not None:
+                recent[n.contract_id] = {str(k): v for k, v in
+                                         self.detector.local_recent(n.cluster_id, n.seq - 256).items()}
+        return {"host": self.host, "version": VERSION, "ts": time.time(), "nodes": nodes, "recent": recent,
+                "metrics": self.metrics.now}
+
+    def poll_peers(self):
+        for p in self.peers.values():
+            try:
+                req = urllib.request.Request(p["url"] + "/api/local/live", headers={"User-Agent": "sashimon"})
+                with urllib.request.urlopen(req, timeout=8, context=self.peer_ctx) as r:
+                    p["data"] = json.loads(r.read().decode())
+                p["ok"], p["error"], p["ts"] = True, None, time.time()
+            except Exception as e:
+                p["ok"], p["error"] = False, str(e)[:200]
+
+    def peer_get(self, url_path):
+        out = []
+        for p in self.peers.values():
+            try:
+                with urllib.request.urlopen(p["url"] + url_path, timeout=10, context=self.peer_ctx) as r:
+                    out.append(json.loads(r.read().decode()))
+            except Exception as e:
+                out.append({"host": p["url"], "error": str(e)[:200]})
+        return out
+
+    def merged_nodes(self):
+        nodes = [n.snapshot() for n in self.local_nodes()]
+        for p in self.peers.values():
+            d = p.get("data")
+            if d and p["ts"] and time.time() - p["ts"] < PEER_STALE_S:
+                age = time.time() - d["ts"]
+                for n in d["nodes"]:
+                    n = dict(n)
+                    if n.get("idle_s") is not None:
+                        n["idle_s"] = n["idle_s"] + age
+                    nodes.append(n)
+        return nodes
+
+    def merged_recent(self, contract_id, min_seq):
+        out = collections.defaultdict(lambda: collections.defaultdict(set))
+        cid = self.store.cluster_id(contract_id)
+        for seq, hashes in self.detector.local_recent(cid, min_seq).items():
+            for h, ns in hashes.items():
+                out[seq][h].update(ns)
+        for p in self.peers.values():
+            d = p.get("data")
+            if d and p["ts"] and time.time() - p["ts"] < PEER_STALE_S:
+                for seq, hashes in (d.get("recent") or {}).get(contract_id, {}).items():
+                    if int(seq) >= min_seq:
+                        for h, ns in hashes.items():
+                            out[int(seq)][h].update(ns)
+        return {s: {h: sorted(n) for h, n in hs.items()} for s, hs in out.items()}
+
+    # -- loops
+    def run_loops(self):
+        def loop(fn, interval, name):
+            def run():
+                while True:
+                    try:
+                        fn()
+                    except Exception:
+                        traceback.print_exc()
+                    time.sleep(interval)
+            threading.Thread(target=run, name=name, daemon=True).start()
+
+        loop(self.discover, 15, "discover")
+        loop(self.metrics.sample, 10, "metrics")
+        if self.peers:
+            loop(self.poll_peers, 5, "peers")
+        loop(self.detector.evaluate, 5, "detect")
+        loop(lambda: [n._flush() for n in self.local_nodes()], 20, "flush")
+        loop(self.store.maintain, 1800, "maintain")
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Queries for the API
+# ---------------------------------------------------------------------------------------------------------
+
+def q_history(app, contract_id, since, until):
+    """This host's stored history for one cluster (also served to peers)."""
+    c = app.store.reader()
+    try:
+        row = c.execute("SELECT id FROM clusters WHERE contract_id=?", (contract_id,)).fetchone()
+        if not row:
+            return {"host": app.host, "nodes": [], "minutes": [], "incidents": [], "ledgers": [], "stats": []}
+        cid = row[0]
+        nodes = [dict(r) for r in c.execute(
+            "SELECT id, name, short, host, pubkey, version, image FROM nodes WHERE cluster_id=?", (cid,))]
+        ids = {n["id"]: n["short"] for n in nodes}
+        minutes = [dict(r, node=ids.get(r["node_id"])) for r in c.execute(
+            "SELECT * FROM node_minutes WHERE minute BETWEEN ? AND ? AND node_id IN (SELECT id FROM nodes WHERE "
+            "cluster_id=?) ORDER BY minute", (int(since // 60), int(until // 60), cid))]
+        incidents = [dict(r, node=ids.get(r["node_id"]), host=app.host,
+                          detail=json.loads(r["detail"] or "{}"),
+                          captures=[x[0] for x in c.execute(
+                              "SELECT kind FROM captures WHERE incident_id=?", (r["id"],))])
+                     for r in c.execute(
+                         "SELECT * FROM incidents WHERE cluster_id=? AND (start_ts BETWEEN ? AND ? OR end_ts IS NULL) "
+                         "ORDER BY start_ts DESC LIMIT 500", (cid, since, until))]
+        ledgers = [dict(r) for r in c.execute(
+            "SELECT seq, hash, nodes, first_ts, last_ts FROM ledgers WHERE cluster_id=? AND last_ts BETWEEN ? AND ? "
+            "ORDER BY seq DESC LIMIT 400", (cid, since, until))]
+        stats = [dict(r, node=ids.get(r["node_id"]), data=json.loads(r["data"])) for r in c.execute(
+            "SELECT * FROM stats WHERE ts BETWEEN ? AND ? AND node_id IN (SELECT id FROM nodes WHERE cluster_id=?) "
+            "ORDER BY ts", (since, until, cid))]
+        host = [dict(r) for r in c.execute(
+            "SELECT * FROM host_minutes WHERE minute BETWEEN ? AND ? ORDER BY minute",
+            (int(since // 60), int(until // 60)))]
+        for n in nodes:
+            n["host"] = app.host
+        return {"host": app.host, "nodes": nodes, "minutes": minutes, "incidents": incidents, "ledgers": ledgers,
+                "stats": stats, "host_minutes": host}
+    finally:
+        c.close()
+
+
+def q_incident(app, iid):
+    c = app.store.reader()
+    try:
+        r = c.execute("SELECT * FROM incidents WHERE id=?", (iid,)).fetchone()
+        if not r:
+            return None
+        names = {x[0]: x[1] for x in c.execute("SELECT id, short FROM nodes")}
+        caps = []
+        for cap in c.execute("SELECT node_id, ts, kind, data FROM captures WHERE incident_id=?", (iid,)):
+            text = zlib.decompress(cap["data"]).decode("utf-8", "replace")
+            caps.append({"node": names.get(cap["node_id"]), "ts": cap["ts"], "kind": cap["kind"],
+                         "text": text if cap["kind"] == "log" else None,
+                         "json": json.loads(text) if cap["kind"] == "proc" else None})
+        d = dict(r)
+        d["detail"] = json.loads(d["detail"] or "{}")
+        d["node"] = names.get(d["node_id"])
+        d["host"] = app.host
+        d["captures"] = caps
+        return d
+    finally:
+        c.close()
+
+
+def q_clusters(app):
+    c = app.store.reader()
+    try:
+        return {r["contract_id"]: dict(r) for r in c.execute("SELECT * FROM clusters")}
+    finally:
+        c.close()
+
+
+# ---------------------------------------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------------------------------------
+
+def make_handler(app, dashboard_path):
+    class H(BaseHTTPRequestHandler):
+        server_version = "sashimon/" + VERSION
+
+        def log_message(self, *a):
             pass
 
-        def _send(self, code: int, body: bytes, ctype: str, extra_headers: dict | None = None) -> None:
+        def _send(self, code, body, ctype):
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, obj, code=200):
+            self._send(code, json.dumps(obj, default=str), "application/json")
+
+        def do_GET(self):
             try:
-                self.send_response(code)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
-                for k, v in (extra_headers or {}).items():
-                    self.send_header(k, v)
-                self.end_headers()
-                self.wfile.write(body)
-            except (ssl.SSLEOFError, ssl.SSLError, ConnectionResetError,
-                    ConnectionAbortedError, BrokenPipeError, TimeoutError):
-                # Client went away mid-response — common for long-polled
-                # dashboards over flaky links. Don't log; not actionable.
-                pass
-
-        def _json(self, obj, code: int = 200) -> None:
-            self._send(code, json.dumps(obj).encode("utf-8"),
-                       "application/json; charset=utf-8")
-
-        def _serve_dashboard(self) -> None:
-            html: bytes
-            if static_html_path:
-                try:
-                    with open(static_html_path, "rb") as f:
-                        html = f.read()
-                except OSError:
-                    html = DASHBOARD_HTML.encode("utf-8")
-            else:
-                html = DASHBOARD_HTML.encode("utf-8")
-            self._send(200, html, "text/html; charset=utf-8")
-
-        def do_GET(self) -> None:  # noqa: N802
-            u = urlparse(self.path)
-            qs = parse_qs(u.query)
-
-            if u.path in ("/", "/index.html"):
-                self._serve_dashboard()
-                return
-
-            if u.path == "/api/instances":
-                self._json(store.list_instances())
-                return
-
-            if u.path == "/api/clusters":
-                self._json(store.list_clusters())
-                return
-
-            if u.path == "/api/summary":
-                w = _parse_window(qs.get("window", [None])[0])
-                cid = qs.get("contract_id", [None])[0]
-                self._json(store.summary(w, roundtime_ms, contract_id=cid))
-                return
-
-            if u.path == "/api/events":
-                inst = qs.get("instance", [None])[0]
-                since = float(qs["since"][0]) if "since" in qs else None
-                until = float(qs["until"][0]) if "until" in qs else None
-                tag = qs.get("tag", [None])[0]
-                limit = int(qs.get("limit", ["2000"])[0])
-                cid = qs.get("contract_id", [None])[0]
-                self._json(store.events_window(inst, since, until, tag, limit,
-                                               contract_id=cid))
-                return
-
-            if u.path == "/api/histogram":
-                inst = qs.get("instance", [None])[0]
-                window = _parse_window(qs.get("window", [None])[0])
-                bucket = int(qs.get("bucket", ["60"])[0])
-                cid = qs.get("contract_id", [None])[0]
-                until = time.time()
-                if window <= 0:
-                    earliest = store.earliest_event_ts(inst)
-                    since = earliest if earliest is not None else until - 60
-                else:
-                    since = until - window
-                self._json(store.histogram(inst, since, until, bucket,
-                                           contract_id=cid))
-                return
-
-            if u.path == "/api/spells":
-                inst = qs.get("instance", [None])[0]
-                window = _parse_window(qs.get("window", [None])[0])
-                until = time.time()
-                if window <= 0:
-                    earliest = store.earliest_event_ts(inst)
-                    since = earliest if earliest is not None else until - 60
-                else:
-                    since = until - window
-                tags_raw = qs.get("tags", [None])[0]
-                tags: tuple[str, ...]
-                if tags_raw:
-                    tags = tuple(t for t in tags_raw.split(",") if t)
-                else:
-                    tags = ("consensus_lost", "fork_warn", "out_of_sync",
-                            "error", "warning")
-                try:
-                    max_gap = float(qs.get("max_gap", ["10"])[0])
-                except ValueError:
-                    max_gap = 10.0
-                try:
-                    min_count = int(qs.get("min_count", ["1"])[0])
-                except ValueError:
-                    min_count = 1
-                self._json(store.spells(
-                    instance=inst, since=since, until=until,
-                    tags=tags, max_gap=max_gap, min_count=min_count,
-                ))
-                return
-
-            if u.path == "/api/host_metrics":
-                inst = qs.get("instance", [None])[0]
-                window = _parse_window(qs.get("window", [None])[0])
-                until = time.time()
-                if window <= 0:
-                    since = until - 3600.0
-                else:
-                    since = until - window
-                limit = int(qs.get("limit", ["20000"])[0])
-                self._json(store.host_metrics_window(inst, since, until, limit))
-                return
-
-            if u.path == "/api/metrics_now":
-                # Take an out-of-band sample and return the latest machine row.
-                if metrics is not None:
-                    metrics.sample_now()
-                self._json(store.latest_host_metric() or {})
-                return
-
-            if u.path == "/api/spells_log":
-                inst = qs.get("instance", [None])[0]
-                window = _parse_window(qs.get("window", [None])[0])
-                cid = qs.get("contract_id", [None])[0]
-                until = time.time()
-                since = (until - 86400.0) if window <= 0 else (until - window)
-                limit = int(qs.get("limit", ["500"])[0])
-                self._json(store.spells_log_window(since, until, inst, limit,
-                                                   contract_id=cid))
-                return
-
-            if u.path == "/api/spell_artifacts":
-                sid = qs.get("spell_id", [None])[0]
-                if not sid:
-                    self._json({"error": "spell_id required"}, code=400)
-                    return
-                self._json(store.spell_artifacts(sid))
-                return
-
-            if u.path == "/api/open_spells":
-                self._json(store.open_spells())
-                return
-
-            if u.path == "/api/proposal_votes":
-                inst = qs.get("instance", [None])[0]
-                root_hash = qs.get("root_hash", [None])[0]
-                limit = int(qs.get("limit", ["5000"])[0])
-                if "since" in qs:
-                    # Absolute window (e.g. a spell's start_ts-90 .. end_ts+90),
-                    # same convention as /api/events.
-                    since = float(qs["since"][0])
-                    until = float(qs["until"][0]) if "until" in qs else time.time()
-                else:
-                    window = _parse_window(qs.get("window", [None])[0])
-                    until = time.time()
-                    since = (until - 3600.0) if window <= 0 else (until - window)
-                self._json(store.proposal_votes_window(
-                    since, until, instance=inst, root_hash=root_hash, limit=limit))
-                return
-
-            if u.path == "/api/fork_events":
-                cid = qs.get("contract_id", [None])[0]
-                window = _parse_window(qs.get("window", [None])[0])
-                until = time.time()
-                since = (until - 86400.0) if window <= 0 else (until - window)
-                limit = int(qs.get("limit", ["500"])[0])
-                self._json(store.fork_events_window(
-                    since, until, contract_id=cid, limit=limit))
-                return
-
-            if u.path == "/api/report":
-                window = _parse_window(qs.get("window", ["all"])[0])
-                self_only = qs.get("self", ["0"])[0] in ("1", "true", "yes")
-                try:
-                    text = build_report(
-                        store, window, sashi_bin, hostname,
-                        report_peers=(None if self_only else report_peers),
-                        include_peers=not self_only,
-                        roundtime_ms=roundtime_ms,
-                    )
-                except Exception as e:
-                    text = f"REPORT GENERATION FAILED on {hostname}: {e!r}\n"
-                fname = f"sashimon-report-{hostname}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.txt"
-                self._send(200, text.encode("utf-8"), "text/plain; charset=utf-8",
-                           {"Content-Disposition": f'attachment; filename="{fname}"'})
-                return
-
-            if u.path == "/api/db_size":
-                size = store.db_size_bytes()
-                self._json({
-                    "bytes": size,
-                    "human": _human_bytes(size),
-                    "path":  store.path,
-                })
-                return
-
-            if u.path == "/api/policy":
-                self._json({
-                    "mode":        policy.mode() if policy else DEFAULT_POLICY_MODE,
-                    "modes":       sorted(POLICY_MODES.keys()),
-                    "severity":    TAG_SEVERITY,
-                    "always_track": sorted(ALWAYS_TRACK_TAGS),
-                    "actions":     POLICY_MODES,
-                })
-                return
-
-            if u.path == "/healthz":
-                self._json({"ok": True})
-                return
-
-            self._send(404, b"not found", "text/plain")
-
-        def do_POST(self) -> None:  # noqa: N802
-            u = urlparse(self.path)
-
-            if u.path == "/api/clusters/monitor":
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length > 0 else b""
-                try:
-                    body = json.loads(raw.decode("utf-8") or "{}")
-                except Exception:
-                    self._json({"ok": False, "error": "bad json body"}, code=400)
-                    return
-                # Accept either { contract_id, monitored } or { contract_ids:[...], monitored }
-                cids = body.get("contract_ids")
-                if not cids:
-                    cid = body.get("contract_id")
-                    cids = [cid] if cid else []
-                if not cids:
-                    self._json({"ok": False, "error": "no contract_id(s)"}, code=400)
-                    return
-                monitored = bool(body.get("monitored", True))
-                for cid in cids:
-                    if not isinstance(cid, str):
-                        continue
-                    store.upsert_cluster(cid)
-                    store.set_cluster_monitored(cid, monitored)
-                # Trigger an immediate discover pass so tails spawn/reap now.
-                if discoverer is not None:
-                    discoverer.trigger()
-                self._json({"ok": True, "monitored": monitored,
-                            "contract_ids": cids})
-                return
-
-            if u.path == "/api/instances/delete":
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = self.rfile.read(length) if length > 0 else b""
-                try:
-                    body = json.loads(raw.decode("utf-8") or "{}")
-                except Exception:
-                    self._json({"ok": False, "error": "bad json body"}, code=400)
-                    return
-                name = (body.get("name") or "").strip()
-                if not name or not re.fullmatch(r"[A-Za-z0-9_\-]{4,80}", name):
-                    self._json({"ok": False, "error": "invalid instance name"},
-                               code=400)
-                    return
-                cid = store.cluster_for_instance(name)
-                if cid is None:
-                    self._json({"ok": False, "error": "instance not known to monitor"},
-                               code=404)
-                    return
-                # Destructive: only when the instance's cluster is hard-forked.
-                if cid not in store.hard_forked_clusters():
-                    self._json({"ok": False,
-                                "error": "delete is gated to hard-forked "
-                                         "clusters; this cluster is not in "
-                                         "that state"},
-                               code=403)
-                    return
-                # Run evernode delete (capture both streams).
-                try:
-                    cp = subprocess.run(
-                        [evernode_bin, "delete", name],
-                        capture_output=True, text=True, timeout=180, check=False,
-                    )
-                except FileNotFoundError:
-                    self._json({"ok": False,
-                                "error": f"'{evernode_bin}' not found in PATH"},
-                               code=500)
-                    return
-                except subprocess.TimeoutExpired:
-                    self._json({"ok": False,
-                                "error": "evernode delete timed out after 180s"},
-                               code=504)
-                    return
-                transcript = (cp.stdout or "") + (("\n" + cp.stderr) if cp.stderr else "")
-                # Verify via sashi list.
-                still_present = True
-                list_err = None
-                try:
-                    out = subprocess.check_output(
-                        [sashi_bin, "list"], text=True, timeout=15)
-                    rows = json.loads(out)
-                    still_present = any(r.get("name") == name for r in rows)
-                except Exception as e:
-                    list_err = str(e)
-                deleted = (cp.returncode == 0 and not still_present)
-                if deleted:
-                    try: store.remove_instance(name)
-                    except Exception: pass
-                    # Drop the tail thread for this instance.
-                    if discoverer is not None:
-                        try:
-                            t = discoverer.tails.pop(name, None)
-                            if t is not None: t.shutdown()
-                        except Exception:
-                            pass
-                self._json({
-                    "ok":            deleted,
-                    "name":          name,
-                    "contract_id":   cid,
-                    "exit_code":     cp.returncode,
-                    "still_present": still_present,
-                    "list_error":    list_err,
-                    "transcript":    transcript[:20000],
-                })
-                return
-
-            if u.path == "/api/self_update":
-                # Drain any body; we ignore params.
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > 0:
-                    try: self.rfile.read(length)
-                    except Exception: pass
-                # Run the install one-liner detached so it survives the
-                # systemctl restart that the installer triggers at the end.
-                log_path = "/tmp/sashimon-update.log"
-                cmd = (
-                    f"set -e; "
-                    f"echo '[update] starting at '$(date -Iseconds); "
-                    f"curl -fsSL {shlex_quote(install_url)} "
-                    f"| sudo -n bash; "
-                    f"echo '[update] done at '$(date -Iseconds)"
-                )
-                try:
-                    subprocess.Popen(
-                        ["bash", "-c", f"({cmd}) >>{log_path} 2>&1"],
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        start_new_session=True,
-                        close_fds=True,
-                    )
-                except Exception as e:
-                    self._json({"ok": False, "error": str(e)}, code=500)
-                    return
-                self._json({
-                    "ok":           True,
-                    "log_path":     log_path,
-                    "install_url":  install_url,
-                    "hint":         "systemd will restart sashimon when the install completes; "
-                                    "poll /healthz to detect when it is back.",
-                })
-                return
-
-            if u.path == "/api/discover_now":
-                # Drain any body.
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > 0:
-                    try: self.rfile.read(length)
-                    except Exception: pass
-                if discoverer is None:
-                    self._json({"ok": False, "error": "discoverer disabled"},
-                               code=500)
-                    return
-                result = discoverer.discover_once()
-                self._json({"ok": "error" not in result, **result})
-                return
-
-            if u.path == "/api/policy":
-                length = int(self.headers.get("Content-Length") or 0)
-                raw = b""
-                if length > 0:
+                u = urllib.parse.urlparse(self.path)
+                qs = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
+                now = time.time()
+                p = u.path
+                if p in ("/", "/index.html"):
                     try:
-                        raw = self.rfile.read(length)
-                    except Exception:
-                        raw = b""
-                mode = None
-                # Accept either application/json {"mode":"balanced"} or form body.
-                ctype = (self.headers.get("Content-Type") or "").lower()
-                try:
-                    if "application/json" in ctype and raw:
-                        body = json.loads(raw.decode("utf-8") or "{}")
-                        mode = body.get("mode")
-                    else:
-                        body = parse_qs(raw.decode("utf-8")) if raw else {}
-                        mode = (body.get("mode") or [None])[0]
-                except Exception:
-                    mode = None
-                if not mode:
-                    mode = (parse_qs(u.query).get("mode") or [None])[0]
-                if not policy:
-                    self._json({"ok": False, "error": "policy disabled"}, code=500)
-                    return
-                try:
-                    policy.set_mode(mode)
-                except ValueError as e:
-                    self._json({"ok": False, "error": str(e)}, code=400)
-                    return
-                self._json({"ok": True, "mode": policy.mode()})
-                return
+                        with open(dashboard_path, "rb") as f:
+                            return self._send(200, f.read(), "text/html; charset=utf-8")
+                    except OSError:
+                        return self._send(200, "<h1>sashimon %s</h1><p>dashboard.html not found next to "
+                                               "sashimon.py. API is at /api/overview.</p>" % VERSION, "text/html")
+                if p == "/healthz":
+                    return self._json({"ok": True, "version": VERSION})
+                if p == "/api/local/live":
+                    return self._json(app.live())
+                if p == "/api/local/history":
+                    since = float(qs.get("since", now - 3600))
+                    return self._json(q_history(app, qs["contract_id"], since, float(qs.get("until", now))))
+                if p == "/api/local/incident":
+                    return self._json(q_incident(app, int(qs["id"])) or {"error": "not found"})
+                if p == "/api/overview":
+                    return self._json(overview(app))
+                if p == "/api/cluster":
+                    window = float(qs.get("window", 3600))
+                    since = now - window
+                    hist = [q_history(app, qs["contract_id"], since, now)]
+                    if app.peers:
+                        hist += app.peer_get("/api/local/history?" + urllib.parse.urlencode(
+                            {"contract_id": qs["contract_id"], "since": since, "until": now}))
+                    nodes = [n for n in app.merged_nodes() if n["contract_id"] == qs["contract_id"]]
+                    return self._json({"contract_id": qs["contract_id"], "since": since, "until": now,
+                                       "live": nodes, "hosts": hist,
+                                       "recent": app.merged_recent(qs["contract_id"],
+                                                                   max([n["seq"] or 0 for n in nodes] or [0]) - 64)})
+                if p == "/api/incident":
+                    host, iid = qs.get("host", app.host), int(qs["id"])
+                    if host == app.host:
+                        return self._json(q_incident(app, iid) or {"error": "not found"})
+                    for peer in app.peers.values():
+                        d = peer.get("data") or {}
+                        if d.get("host") == host:
+                            return self._json(app_peer_one(app, peer["url"], "/api/local/incident?id=%d" % iid))
+                    return self._json({"error": "unknown host"}, 404)
+                return self._json({"error": "not found"}, 404)
+            except Exception as e:
+                traceback.print_exc()
+                return self._json({"error": str(e)}, 500)
 
+        def do_POST(self):
+            u = urllib.parse.urlparse(self.path)
             if u.path == "/api/clear":
-                # Drain any request body to keep the connection clean.
-                length = int(self.headers.get("Content-Length") or 0)
-                if length > 0:
-                    try:
-                        self.rfile.read(length)
-                    except Exception:
-                        pass
-                try:
-                    result = store.clear_all()
-                    # Forget in-memory spell state so a currently-active fork
-                    # opens a fresh spells_log row on its next error tag.
-                    if spell_manager is not None:
-                        try:
-                            spell_manager.state.clear()
-                        except Exception:
-                            pass
-                    sz = store.db_size_bytes()
-                    self._json({
-                        "ok": True,
-                        "db_size_bytes": sz,
-                        "db_size_human": _human_bytes(sz),
-                        **result,
-                    })
-                except Exception as e:
-                    self._json({"ok": False, "error": str(e)}, code=500)
-                return
+                app.store.clear()
+                return self._json({"ok": True})
+            return self._json({"error": "not found"}, 404)
 
-            self._send(404, b"not found", "text/plain")
-
-    return Handler
+    return H
 
 
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
+def app_peer_one(app, base, path):
+    try:
+        with urllib.request.urlopen(base + path, timeout=10, context=app.peer_ctx) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        return {"error": str(e)[:200]}
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Sashimono HotPocket monitor")
-    ap.add_argument("--db",    default=os.environ.get("SASHIMON_DB", DEFAULT_DB))
-    ap.add_argument("--port",  type=int,
-                    default=int(os.environ.get("SASHIMON_PORT", DEFAULT_PORT)))
-    ap.add_argument("--bind",  default=os.environ.get("SASHIMON_BIND", DEFAULT_BIND))
-    ap.add_argument("--sashi", default=os.environ.get("SASHIMON_SASHI", "sashi"),
-                    help="sashi binary (default: sashi from PATH)")
-    ap.add_argument("--retention-days", type=int,
-                    default=int(os.environ.get("SASHIMON_RETENTION_DAYS",
-                                               RETENTION_DAYS)))
-    ap.add_argument("--static",
-                    default=os.environ.get("SASHIMON_STATIC", ""),
-                    help="Path to dashboard index.html. Defaults to "
-                         "<script-dir>/index.html if it exists.")
-    ap.add_argument("--roundtime-ms", type=int,
-                    default=int(os.environ.get("SASHIMON_ROUNDTIME_MS",
-                                               DEFAULT_ROUNDTIME_MS)),
-                    help="HotPocket consensus roundtime in ms; drives the "
-                         "uptime-%% denominator. Default 2000.")
-    ap.add_argument("--metrics-interval", type=int,
-                    default=int(os.environ.get("SASHIMON_METRICS_INTERVAL",
-                                               METRICS_INTERVAL)),
-                    help="Seconds between host-metric samples (normal). Default 30.")
-    ap.add_argument("--metrics-interval-boost", type=int,
-                    default=int(os.environ.get("SASHIMON_METRICS_INTERVAL_BOOST",
-                                               METRICS_INTERVAL_BOOST)),
-                    help="Seconds between host-metric samples while a spell is "
-                         "active. Default 3.")
-    ap.add_argument("--metrics-boost-cooldown", type=int,
-                    default=int(os.environ.get("SASHIMON_METRICS_BOOST_COOLDOWN",
-                                               METRICS_BOOST_COOLDOWN)),
-                    help="Keep boosted sampling this long after the last error "
-                         "tag. Default 120.")
-    ap.add_argument("--no-metrics", action="store_true",
-                    default=(os.environ.get("SASHIMON_NO_METRICS", "") not in ("", "0", "false")),
-                    help="Disable the host-metrics sampler (spell tracking + "
-                         "diagnostic snapshots still run).")
-    ap.add_argument("--no-ntp", action="store_true",
-                    default=(os.environ.get("SASHIMON_NO_NTP", "") not in ("", "0", "false")),
-                    help="Skip the chronyc/timedatectl NTP probe in samples.")
-    ap.add_argument("--report-peers",
-                    default=os.environ.get("SASHIMON_REPORT_PEERS", ""),
-                    help="Comma-separated http://host:port of other sashimon "
-                         "monitors. When set, GET /api/report (the 'export "
-                         "report' button) fetches their reports too, so a "
-                         "multi-VM cluster yields one document for every node.")
-    ap.add_argument("--policy-mode",
-                    default=os.environ.get("SASHIMON_POLICY_MODE", DEFAULT_POLICY_MODE),
-                    choices=sorted(POLICY_MODES.keys()),
-                    help="DB tracking policy. 'full' tracks everything; "
-                         "'balanced' (default) drops low-severity event floods "
-                         "during a spell and skips metric boost/snapshot for "
-                         "low-impact spells (consensus_lost, out_of_sync, "
-                         "warning); 'minimal' only stores fork-class events.")
-    ap.add_argument("--tls-cert",
-                    default=os.environ.get("SASHIMON_TLS_CERT", ""),
-                    help="Path to TLS certificate (PEM). When set together "
-                         "with --tls-key, the dashboard is served over HTTPS.")
-    ap.add_argument("--tls-key",
-                    default=os.environ.get("SASHIMON_TLS_KEY", ""),
-                    help="Path to TLS private key (PEM).")
-    ap.add_argument("--tls-auto", action="store_true",
-                    default=(os.environ.get("SASHIMON_TLS_AUTO", "") not in ("", "0", "false")),
-                    help="If --tls-cert/--tls-key are blank, try the Sashimono "
-                         "contract template defaults "
-                         "(/etc/sashimono/contract_template/cfg/tls{cert,key}.pem). "
-                         "Silently falls back to plain HTTP if those don't exist.")
-    ap.add_argument("--auto-monitor-new", action="store_true",
-                    default=(os.environ.get("SASHIMON_AUTO_MONITOR_NEW", "") not in ("", "0", "false")),
-                    help="Automatically start monitoring newly-discovered "
-                         "clusters. Default off: operator opts in per cluster "
-                         "from the dashboard. Existing installs that want the "
-                         "old 'tail everything' behaviour can set this.")
-    ap.add_argument("--evernode-bin",
-                    default=os.environ.get("SASHIMON_EVERNODE_BIN", "evernode"),
-                    help="`evernode` CLI binary used by the dashboard's "
-                         "destructive Delete action (only enabled while a "
-                         "cluster is hard-forked).")
-    ap.add_argument("--install-url",
-                    default=os.environ.get("SASHIMON_INSTALL_URL",
-                        "https://raw.githubusercontent.com/du1ana/sashi-monitor/main/install.sh"),
-                    help="URL of the install one-liner used by the in-dashboard "
-                         "Update button.")
+
+def overview(app):
+    now = time.time()
+    nodes = app.merged_nodes()
+    clusters = collections.defaultdict(list)
+    for n in nodes:
+        clusters[n["contract_id"]].append(n)
+    known = q_clusters(app)
+    out = []
+    for cid, ns in clusters.items():
+        seqs = [n["seq"] for n in ns if n.get("seq") is not None]
+        versions = collections.Counter(n.get("version") or "?" for n in ns)
+        hosts = collections.Counter(n["host"] for n in ns)
+        last_close = max([n["close_ts"] for n in ns if n.get("close_ts")] or [0])
+        open_inc = [{"kind": k[1], "key": k[2]} for k in app.detector.open
+                    if k[0] == app.store.cluster_id(cid)]
+        out.append({
+            "contract_id": cid, "nodes": len(ns), "hosts": dict(hosts), "versions": dict(versions),
+            "version": versions.most_common(1)[0][0], "max_seq": max(seqs) if seqs else None,
+            "min_seq": min(seqs) if seqs else None, "last_close_age": now - last_close if last_close else None,
+            "frozen": sum(1 for n in ns if n.get("frozen_since")),
+            "silent": sum(1 for n in ns if n.get("idle_s") is None or n["idle_s"] > app.freeze_s),
+            "open_incidents": open_inc, "first_seen": known.get(cid, {}).get("first_seen"),
+        })
+    # Clusters with no live nodes any more (e.g. an earlier test run) stay listed from the DB, so they can be compared.
+    c = app.store.reader()
+    try:
+        for cid, rec in known.items():
+            if cid in clusters or (rec.get("last_seen") or 0) < now - app.args.retention_hours * 3600:
+                continue
+            vers = collections.Counter(r[0] or "?" for r in c.execute(
+                "SELECT version FROM nodes WHERE cluster_id=?", (rec["id"],)))
+            hosts_c = collections.Counter(r[0] for r in c.execute(
+                "SELECT host FROM nodes WHERE cluster_id=?", (rec["id"],)))
+            if not vers:
+                continue
+            last = c.execute("SELECT MAX(last_ts), MAX(seq) FROM ledgers WHERE cluster_id=?", (rec["id"],)).fetchone()
+            out.append({"contract_id": cid, "nodes": 0, "offline": True, "hosts": dict(hosts_c), "versions": dict(vers),
+                        "version": vers.most_common(1)[0][0], "max_seq": last[1], "min_seq": None,
+                        "last_close_age": now - last[0] if last[0] else None, "frozen": 0, "silent": 0,
+                        "open_incidents": [], "first_seen": rec.get("first_seen"), "last_seen": rec.get("last_seen")})
+    finally:
+        c.close()
+    hosts = [{"host": app.host, "self": True, "ok": True, "metrics": app.metrics.now, "version": VERSION,
+              "nodes": len(app.local_nodes())}]
+    for p in app.peers.values():
+        d = p.get("data") or {}
+        hosts.append({"host": d.get("host") or p["url"], "url": p["url"], "self": False, "ok": p["ok"],
+                      "error": p["error"], "metrics": d.get("metrics"), "version": d.get("version"),
+                      "nodes": len(d.get("nodes") or []), "age": now - p["ts"] if p["ts"] else None})
+    return {"now": now, "host": app.host, "version": VERSION, "hosts": hosts,
+            "clusters": sorted(out, key=lambda c: (bool(c.get("offline")), -(c["first_seen"] or 0))),
+            "config": {"freeze_s": app.freeze_s, "stall_s": app.stall_s, "split_ledgers": app.split_seq,
+                       "retention_h": app.args.retention_hours, "max_db_mb": app.args.max_db_mb}}
+
+
+# ---------------------------------------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(description="HotPocket consensus observer")
+    env = os.environ.get
+    ap.add_argument("--db", default=env("SASHIMON_DB", "/var/lib/sashimon/sashimon.db"))
+    ap.add_argument("--port", type=int, default=int(env("SASHIMON_PORT", "8765")))
+    ap.add_argument("--bind", default=env("SASHIMON_BIND", "0.0.0.0"))
+    ap.add_argument("--host-label", default=env("SASHIMON_HOST_LABEL"))
+    ap.add_argument("--peer", action="append", default=[p for p in (env("SASHIMON_PEERS") or "").split(",") if p],
+                    help="base URL of another host's sashimon (repeatable)")
+    ap.add_argument("--sashi", default=env("SASHIMON_SASHI", "sashi"))
+    ap.add_argument("--instances-dir", default=env("SASHIMON_INSTANCES_DIR"),
+                    help="test mode: directory of node dirs (each with cfg/hp.cfg and log/hp.log) instead of sashi list")
+    ap.add_argument("--retention-hours", type=float, default=float(env("SASHIMON_RETENTION_HOURS", "72")))
+    ap.add_argument("--max-db-mb", type=float, default=float(env("SASHIMON_MAX_DB_MB", "512")))
+    ap.add_argument("--ring-lines", type=int, default=int(env("SASHIMON_RING_LINES", "6000")))
+    ap.add_argument("--freeze-seconds", type=float, default=float(env("SASHIMON_FREEZE_S", "15")))
+    ap.add_argument("--stall-seconds", type=float, default=float(env("SASHIMON_STALL_S", "60")))
+    ap.add_argument("--split-ledgers", type=int, default=int(env("SASHIMON_SPLIT_LEDGERS", "5")))
+    ap.add_argument("--dashboard", default=env("SASHIMON_DASHBOARD"))
+    ap.add_argument("--tls-cert", default=env("SASHIMON_TLS_CERT"))
+    ap.add_argument("--tls-key", default=env("SASHIMON_TLS_KEY"))
+    ap.add_argument("--tls-auto", action="store_true", default=env("SASHIMON_TLS_AUTO") in ("1", "true"))
     args = ap.parse_args()
 
-    sashi_path = shutil.which(args.sashi) or args.sashi
-    evernode_path = shutil.which(args.evernode_bin) or args.evernode_bin
-    report_peers = [p.strip() for p in (args.report_peers or "").split(",") if p.strip()]
-    store = Store(args.db)
-    stop = threading.Event()
-    tails: dict[str, Tail] = {}
-    policy = PolicyManager(store, default_mode=args.policy_mode)
-
-    static_path = args.static.strip() or str(
-        Path(__file__).resolve().parent / "index.html"
-    )
-    if not Path(static_path).exists():
-        static_path = ""
-
-    def _term(_sig, _frm):
-        print("[sashimon] shutting down")
-        stop.set()
-    signal.signal(signal.SIGTERM, _term)
-    signal.signal(signal.SIGINT, _term)
-
-    metrics: MetricsCollector | None = None
-    if not args.no_metrics:
-        metrics = MetricsCollector(
-            store, stop, tails,
-            normal_interval=args.metrics_interval,
-            boost_interval=args.metrics_interval_boost,
-            ntp_enabled=not args.no_ntp,
-        )
-    spell_mgr = SpellManager(
-        store, stop, sashi_path, metrics, tails,
-        boost_cooldown=args.metrics_boost_cooldown,
-        policy=policy,
-    )
-    if metrics is not None:
-        metrics.tick_cb = spell_mgr.tick
-        metrics.start()
-
-    fork_detector = ForkDetector(store)
-    discoverer = Discoverer(store, tails, stop, sashi_path,
-                            spell_manager=spell_mgr, policy=policy,
-                            auto_monitor_new=args.auto_monitor_new,
-                            fork_detector=fork_detector)
-    discoverer.start()
-    Pruner(store, stop, args.retention_days).start()
-
-    server = ThreadingHTTPServer(
-        (args.bind, args.port),
-        make_handler(store, static_path or None,
-                     roundtime_ms=args.roundtime_ms, metrics=metrics,
-                     spell_manager=spell_mgr, sashi_bin=sashi_path,
-                     report_peers=report_peers, policy=policy,
-                     discoverer=discoverer,
-                     evernode_bin=evernode_path,
-                     install_url=args.install_url),
-    )
-
-    # ---- TLS wrap (optional) ------------------------------------------
-    tls_cert = (args.tls_cert or "").strip()
-    tls_key = (args.tls_key or "").strip()
-    if not tls_cert and not tls_key and args.tls_auto:
-        c = "/etc/sashimono/contract_template/cfg/tlscert.pem"
-        k = "/etc/sashimono/contract_template/cfg/tlskey.pem"
-        if os.path.isfile(c) and os.path.isfile(k):
-            tls_cert, tls_key = c, k
+    app = App(args)
+    app.run_loops()
+    dashboard = args.dashboard or os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+    srv = ThreadingHTTPServer((args.bind, args.port), make_handler(app, dashboard))
+    srv.daemon_threads = True
+    cert, key = args.tls_cert, args.tls_key
+    if not cert and args.tls_auto:
+        base = "/etc/sashimono/contract_template/cfg"
+        if os.path.exists(base + "/tlscert.pem") and os.path.exists(base + "/tlskey.pem"):
+            cert, key = base + "/tlscert.pem", base + "/tlskey.pem"
     scheme = "http"
-    if tls_cert and tls_key:
-        try:
-            import ssl
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ctx.load_cert_chain(tls_cert, tls_key)
-            server.socket = ctx.wrap_socket(server.socket, server_side=True)
-            scheme = "https"
-            print(f"[sashimon] TLS enabled  cert={tls_cert}  key={tls_key}")
-        except Exception as e:
-            print(f"[sashimon] TLS init failed ({e}) — falling back to HTTP",
-                  file=sys.stderr)
-            scheme = "http"
-
-    print(f"[sashimon] db={args.db}  sashi={sashi_path}")
-    print(f"[sashimon] static={static_path or '(embedded fallback)'}")
-    print(f"[sashimon] policy={policy.mode()}")
-    print(f"[sashimon] roundtime={args.roundtime_ms}ms  "
-          f"metrics={'off' if args.no_metrics else f'{args.metrics_interval}s/{args.metrics_interval_boost}s'}"
-          f"  report-peers={report_peers or '(none)'}")
-    print(f"[sashimon] dashboard {scheme}://{args.bind}:{args.port}")
-    threading.Thread(target=server.serve_forever, daemon=True,
-                     name="http").start()
-    try:
-        while not stop.is_set():
-            time.sleep(1.0)
-    finally:
-        server.shutdown()
-        # SIGKILL the sashi/docker-attach children — SIGINT routinely takes
-        # >3s per child to drain, which trips systemd's TimeoutStopSec and
-        # leaves orphaned python procs eating RAM until the next restart.
-        for t in list(tails.values()):
-            t.shutdown(fast=True)
+    if cert and key:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        scheme = "https"
+    print("sashimon %s on %s://%s:%d host=%s peers=%s db=%s" % (
+        VERSION, scheme, args.bind, args.port, app.host, list(app.peers), args.db), flush=True)
+    signal.signal(signal.SIGTERM, lambda *a: (srv.shutdown(), sys.exit(0)))
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
