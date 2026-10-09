@@ -386,6 +386,36 @@ class Node:
         if self.version or self.pubkey:
             self.app.store.put("UPDATE nodes SET version=coalesce(?,version), pubkey=coalesce(?,pubkey) WHERE id=?",
                                (self.version, self.pubkey, self.id))
+        self._prime_last_ledger(files)
+
+    def _prime_last_ledger(self, files):
+        """Find the node's last closed ledger (newest log first, reading backwards) so a stalled node, which prints
+        no new 'Ledger created' lines, still has a known height after a monitor restart."""
+        for p in reversed(files):
+            try:
+                with open(p, "rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    pos = fh.tell()
+                    tail = b""
+                    while pos > 0:
+                        step = min(1048576, pos)
+                        pos -= step
+                        fh.seek(pos)
+                        block = fh.read(step) + tail
+                        i = block.rfind(b"****Ledger created****")
+                        if i >= 0:
+                            start = block.rfind(b"\n", 0, i) + 1
+                            end = block.find(b"\n", i)
+                            line = block[start:end if end >= 0 else None].decode("utf-8", "replace")
+                            m = LINE_RE.match(ANSI_RE.sub("", line).lstrip("﻿"))
+                            mm = RE_CREATED.search(line)
+                            if m and mm:
+                                self.seq, self.hash = int(mm.group(1)), mm.group(2)
+                                self.close_ts = parse_ts(m.group(1), m.group(2))
+                            return
+                        tail = block[:200]
+            except OSError:
+                continue
 
     def _bump(self, ts, field, n=1):
         minute = int(ts // 60)
@@ -626,7 +656,7 @@ class Detector:
         self.last_event = {}      # (node name, kind) -> ts
         self.cluster_state = {}   # contract_id -> {"max_seq", "advance_ts"}
         # Forks already reported (open or resolved), so a resolved fork is not raised again. Seeded from the DB.
-        self.known_forks = set()  # (cluster_id, seq)
+        self.known_forks = {}     # (cluster_id, seq) -> incident id
         c = app.store.reader()
         try:
             for iid, cid, detail, end_ts in c.execute(
@@ -635,7 +665,7 @@ class Detector:
                     seq = int(json.loads(detail or "{}").get("seq"))
                 except (TypeError, ValueError):
                     continue
-                self.known_forks.add((cid, seq))
+                self.known_forks[(cid, seq)] = iid
                 if end_ts is None:
                     self.open[(cid, "fork", str(seq))] = iid
         finally:
@@ -739,11 +769,14 @@ class Detector:
                 with node.lock:
                     node._bump(now, "frozen_s", 5)
 
-        # Clusters that no longer have any live node: close whatever is still open for them.
-        live_cids = {app.store.cluster_id(c) for c in by_cluster}
-        for (cid, kind, key) in list(self.open):
-            if cid not in live_cids:
-                self._close(cid, kind, key)
+        # Clusters that no longer have any live node: close whatever is still open for them. Skipped right after
+        # startup (discovery and peers not in yet). Forks are never closed this way: only when the nodes are back on
+        # one chain, or when the cluster is purged.
+        if now - app.started > 60:
+            live_cids = {app.store.cluster_id(c) for c in by_cluster}
+            for (cid, kind, key) in list(self.open):
+                if cid not in live_cids and kind != "fork":
+                    self._close(cid, kind, key)
 
         for contract_id, nodes in by_cluster.items():
             cid = app.store.cluster_id(contract_id)
@@ -782,8 +815,7 @@ class Detector:
             # Forks: the same ledger number with different hashes (across all hosts).
             for seq, hashes in app.merged_recent(contract_id, max_seq - 256).items():
                 if len(hashes) > 1 and (cid, seq) not in self.known_forks:
-                    self.known_forks.add((cid, seq))
-                    self._open(cid, "fork", str(seq), "critical",
+                    self.known_forks[(cid, seq)] = self._open(cid, "fork", str(seq), "critical",
                                "fork at ledger %d: %s" % (seq, " vs ".join(
                                    "%s(%d)" % (h, len(ns)) for h, ns in hashes.items())),
                                {"seq": seq, "hashes": hashes}, capture_nodes=local_cluster_nodes)
@@ -795,6 +827,12 @@ class Detector:
                 if n.get("seq") is not None:
                     heads[n["seq"]].add(n.get("hash"))
             one_chain = alive and all(len(hs) == 1 for hs in heads.values())
+            # A known fork that was closed but where live nodes at that ledger still disagree is ongoing: re-open it.
+            for seq, hs in heads.items():
+                iid = self.known_forks.get((cid, seq))
+                if len(hs) > 1 and iid and (cid, "fork", str(seq)) not in self.open:
+                    self.open[(cid, "fork", str(seq))] = iid
+                    app.store.put("UPDATE incidents SET end_ts=NULL WHERE id=?", (iid,))
             for (ocid, kind, key) in list(self.open):
                 if ocid == cid and kind == "fork" and one_chain and max_seq - int(key) >= 3:
                     iid = self.open.pop((ocid, kind, key))
@@ -1313,8 +1351,12 @@ def main():
         scheme = "https"
     print("sashimon %s on %s://%s:%d host=%s peers=%s db=%s" % (
         VERSION, scheme, args.bind, args.port, app.host, list(app.peers), args.db), flush=True)
-    signal.signal(signal.SIGTERM, lambda *a: (srv.shutdown(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda *a: threading.Thread(target=srv.shutdown, daemon=True).start())
     srv.serve_forever()
+    for n in app.local_nodes():
+        with n.lock:
+            n._flush()
+    time.sleep(1.5)   # let the writer commit the last batch
 
 
 if __name__ == "__main__":
