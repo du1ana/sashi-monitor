@@ -131,9 +131,10 @@ class Store:
         self.w.execute("PRAGMA journal_size_limit=67108864")
         self.w.execute("PRAGMA busy_timeout=5000")
         self.w.executescript(SCHEMA)
-        # Incidents left open by a previous run can't be tracked any more: close them at restart.
+        # Incidents left open by a previous run can't be tracked any more: close them at restart. Forks are the
+        # exception: they are reloaded and stay open until the nodes are verifiably back on one chain.
         self.w.execute("UPDATE incidents SET end_ts=?, summary=summary || ' (closed at monitor restart)' "
-                       "WHERE end_ts IS NULL", (time.time(),))
+                       "WHERE end_ts IS NULL AND kind != 'fork'", (time.time(),))
         self.q = queue.Queue(maxsize=50000)
         self.ids = {}            # ("cluster", contract_id) / ("node", name) -> id
         self.id_lock = threading.Lock()
@@ -624,6 +625,21 @@ class Detector:
         self.open = {}            # (cluster_id, kind, key) -> incident id
         self.last_event = {}      # (node name, kind) -> ts
         self.cluster_state = {}   # contract_id -> {"max_seq", "advance_ts"}
+        # Forks already reported (open or resolved), so a resolved fork is not raised again. Seeded from the DB.
+        self.known_forks = set()  # (cluster_id, seq)
+        c = app.store.reader()
+        try:
+            for iid, cid, detail, end_ts in c.execute(
+                    "SELECT id, cluster_id, detail, end_ts FROM incidents WHERE kind='fork'"):
+                try:
+                    seq = int(json.loads(detail or "{}").get("seq"))
+                except (TypeError, ValueError):
+                    continue
+                self.known_forks.add((cid, seq))
+                if end_ts is None:
+                    self.open[(cid, "fork", str(seq))] = iid
+        finally:
+            c.close()
 
     # -- local ledgers
     def ledger(self, node, seq, h, ts):
@@ -765,13 +781,25 @@ class Detector:
 
             # Forks: the same ledger number with different hashes (across all hosts).
             for seq, hashes in app.merged_recent(contract_id, max_seq - 256).items():
-                if len(hashes) > 1:
-                    key = str(seq)
-                    if (cid, "fork", key) not in self.open:
-                        self._open(cid, "fork", key, "critical",
-                                   "fork at ledger %d: %s" % (seq, " vs ".join(
-                                       "%s(%d)" % (h, len(ns)) for h, ns in hashes.items())),
-                                   {"seq": seq, "hashes": hashes}, capture_nodes=local_cluster_nodes)
+                if len(hashes) > 1 and (cid, seq) not in self.known_forks:
+                    self.known_forks.add((cid, seq))
+                    self._open(cid, "fork", str(seq), "critical",
+                               "fork at ledger %d: %s" % (seq, " vs ".join(
+                                   "%s(%d)" % (h, len(ns)) for h, ns in hashes.items())),
+                               {"seq": seq, "hashes": hashes}, capture_nodes=local_cluster_nodes)
+
+            # A fork is resolved once the cluster is a few ledgers past it and every live node at the same height has
+            # the same hash (the forked nodes synced back onto the majority chain).
+            heads = collections.defaultdict(set)
+            for n in alive:
+                if n.get("seq") is not None:
+                    heads[n["seq"]].add(n.get("hash"))
+            one_chain = alive and all(len(hs) == 1 for hs in heads.values())
+            for (ocid, kind, key) in list(self.open):
+                if ocid == cid and kind == "fork" and one_chain and max_seq - int(key) >= 3:
+                    iid = self.open.pop((ocid, kind, key))
+                    app.store.put("UPDATE incidents SET end_ts=?, summary=summary || ? WHERE id=?",
+                                  (now, " (resolved: all live nodes back on one chain)", iid))
 
 
 # ---------------------------------------------------------------------------------------------------------

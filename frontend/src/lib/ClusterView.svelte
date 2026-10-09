@@ -17,6 +17,8 @@
 
   const cluster = $derived(overview.clusters.find((c) => c.contract_id === id));
   const d = $derived(data ? digest(data) : null);
+  // A fork is ongoing while its incident is open on any host.
+  const forkOpen = (seq) => !!d?.incidents.some((i) => i.kind === 'fork' && +i.detail?.seq === +seq && i.end_ts == null);
 
   async function load() {
     loading = true;
@@ -55,19 +57,22 @@
   <div class="panel empty">Loading…</div>
 {:else}
   {#if d.forks.length}
-    <section class="panel fork">
-      <div class="panel-head"><h3>⑂ Forks: same ledger number, different hashes</h3>
-        <span class="pill bad">{d.forks.length} ledger{d.forks.length > 1 ? 's' : ''}</span></div>
+    {@const ongoing = d.forks.filter((f) => forkOpen(f.seq)).length}
+    <section class="panel fork" class:resolved={!ongoing}>
+      <div class="panel-head"><h3>⑂ Forks seen: same ledger number, different hashes</h3>
+        <span class="pill {ongoing ? 'bad' : 'ok'}">{ongoing ? `${ongoing} ongoing` : 'all resolved'} · {d.forks.length} ledger{d.forks.length > 1 ? 's' : ''}</span></div>
       <div class="panel-body">
         <table class="t">
-          <thead><tr><th>Ledger</th><th>Versions</th></tr></thead>
+          <thead><tr><th>Ledger</th><th>Status</th><th>Hashes (nodes that closed each)</th></tr></thead>
           <tbody>
             {#each d.forks.slice(0, 20) as f}
               <tr><td class="mono num">{f.seq}</td>
+                <td>{#if forkOpen(f.seq)}<span class="pill bad">ongoing</span>{:else}<span class="pill ok">resolved</span>{/if}</td>
                 <td>{#each f.hashes as h}<div><span class="mono">{h.hash}</span> <span class="muted">· {h.nodes.join(', ')}</span></div>{/each}</td></tr>
             {/each}
           </tbody>
         </table>
+        <p class="faint note">A fork is resolved once every live node at the same height has the same hash again (the diverged nodes synced back).</p>
       </div>
     </section>
   {/if}
@@ -112,6 +117,8 @@
   .totals { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
   .tot { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; border-bottom: 1px dashed var(--border); padding-bottom: 4px; }
   .fork { border-color: var(--bad); }
+  .fork.resolved { border-color: var(--border); }
+  .note { font-size: 12px; margin: 10px 0 0; }
   .foot { font-size: 12px; margin: 0; }
   @media (max-width: 960px) { .two { grid-template-columns: 1fr; } }
 </style>
