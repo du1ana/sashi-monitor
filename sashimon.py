@@ -242,6 +242,25 @@ class Store:
             self.w.execute("PRAGMA incremental_vacuum(5000)")
             self.w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
+    def purge_cluster(self, cluster_id):
+        """Delete everything stored about one cluster (used once it no longer exists)."""
+        with self.id_lock:
+            nodes = "(SELECT id FROM nodes WHERE cluster_id=?)"
+            for sql in (
+                "DELETE FROM captures WHERE incident_id IN (SELECT id FROM incidents WHERE cluster_id=?)",
+                "DELETE FROM incidents WHERE cluster_id=?",
+                "DELETE FROM node_minutes WHERE node_id IN " + nodes,
+                "DELETE FROM stats WHERE node_id IN " + nodes,
+                "DELETE FROM ledgers WHERE cluster_id=?",
+                "DELETE FROM nodes WHERE cluster_id=?",
+                "DELETE FROM clusters WHERE id=?",
+            ):
+                self.w.execute(sql, (cluster_id,))
+            self.w.execute("PRAGMA incremental_vacuum(2000)")
+            for key in [k for k, v in self.ids.items() if (k[0] == "c" and v == cluster_id) or
+                        (k[0] == "n" and k[1] == cluster_id)]:
+                del self.ids[key]
+
     def clear(self):
         with self.id_lock:
             for t in ("node_minutes", "host_minutes", "ledgers", "stats", "captures", "incidents"):
@@ -668,6 +687,14 @@ class Detector:
                 self.app.store.put("INSERT INTO captures(incident_id, node_id, ts, kind, data) VALUES (?,?,?,?,?)",
                                    (iid, n.id, now, "log", zlib.compress(text.encode(), 6)))
 
+    def forget_cluster(self, cluster_id, contract_id):
+        with self.lock:
+            for k in [k for k in self.recent if k[0] == cluster_id]:
+                del self.recent[k]
+        for k in [k for k in self.open if k[0] == cluster_id]:
+            del self.open[k]
+        self.cluster_state.pop(contract_id, None)
+
     # -- periodic evaluation over the merged (all hosts) view
     def evaluate(self):
         app = self.app
@@ -834,6 +861,7 @@ class App:
         self.peer_ctx.check_hostname = False
         self.peer_ctx.verify_mode = ssl.CERT_NONE
         self.started = time.time()
+        self.cluster_seen = {}        # contract_id -> last time any host reported a live node for it
 
     # -- discovery
     def discover(self):
@@ -946,6 +974,27 @@ class App:
                             out[int(seq)][h].update(ns)
         return {s: {h: sorted(n) for h, n in hs.items()} for s, hs in out.items()}
 
+    def purge_deleted(self):
+        """Clusters with no live node on any host for purge_after seconds are deleted from the DB."""
+        after = self.args.purge_deleted_after
+        if after <= 0:
+            return
+        now = time.time()
+        for n in self.merged_nodes():
+            self.cluster_seen[n["contract_id"]] = now
+        c = self.store.reader()
+        try:
+            rows = [dict(r) for r in c.execute("SELECT id, contract_id, last_seen FROM clusters")]
+        finally:
+            c.close()
+        for r in rows:
+            seen = max(self.cluster_seen.get(r["contract_id"], 0), r["last_seen"] or 0, self.started)
+            if now - seen > after:
+                print("purging deleted cluster %s (no live nodes for %ds)" % (r["contract_id"], now - seen), flush=True)
+                self.detector.forget_cluster(r["id"], r["contract_id"])
+                self.store.purge_cluster(r["id"])
+                self.cluster_seen.pop(r["contract_id"], None)
+
     # -- loops
     def run_loops(self):
         def loop(fn, interval, name):
@@ -965,6 +1014,7 @@ class App:
         loop(self.detector.evaluate, 5, "detect")
         loop(lambda: [n._flush() for n in self.local_nodes()], 20, "flush")
         loop(self.store.maintain, 1800, "maintain")
+        loop(self.purge_deleted, 30, "purge")
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -1209,6 +1259,8 @@ def main():
     ap.add_argument("--freeze-seconds", type=float, default=float(env("SASHIMON_FREEZE_S", "15")))
     ap.add_argument("--stall-seconds", type=float, default=float(env("SASHIMON_STALL_S", "60")))
     ap.add_argument("--split-ledgers", type=int, default=int(env("SASHIMON_SPLIT_LEDGERS", "5")))
+    ap.add_argument("--purge-deleted-after", type=float, default=float(env("SASHIMON_PURGE_DELETED_AFTER", "300")),
+                    help="delete all data of a cluster once no host has seen a live node of it for this many seconds (0 = keep)")
     ap.add_argument("--dashboard", default=env("SASHIMON_DASHBOARD"))
     ap.add_argument("--tls-cert", default=env("SASHIMON_TLS_CERT"))
     ap.add_argument("--tls-key", default=env("SASHIMON_TLS_KEY"))

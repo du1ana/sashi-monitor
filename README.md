@@ -73,6 +73,7 @@ Main options (flag / env):
 | `--freeze-seconds` | `SASHIMON_FREEZE_S` | 15 | |
 | `--stall-seconds` | `SASHIMON_STALL_S` | 60 | |
 | `--split-ledgers` | `SASHIMON_SPLIT_LEDGERS` | 5 | |
+| `--purge-deleted-after` | `SASHIMON_PURGE_DELETED_AFTER` | 300 | delete all data of a cluster once no host has seen a live node of it for this long (0 = keep) |
 | `--ring-lines` | `SASHIMON_RING_LINES` | 6000 | per node |
 | `--instances-dir GLOB` | `SASHIMON_INSTANCES_DIR` | | test mode: node directories (each with `cfg/hp.cfg`, `log/hp.log`) instead of `sashi list` |
 
