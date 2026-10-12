@@ -1,7 +1,7 @@
 <script>
   import { incMeta, clock, dur } from './util.js';
   import IncidentDrawer from './IncidentDrawer.svelte';
-  let { incidents, until } = $props();
+  let { incidents, until, startTs = null } = $props();
 
   const KINDS = ['fork', 'stall', 'height_split', 'freeze', 'refused_close', 'fast_forward', 'config_patch',
     'patch_after_sync', 'invalid_cert', 'conflicting_cert', 'node_start', 'error'];
@@ -28,12 +28,12 @@
   {:else}
     <div class="scroll">
       <table class="t">
-        <thead><tr><th>Start (UTC)</th><th>Kind</th><th>Where</th><th>Duration</th><th>Summary</th><th></th></tr></thead>
+        <thead><tr><th>Start</th><th>Kind</th><th>Where</th><th>Duration</th><th>Summary</th><th></th></tr></thead>
         <tbody>
           {#each shown as i (i.host + i.id)}
             {@const m = incMeta(i.kind)}
             <tr class="click" onclick={() => (open = i)}>
-              <td class="mono num">{clock(i.start_ts)}</td>
+              <td class="mono num">{clock(i.start_ts)}{#if startTs && i.start_ts < startTs}<span class="pill neutral deploy" title="Before the real contract replaced the bootstrap contract">deploy phase</span>{/if}</td>
               <td><span class="pill {m.cls}">{m.icon} {m.label}</span></td>
               <td class="mono">{(i.hosts || [i.host]).join(', ')}{i.node ? ' / ' + i.node : ''}</td>
               <td class="num">{i.end_ts == null ? 'open · ' + dur(i.start_ts, null, until) : i.end_ts - i.start_ts < 1 ? '—' : dur(i.start_ts, i.end_ts)}</td>
@@ -56,4 +56,5 @@
   .scroll { max-height: 460px; overflow: auto; }
   .sum { max-width: 560px; }
   td .pill { font-size: 11.5px; }
+  .deploy { margin-left: 6px; font-size: 10.5px; }
 </style>

@@ -1,5 +1,5 @@
 <script>
-  import { ago } from './util.js';
+  import { ago, until, expiryClass } from './util.js';
   let { live, historyNodes, stats } = $props();
 
   const maxSeq = $derived(Math.max(0, ...live.map((n) => n.seq || 0)));
@@ -41,7 +41,7 @@
           {#each ns as n (n.name)}
             {@const s = nodeState(n)}
             <button class="node {s.cls}" class:sel={sel === n.name} onclick={() => (sel = sel === n.name ? null : n.name)}
-              title={`${n.name}\nheight ${n.seq ?? '?'} · ${n.vote_status ?? '?'} · ${n.last_votes ?? ''}`}>
+              title={`${n.name}\nheight ${n.seq ?? '?'} · ${n.vote_status ?? '?'} · ${n.last_votes ?? ''}${n.expiry_ts ? '\nexpires in ' + ago(until(n.expiry_ts)) : ''}`}>
               <span class="id mono">{n.short}</span>
               <span class="h num">{n.seq ?? '—'}</span>
               <span class="st">{s.label}</span>
@@ -65,6 +65,7 @@
           <div><span class="k">Vote status</span>{n.vote_status ?? '?'} {n.last_votes ? `· ${n.last_votes}` : ''}</div>
           <div><span class="k">Last log line</span>{ago(n.idle_s)} ago</div>
           <div><span class="k">Image</span><span class="mono">{n.image ?? ''}</span></div>
+          <div><span class="k">Lease</span><span class={expiryClass(until(n.expiry_ts))}>{n.expiry_ts ? (until(n.expiry_ts) > 0 ? 'expires in ' + ago(until(n.expiry_ts)) : 'expired') : 'unknown'}</span></div>
         </div>
         {#if n.proc}
           <div class="proc" class:blocked={n.proc.blocked_in_stdout_write}>
@@ -107,6 +108,7 @@
   .dgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px 18px; font-size: 13px; }
   .dgrid > div { display: flex; flex-direction: column; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  .warn { color: var(--warn); font-weight: 650; } .bad { color: var(--bad); font-weight: 700; }
   .proc { padding: 10px 12px; border-radius: 8px; background: var(--panel-2); font-size: 13px; display: flex; gap: 10px; justify-content: space-between; flex-wrap: wrap; }
   .proc.blocked { background: var(--violet-bg); color: var(--violet); font-weight: 600; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }

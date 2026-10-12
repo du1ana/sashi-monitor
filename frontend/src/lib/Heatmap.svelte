@@ -1,5 +1,5 @@
 <script>
-  import { clock } from './util.js';
+  import { hm } from './util.js';
   let { minutes, since, until } = $props();
 
   const MODES = [
@@ -27,7 +27,7 @@
 
   function cell(m) {
     if (!m) return { cls: 'none', label: 'no data' };
-    const label = `${clock(m.minute * 60).slice(0, 5)} · closed ${m.closes} · height ${m.max_seq} · splits ${m.vote_split} · too few ${m.consensus_lost} · missed ${m.missed_stage} · refused ${m.refused} · ff ${m.fast_forward}${m.frozen_s ? ' · frozen ' + m.frozen_s + 's' : ''}`;
+    const label = `${hm(m.minute * 60)} · closed ${m.closes} · height ${m.max_seq} · splits ${m.vote_split} · too few ${m.consensus_lost} · missed ${m.missed_stage} · refused ${m.refused} · ff ${m.fast_forward}${m.frozen_s ? ' · frozen ' + m.frozen_s + 's' : ''}`;
     if (m.frozen_s > 0) return { cls: 'frozen', label };
     if (mode === 'closes') {
       const f = (m.closes || 0) / maxCloses;
@@ -65,7 +65,7 @@
           </div>
         {/each}
         <div></div>
-        <div class="axis faint mono"><span>{clock(since).slice(0, 5)}</span><span>{clock((since + until) / 2).slice(0, 5)}</span><span>{clock(until).slice(0, 5)}</span></div>
+        <div class="axis faint mono"><span>{hm(since)}</span><span>{hm((since + until) / 2)}</span><span>{hm(until)}</span></div>
       </div>
       <div class="key faint">
         {#if mode === 'closes'}<span><i class="c h0"></i>none</span><span><i class="c h1"></i>few</span><span><i class="c h3"></i>many</span>

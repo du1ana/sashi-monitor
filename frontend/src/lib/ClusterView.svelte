@@ -1,6 +1,7 @@
 <script>
   import { onMount } from 'svelte';
-  import { getJSON, digest, ago, clock, clusterHealth, versionClass, short } from './util.js';
+  import { getJSON, digest, ago, clock, clusterHealth, versionClass, short, clusterColor } from './util.js';
+  import ClusterTimes from './ClusterTimes.svelte';
   import NodeGrid from './NodeGrid.svelte';
   import Throughput from './Throughput.svelte';
   import Heatmap from './Heatmap.svelte';
@@ -36,12 +37,13 @@
 <section class="head">
   <div class="title">
     <a href="#/" class="back">← Clusters</a>
-    <h2 class="mono" title={id}>{short(id, 18)}…</h2>
+    <h2 class="mono" title={id}><span class="swatch" style={`background:${clusterColor(id)}`}></span>{short(id, 18)}…</h2>
     {#if cluster}
       {@const h = clusterHealth(cluster)}
       <span class="pill {h.cls}"><span class="dot"></span>{h.label}</span>
       <span class="pill {versionClass(cluster.version)}">HotPocket {cluster.version}</span>
       <span class="muted">{cluster.nodes} nodes · height {cluster.max_seq ?? '—'} · last close {ago(cluster.last_close_age)} ago</span>
+      <ClusterTimes c={cluster} now={overview.now} />
     {/if}
   </div>
   <div class="seg">
@@ -103,9 +105,9 @@
   </section>
 
   <Heatmap minutes={d.minutes} since={data.since} until={data.until} />
-  <Incidents incidents={d.incidents} until={data.until} />
+  <Incidents incidents={d.incidents} until={data.until} startTs={cluster?.start_ts} />
   <HostCharts hostMinutes={d.hostMinutes} since={data.since} until={data.until} />
-  <p class="faint foot">Updated {clock(data.until)} UTC{loading ? ' · refreshing…' : ''}</p>
+  <p class="faint foot">Updated {clock(data.until)}{loading ? ' · refreshing…' : ''}</p>
 {/if}
 
 <style>
@@ -113,6 +115,7 @@
   .title { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .back { font-size: 13px; }
   h2 { margin: 0; font-size: 17px; }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 8px; vertical-align: -1px; }
   .two { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; }
   .totals { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px; }
   .tot { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; border-bottom: 1px dashed var(--border); padding-bottom: 4px; }

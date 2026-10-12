@@ -21,8 +21,8 @@
 
   const ca = $derived(overview.clusters.find((c) => c.contract_id === a));
   const cb = $derived(overview.clusters.find((c) => c.contract_id === b));
-  const ma = $derived(da ? metrics(da) : null);
-  const mb = $derived(db ? metrics(db) : null);
+  const ma = $derived(da ? metrics(da, ca?.start_ts) : null);
+  const mb = $derived(db ? metrics(db, cb?.start_ts) : null);
 
   // [key, label, better: 'high' | 'low', format]
   const ROWS = [

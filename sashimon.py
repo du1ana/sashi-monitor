@@ -33,7 +33,7 @@ import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 PEER_STALE_S = 60     # keep using a peer's last good snapshot this long after a failed poll
 
@@ -131,6 +131,12 @@ class Store:
         self.w.execute("PRAGMA journal_size_limit=67108864")
         self.w.execute("PRAGMA busy_timeout=5000")
         self.w.executescript(SCHEMA)
+        # Columns added after the first release (ALTER fails harmlessly when they already exist).
+        for col in ("start_ts REAL", "start_src TEXT"):
+            try:
+                self.w.execute("ALTER TABLE clusters ADD COLUMN " + col)
+            except sqlite3.OperationalError:
+                pass
         # Incidents left open by a previous run can't be tracked any more: close them at restart. Forks are the
         # exception: they are reloaded and stay open until the nodes are verifiably back on one chain.
         self.w.execute("UPDATE incidents SET end_ts=?, summary=summary || ' (closed at monitor restart)' "
@@ -165,6 +171,11 @@ class Store:
             nid = self.w.execute("SELECT id FROM nodes WHERE cluster_id=? AND name=?", (cluster_id, name)).fetchone()[0]
             self.ids[key] = nid
             return nid
+
+    def record_start(self, cluster_id, ts, src):
+        """Cluster start = when the real contract replaced the bootstrap contract. The earliest report wins."""
+        self.put("UPDATE clusters SET start_ts=?, start_src=? WHERE id=? AND (start_ts IS NULL OR start_ts > ?)",
+                 (ts, src, cluster_id, ts))
 
     def insert_incident(self, cluster_id, node_id, kind, severity, start_ts, summary, detail):
         with self.id_lock:
@@ -299,6 +310,9 @@ class Node:
         self.stats = None
         self.frozen_since = None
         self.proc = None             # last /proc diagnosis
+        self.expiry_ts = None        # lease expiry (from sashi list)
+        self.post_exec_ts = None     # last "Post-exec script executed successfully" (the bundle's install script)
+        self.last_patch = None       # patch hash of the last closed ledger
         self.ring = collections.deque(maxlen=app.ring_lines)
         self.minute = None
         self.cnt = None
@@ -464,11 +478,16 @@ class Node:
         if c0 == "*" and "Ledger created" in msg:
             mm = RE_CREATED.search(msg)
             if mm:
-                seq, h = int(mm.group(1)), mm.group(2)
+                seq, h, patch = int(mm.group(1)), mm.group(2), mm.group(4)
                 self.seq, self.hash, self.close_ts = seq, h, ts
                 self._bump(ts, "closes")
                 self._bump(ts, "max_seq", seq)
                 self.app.detector.ledger(self, seq, h, ts)
+                # Fallback start marker: the first patch change this node shows (bootstrap patch -> uploaded bundle's
+                # patch), used only when the post-exec marker below was not seen.
+                if self.last_patch and patch != self.last_patch:
+                    self.app.cluster_started(self, ts, "patch-change", fallback=True)
+                self.last_patch = patch
             return
         if msg.startswith(HIGH_VOLUME_PREFIXES):
             # High-volume debug lines (candidate proposals, waits, stage starts, own proposals): nothing to record.
@@ -544,9 +563,16 @@ class Node:
                 self.app.store.put("INSERT OR REPLACE INTO stats(node_id, ts, rounds, data) VALUES (?,?,?,?)",
                                    (self.id, ts, int(mm.group(1)), json.dumps(data)))
             return
+        if msg.startswith("Post-exec script executed successfully"):
+            self.post_exec_ts = ts
+            return
         if msg.startswith("Contract config updated from patch file"):
             self.app.detector.node_event(self, ts, "config_patch", "info", "config patch applied (UNL/settings)",
                                          {"line": msg}, dedupe_s=5)
+            # The uploaded bundle's install script runs, then its patch (UNL, contract binary) is applied: this is the
+            # moment the real contract replaced the bootstrap contract.
+            if self.post_exec_ts is not None and 0 <= ts - self.post_exec_ts <= 300:
+                self.app.cluster_started(self, ts, "post-exec")
             return
         if msg.startswith("Applying pending patch"):
             mm = RE_PATCH_SYNC.search(msg)
@@ -588,6 +614,7 @@ class Node:
                 "read_ts": self.read_ts, "idle_s": round(now - self.read_ts, 1) if self.read_ts else None,
                 "vote_status": VOTE_STATUS_NAMES.get(self.vote_status), "last_votes": self.last_votes,
                 "frozen_since": self.frozen_since, "proc": self.proc, "stats": self.stats,
+                "expiry_ts": self.expiry_ts,
             }
 
     def ring_text(self, since_ts=None):
@@ -787,6 +814,8 @@ class Detector:
                 continue
             max_seq = max(seqs)
             st = self.cluster_state.setdefault(contract_id, {"max_seq": max_seq, "advance_ts": now})
+            # Most nodes ever seen at once: nodes missing since then have expired or been deleted.
+            st["peak"] = max(st.get("peak", 0), len(nodes))
             if max_seq > st["max_seq"]:
                 st["max_seq"], st["advance_ts"] = max_seq, now
 
@@ -928,24 +957,60 @@ class App:
         self.peer_ctx.verify_mode = ssl.CERT_NONE
         self.started = time.time()
         self.cluster_seen = {}        # contract_id -> last time any host reported a live node for it
+        self.placeholder_re = re.compile(args.placeholder_image)
+        self.instances = []           # every running instance on this host (incl. placeholders), for the slot view
+        self.max_instances = None     # host capacity (sa.cfg max_instance_count)
+        # Cluster start times known locally: contract_id -> (ts, src). Seeded from the DB.
+        self.starts = {}
+        c = self.store.reader()
+        try:
+            for r in c.execute("SELECT contract_id, start_ts, start_src FROM clusters WHERE start_ts IS NOT NULL"):
+                self.starts[r["contract_id"]] = (r["start_ts"], r["start_src"])
+        finally:
+            c.close()
+
+    def cluster_started(self, node, ts, src, fallback=False):
+        known = self.starts.get(node.contract_id)
+        if known and (fallback or known[0] <= ts):
+            return
+        self.starts[node.contract_id] = (ts, src)
+        self.store.record_start(node.cluster_id, ts, src)
+
+    def read_capacity(self):
+        if self.args.max_instances:
+            return self.args.max_instances
+        try:
+            with open(self.args.sa_cfg) as f:
+                return int(json.load(f)["system"]["max_instance_count"])
+        except Exception:
+            return None
 
     # -- discovery
     def discover(self):
         found = []
         if self.args.instances_dir:
+            # Test mode: each dir has cfg/hp.cfg and log/hp.log; an optional instance.json simulates the sashi list
+            # fields (image, tenant, expiry_timestamp, contract_id), e.g. for placeholders that have no hp.cfg.
             pattern = self.args.instances_dir
             if not any(ch in pattern for ch in "*?["):
                 pattern = os.path.join(pattern, "*")
             for d in sorted(glob.glob(pattern)):
-                cfg = os.path.join(d, "cfg", "hp.cfg")
-                if not os.path.exists(cfg):
-                    continue
+                meta = {}
                 try:
-                    contract_id = json.load(open(cfg))["contract"]["id"]
+                    with open(os.path.join(d, "instance.json")) as f:
+                        meta = json.load(f)
+                except (OSError, ValueError):
+                    pass
+                contract_id = meta.get("contract_id")
+                try:
+                    contract_id = json.load(open(os.path.join(d, "cfg", "hp.cfg")))["contract"]["id"]
                 except Exception:
+                    pass
+                if not contract_id:
                     continue
-                found.append({"name": os.path.basename(d).upper(), "dir": d, "user": None,
-                              "contract_id": contract_id, "image": "local"})
+                found.append({"name": os.path.basename(d).upper(), "dir": d, "user": None, "contract_id": contract_id,
+                              "image": meta.get("image", "local"), "tenant": meta.get("tenant"),
+                              "expiry_ts": meta.get("expiry_timestamp")})
         else:
             try:
                 out = subprocess.run([self.args.sashi, "list"], capture_output=True, text=True, timeout=30).stdout
@@ -954,14 +1019,26 @@ class App:
                         continue
                     d = "/home/%s/%s" % (i["user"], i["name"])
                     found.append({"name": i["name"], "dir": d, "user": i["user"],
-                                  "contract_id": i.get("contract_id", "?"), "image": i.get("image", "")})
+                                  "contract_id": i.get("contract_id", "?"), "image": i.get("image", ""),
+                                  "tenant": i.get("tenant"), "expiry_ts": i.get("expiry_timestamp")})
             except Exception:
                 traceback.print_exc()
                 return
+        self.max_instances = self.read_capacity()
         names = set()
+        instances = []
         for i in found:
             log_dir = os.path.join(i["dir"], "log")
-            if not os.path.isdir(log_dir):
+            # Placeholders hold a slot and do nothing: shown in the slot view only, never followed or stored.
+            if self.placeholder_re.search(i["image"] or ""):
+                kind = "placeholder"
+            elif os.path.isdir(log_dir) and os.path.exists(os.path.join(log_dir, "hp.log")):
+                kind = "node"
+            else:
+                kind = "other"      # e.g. another tenant's non-HotPocket instance
+            instances.append({"name": i["name"], "short": i["name"][:8], "contract_id": i["contract_id"],
+                              "image": i["image"], "tenant": i["tenant"], "expiry_ts": i["expiry_ts"], "kind": kind})
+            if kind != "node":
                 continue
             names.add(i["name"])
             self.store.put("UPDATE clusters SET last_seen=? WHERE contract_id=?", (time.time(), i["contract_id"]))
@@ -969,6 +1046,8 @@ class App:
                 if i["name"] not in self.nodes:
                     self.nodes[i["name"]] = Node(self, i["name"], i["contract_id"], i["user"], log_dir, i["image"],
                                                  os.path.join(i["dir"], "cfg", "hp.cfg"))
+                self.nodes[i["name"]].expiry_ts = i["expiry_ts"]
+        self.instances = instances
         with self.nodes_lock:
             for name in list(self.nodes):
                 if name not in names:
@@ -990,7 +1069,8 @@ class App:
                 recent[n.contract_id] = {str(k): v for k, v in
                                          self.detector.local_recent(n.cluster_id, n.seq - 256).items()}
         return {"host": self.host, "version": VERSION, "ts": time.time(), "nodes": nodes, "recent": recent,
-                "metrics": self.metrics.now}
+                "metrics": self.metrics.now, "slots": {"max": self.max_instances, "instances": self.instances},
+                "starts": {cid: ts for cid, (ts, _src) in self.starts.items()}}
 
     def poll_peers(self):
         for p in self.peers.values():
@@ -1255,6 +1335,15 @@ def overview(app):
     for n in nodes:
         clusters[n["contract_id"]].append(n)
     known = q_clusters(app)
+    # Start times: the earliest any host knows (each host sees only its own nodes' logs).
+    starts = {cid: ts for cid, (ts, _src) in app.starts.items()}
+    for p in app.peers.values():
+        for cid, ts in ((p.get("data") or {}).get("starts") or {}).items():
+            if ts and (cid not in starts or ts < starts[cid]):
+                starts[cid] = ts
+    for cid, rec in known.items():
+        if rec.get("start_ts") and (cid not in starts or rec["start_ts"] < starts[cid]):
+            starts[cid] = rec["start_ts"]
     out = []
     for cid, ns in clusters.items():
         seqs = [n["seq"] for n in ns if n.get("seq") is not None]
@@ -1270,6 +1359,10 @@ def overview(app):
             "frozen": sum(1 for n in ns if n.get("frozen_since")),
             "silent": sum(1 for n in ns if n.get("idle_s") is None or n["idle_s"] > app.freeze_s),
             "open_incidents": open_inc, "first_seen": known.get(cid, {}).get("first_seen"),
+            "start_ts": starts.get(cid),
+            # The cluster starts losing nodes at the earliest lease expiry.
+            "expiry_ts": min([n["expiry_ts"] for n in ns if n.get("expiry_ts")] or [None], key=lambda x: x or 1e18),
+            "peak_nodes": app.detector.cluster_state.get(cid, {}).get("peak", len(ns)),
         })
     # Clusters with no live nodes any more (e.g. an earlier test run) stay listed from the DB, so they can be compared.
     c = app.store.reader()
@@ -1287,17 +1380,23 @@ def overview(app):
             out.append({"contract_id": cid, "nodes": 0, "offline": True, "hosts": dict(hosts_c), "versions": dict(vers),
                         "version": vers.most_common(1)[0][0], "max_seq": last[1], "min_seq": None,
                         "last_close_age": now - last[0] if last[0] else None, "frozen": 0, "silent": 0,
-                        "open_incidents": [], "first_seen": rec.get("first_seen"), "last_seen": rec.get("last_seen")})
+                        "open_incidents": [], "first_seen": rec.get("first_seen"), "last_seen": rec.get("last_seen"),
+                        "start_ts": starts.get(cid), "expiry_ts": None, "peak_nodes": None})
     finally:
         c.close()
     hosts = [{"host": app.host, "self": True, "ok": True, "metrics": app.metrics.now, "version": VERSION,
-              "nodes": len(app.local_nodes())}]
+              "nodes": len(app.local_nodes()), "slots": {"max": app.max_instances, "instances": app.instances}}]
     for p in app.peers.values():
         d = p.get("data") or {}
         hosts.append({"host": d.get("host") or p["url"], "url": p["url"], "self": False, "ok": p["ok"],
                       "error": p["error"], "metrics": d.get("metrics"), "version": d.get("version"),
-                      "nodes": len(d.get("nodes") or []), "age": now - p["ts"] if p["ts"] else None})
-    return {"now": now, "host": app.host, "version": VERSION, "hosts": hosts,
+                      "nodes": len(d.get("nodes") or []), "age": now - p["ts"] if p["ts"] else None,
+                      "slots": d.get("slots")})
+    # Per-node state for the slot view (height and health of each instance box).
+    node_state = {n["name"]: {"seq": n.get("seq"), "idle_s": n.get("idle_s"), "frozen": bool(n.get("frozen_since")),
+                              "vote": n.get("vote_status"), "version": n.get("version"),
+                              "contract_id": n["contract_id"]} for n in nodes}
+    return {"now": now, "host": app.host, "version": VERSION, "hosts": hosts, "node_state": node_state,
             "clusters": sorted(out, key=lambda c: (bool(c.get("offline")), -(c["first_seen"] or 0))),
             "config": {"freeze_s": app.freeze_s, "stall_s": app.stall_s, "split_ledgers": app.split_seq,
                        "retention_h": app.args.retention_hours, "max_db_mb": app.args.max_db_mb}}
@@ -1327,6 +1426,12 @@ def main():
     ap.add_argument("--split-ledgers", type=int, default=int(env("SASHIMON_SPLIT_LEDGERS", "5")))
     ap.add_argument("--purge-deleted-after", type=float, default=float(env("SASHIMON_PURGE_DELETED_AFTER", "300")),
                     help="delete all data of a cluster once no host has seen a live node of it for this many seconds (0 = keep)")
+    ap.add_argument("--placeholder-image", default=env("SASHIMON_PLACEHOLDER_IMAGE", "placeholder"),
+                    help="regex on the instance image: matching instances are placeholders (slot view only)")
+    ap.add_argument("--sa-cfg", default=env("SASHIMON_SA_CFG", "/etc/sashimono/sa.cfg"),
+                    help="Sashimono config, read for the host's max instance count")
+    ap.add_argument("--max-instances", type=int, default=int(env("SASHIMON_MAX_INSTANCES", "0")),
+                    help="override the host's instance capacity (test mode)")
     ap.add_argument("--dashboard", default=env("SASHIMON_DASHBOARD"))
     ap.add_argument("--tls-cert", default=env("SASHIMON_TLS_CERT"))
     ap.add_argument("--tls-key", default=env("SASHIMON_TLS_KEY"))

@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { getJSON, incMeta, clock } from './util.js';
+  import { getJSON, incMeta, clock, logLocalTime } from './util.js';
   let { incident, onclose } = $props();
 
   let full = $state(null);
@@ -80,7 +80,7 @@
         {#each logs as c}
           <details open={logs.length === 1}>
             <summary class="mono">{c.node} · captured {clock(c.ts)} · {c.text.split('\n').length} lines</summary>
-            <div class="log mono" use:toEnd>{#each lines(c.text) as l}<div class={cls(l)}>{l}</div>{/each}</div>
+            <div class="log mono" use:toEnd>{#each lines(c.text) as l}<div class={cls(l)}><span class="lt" title="your local time">{logLocalTime(l)}</span>{l}</div>{/each}</div>
           </details>
         {/each}
       {:else}
@@ -109,4 +109,5 @@
     white-space: pre; margin-top: 8px; }
   .log .e { color: var(--bad); } .log .w { color: var(--warn); } .log .w2 { color: var(--warn); opacity: .85; }
   .log .ok { color: var(--ok); } .log .i { color: var(--info); }
+  .log .lt { color: var(--faint); display: inline-block; min-width: 96px; margin-right: 10px; user-select: none; }
 </style>

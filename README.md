@@ -39,8 +39,17 @@ Standard library Python only. The dashboard is a Svelte app built into one self-
 
 ## Dashboard
 
+All times are shown in the viewer's local timezone (shown in the header). Captured log lines keep HotPocket's own
+UTC timestamp and get a local-time column next to it.
+
+- **Hosts:** load, CPU, memory, disk, and the host's instance slots (capacity from `sa.cfg`): one box per instance,
+  coloured by cluster (each cluster has a fixed colour, also used on its card), placeholders grey, other tenants'
+  instances hatched, free slots dashed. Hover for name, version, height and lease expiry; click to open the cluster.
 - **Clusters:** status (healthy / degraded / stalled / forked / offline), HotPocket version, height, spread between
-  nodes, open incidents. Pick two to compare.
+  nodes, open incidents, when the cluster started (the real contract replacing the bootstrap contract), how long it
+  has run, when its first node lease expires, and how many nodes have gone since. Pick two to compare.
+- **Placeholders:** instances whose image matches `--placeholder-image` (default: contains `placeholder`) only hold a
+  slot. They are shown in the slot view and nowhere else: not followed, no cluster, no incidents or stats.
 - **Cluster view:**
   - node grid (height lag, vote status, frozen)
   - ledgers per minute with incident bands
@@ -75,7 +84,10 @@ Main options (flag / env):
 | `--split-ledgers` | `SASHIMON_SPLIT_LEDGERS` | 5 | |
 | `--purge-deleted-after` | `SASHIMON_PURGE_DELETED_AFTER` | 300 | delete all data of a cluster once no host has seen a live node of it for this long (0 = keep) |
 | `--ring-lines` | `SASHIMON_RING_LINES` | 6000 | per node |
-| `--instances-dir GLOB` | `SASHIMON_INSTANCES_DIR` | | test mode: node directories (each with `cfg/hp.cfg`, `log/hp.log`) instead of `sashi list` |
+| `--placeholder-image REGEX` | `SASHIMON_PLACEHOLDER_IMAGE` | `placeholder` | instances whose image matches are placeholders (slot view only) |
+| `--sa-cfg` | `SASHIMON_SA_CFG` | `/etc/sashimono/sa.cfg` | read for the host's max instance count |
+| `--max-instances` | `SASHIMON_MAX_INSTANCES` | | override the host's capacity (test mode) |
+| `--instances-dir GLOB` | `SASHIMON_INSTANCES_DIR` | | test mode: node directories (each with `cfg/hp.cfg`, `log/hp.log`) instead of `sashi list`; an optional `instance.json` per directory sets `image`, `tenant`, `expiry_timestamp`, `contract_id` |
 
 ## API
 

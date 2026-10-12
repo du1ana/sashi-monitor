@@ -1,5 +1,5 @@
 <script>
-  import { clock } from './util.js';
+  import { hm } from './util.js';
   let { hostMinutes, since, until } = $props();
 
   const SERIES = [
@@ -21,7 +21,7 @@
 </script>
 
 <section class="panel">
-  <div class="panel-head"><h3>Host load</h3><span class="faint">per minute, {clock(since).slice(0, 5)}–{clock(until).slice(0, 5)} UTC</span></div>
+  <div class="panel-head"><h3>Host load</h3><span class="faint">per minute, {hm(since)}–{hm(until)}</span></div>
   <div class="panel-body grid4">
     {#each Object.entries(hostMinutes) as [host, rows]}
       {#each SERIES as [key, label, max]}

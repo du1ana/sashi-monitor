@@ -17,9 +17,66 @@ export function ago(sec) {
   return `${Math.floor(sec / 86400)}d ${Math.floor((sec % 86400) / 3600)}h`;
 }
 
+// All times are shown in the viewer's local timezone (the browser's), never UTC.
+const pad = (n) => String(n).padStart(2, '0');
+const sameDay = (a, b) => a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+
+// HH:MM:SS for today, "Oct 12 HH:MM:SS" for other days.
 export function clock(ts) {
   if (!ts) return '—';
-  return new Date(ts * 1000).toISOString().slice(11, 19);
+  const d = new Date(ts * 1000);
+  const t = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  if (sameDay(d, new Date())) return t;
+  return `${d.toLocaleString(undefined, { month: 'short' })} ${d.getDate()} ${t}`;
+}
+
+// HH:MM (chart axes).
+export function hm(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// e.g. "UTC+05:30"
+export function tzLabel() {
+  const off = -new Date().getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const a = Math.abs(off);
+  return `UTC${sign}${pad(Math.floor(a / 60))}:${pad(a % 60)}`;
+}
+
+// Countdown to a future epoch time: "2h 14m", or null when unknown.
+export function until(ts, now = Date.now() / 1000) {
+  if (!ts) return null;
+  return ts - now;
+}
+
+// HotPocket log lines start with their own UTC timestamp ("20261012 13:45:49.123"): local time for display.
+const LOG_TS = /^(\d{4})(\d\d)(\d\d) (\d\d):(\d\d):(\d\d)\.(\d{3})/;
+export function logLocalTime(line) {
+  const m = LOG_TS.exec(line);
+  if (!m) return '';
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]));
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${m[7]}`;
+}
+
+// One fixed colour per cluster (by contract id), the same in the slot view, cards and events.
+// Mid-tone hues that read on both the light and the dark theme.
+const CLUSTER_COLORS = ['#4e79a7', '#f28e2b', '#59a14f', '#b07aa1', '#76b7b2', '#edc948', '#ff9da7', '#9c755f',
+  '#2ca7c9', '#e15759', '#8cd17d', '#a0cbe8'];
+export function clusterColor(cid) {
+  if (!cid) return 'var(--faint)';
+  let h = 0;
+  for (const ch of String(cid)) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return CLUSTER_COLORS[h % CLUSTER_COLORS.length];
+}
+
+// Expiry level: amber under 30 min, red under 10 min.
+export function expiryClass(sec) {
+  if (sec == null) return '';
+  if (sec < 600) return 'bad';
+  if (sec < 1800) return 'warn';
+  return '';
 }
 
 export function dur(start, end, now) {
@@ -125,13 +182,16 @@ export function digest(data) {
 }
 
 // Summary numbers for one cluster over the loaded window (used by the compare view).
-export function metrics(data) {
+export function metrics(data, startTs) {
   const d = digest(data);
-  const span = Math.max(60, (data.until - data.since));
+  // Rates count from the cluster start (bootstrap time before the real contract is excluded).
+  const from = startTs && startTs > data.since ? startTs : data.since;
+  if (from > data.since) d.series = d.series.filter((s) => s.minute * 60 >= from - 60);
+  const span = Math.max(60, (data.until - from));
   const mins = d.series.length || 1;
   const count = (k) => d.incidents.filter((i) => i.kind === k).length;
   const stallSecs = d.incidents.filter((i) => i.kind === 'stall')
-    .reduce((s, i) => s + ((i.end_ts ?? data.until) - Math.max(i.start_ts, data.since)), 0);
+    .reduce((s, i) => s + Math.max(0, (i.end_ts ?? data.until) - Math.max(i.start_ts, from)), 0);
   const nodeCount = new Set(d.minutes.map((m) => m.node + '@' + m.host)).size || 1;
   const sum = (k) => d.minutes.reduce((s, m) => s + (m[k] || 0), 0);
   const zeroMinutes = d.series.filter((s) => (s.closes || 0) === 0).length;

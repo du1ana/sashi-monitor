@@ -1,5 +1,6 @@
 <script>
-  import { ago, clusterHealth, versionClass, incMeta, short } from './util.js';
+  import { ago, clusterHealth, versionClass, incMeta, short, clusterColor } from './util.js';
+  import ClusterTimes from './ClusterTimes.svelte';
   let { overview } = $props();
 
   let picked = $state([]);
@@ -26,13 +27,15 @@
     {#each overview.clusters as c (c.contract_id)}
       {@const h = clusterHealth(c)}
       {@const spread = c.max_seq != null && c.min_seq != null ? c.max_seq - c.min_seq : null}
-      <article class="panel card" class:picked={picked.includes(c.contract_id)} class:offline={c.offline}>
+      <article class="panel card" class:picked={picked.includes(c.contract_id)} class:offline={c.offline}
+        style={`--c:${clusterColor(c.contract_id)}`}>
         <a class="body" href={`#/c/${encodeURIComponent(c.contract_id)}`}>
           <div class="row1">
             <span class="pill {h.cls}"><span class="dot"></span>{h.label}</span>
             <span class="pill {versionClass(c.version)}">HotPocket {c.version}</span>
           </div>
-          <div class="cid mono" title={c.contract_id}>{short(c.contract_id, 18)}…</div>
+          <div class="cid mono" title={c.contract_id}><span class="swatch"></span>{short(c.contract_id, 18)}…</div>
+          <ClusterTimes {c} now={overview.now} />
           <div class="kpis">
             <div class="kpi"><span class="label">Height</span><span class="value">{c.max_seq ?? '—'}</span></div>
             <div class="kpi"><span class="label">Spread</span>
@@ -70,7 +73,8 @@
   .head p { margin: 0; font-size: 13px; }
   .btn.disabled { opacity: .45; pointer-events: none; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
-  .card { position: relative; transition: border-color .15s; }
+  .card { position: relative; transition: border-color .15s; border-left: 4px solid var(--c); }
+  .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 3px; background: var(--c); margin-right: 6px; }
   .card:hover { border-color: var(--faint); }
   .card.offline { opacity: .78; }
   .card.picked { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }

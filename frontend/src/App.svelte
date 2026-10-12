@@ -1,6 +1,6 @@
 <script>
   import { onMount } from 'svelte';
-  import { getJSON } from './lib/util.js';
+  import { getJSON, tzLabel } from './lib/util.js';
   import HostStrip from './lib/HostStrip.svelte';
   import Overview from './lib/Overview.svelte';
   import ClusterView from './lib/ClusterView.svelte';
@@ -50,6 +50,7 @@
     <span class="sub">consensus observer</span>
   </a>
   <div class="right">
+    <span class="faint" title="All times on this page are in your computer's timezone">Times in {tzLabel()}</span>
     {#if overview}<span class="faint mono">v{overview.version} · {overview.host}</span>{/if}
     <div class="seg" title="Theme">
       {#each ['auto', 'light', 'dark'] as t}
@@ -65,7 +66,7 @@
   {:else if !overview}
     <div class="panel empty">Loading…</div>
   {:else}
-    <HostStrip hosts={overview.hosts} {error} />
+    <HostStrip hosts={overview.hosts} {error} clusters={overview.clusters} nodeState={overview.node_state || {}} />
     {#if route.view === 'cluster'}
       <ClusterView id={route.id} {overview} />
     {:else if route.view === 'compare'}

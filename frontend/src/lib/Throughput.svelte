@@ -1,5 +1,5 @@
 <script>
-  import { incMeta, clock } from './util.js';
+  import { incMeta, hm } from './util.js';
   let { series, incidents, since, until } = $props();
 
   const W = 900, H = 220, P = { l: 36, r: 12, t: 12, b: 26 };
@@ -49,12 +49,12 @@
           <path d={path('closes')} class="line ok" />
           <path d={path('vote_split', 5)} class="line warn" />
           {#each ticks as t}
-            <text x={x(t)} y={H - 6} class="axis" text-anchor="middle">{clock(t).slice(0, 5)}</text>
+            <text x={x(t)} y={H - 6} class="axis" text-anchor="middle">{hm(t)}</text>
           {/each}
         </svg>
         {#if hover}
           <div class="tip">
-            <b>{clock(hover.minute * 60).slice(0, 5)}</b> · height {hover.max_seq} · {hover.closes} closed ·
+            <b>{hm(hover.minute * 60)}</b> · height {hover.max_seq} · {hover.closes} closed ·
             {hover.vote_split} vote splits · {hover.consensus_lost} too few · {hover.refused} refused · {hover.fast_forward} ff
           </div>
         {/if}
