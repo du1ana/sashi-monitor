@@ -33,7 +33,7 @@ import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 PEER_STALE_S = 60     # keep using a peer's last good snapshot this long after a failed poll
 
@@ -55,7 +55,7 @@ RE_STATS = re.compile(r"Consensus stats \(last (\d+) rounds\): (.*)$")
 RE_KV = re.compile(r"([a-z-]+):(\d+)")
 RE_FF = re.compile(r"ours:(\d+)-([0-9a-f]+) certified:(\d+)-([0-9a-f]+) from:([0-9a-f]+)")
 RE_REFUSED = re.compile(r"lcl\(ours/theirs\):(\d+)-([0-9a-f]+)/(\d+)-([0-9a-f]+)")
-RE_VERSION = re.compile(r"^HotPocket (\d+\.\d+\.\d+)")
+RE_VERSION = re.compile(r"^HotPocket (\d+(?:\.\d+)+)")  # any number of parts: 0.6.6, 0.6.6.2
 RE_PUBKEY = re.compile(r"^Public key: (ed[0-9a-f]+)")
 RE_PATCH_SYNC = re.compile(r"Applying pending patch recorded in synced ledger (\d+)-([0-9a-f]+)")
 RE_CONFLICT = re.compile(r"Conflicting certified ledgers at seq (\d+)")

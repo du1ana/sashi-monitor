@@ -74,7 +74,7 @@
             <span class="s faint num">swap {fmt(m.swap_mb)} MB</span></div>
           <div class="m"><span class="k">disk</span><span class="v num {level(m.disk_pct, 80, 92)}">{fmt(m.disk_pct)}%</span>
             <span class="s faint num">{fmt((m.disk_free_mb || 0) / 1024, 1)} GB free</span></div>
-          <div class="m"><span class="k">sashimon</span><span class="v num">{fmt(m.db_mb, 1)} MB</span>
+          <div class="m"><span class="k">sashi.mon</span><span class="v num">{fmt(m.db_mb, 1)} MB</span>
             <span class="s faint num">cpu {fmt(m.sashimon_cpu, 1)}% · {h.nodes} nodes</span></div>
         </div>
         {#if h.slots}

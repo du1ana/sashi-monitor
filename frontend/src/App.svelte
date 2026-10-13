@@ -46,7 +46,7 @@
 <header>
   <a class="brand" href="#/">
     <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><circle cx="16" cy="16" r="12" fill="none" stroke="var(--ok)" stroke-width="4"/><circle cx="16" cy="16" r="4" fill="var(--ok)"/></svg>
-    <span>sashimon</span>
+    <span>sashi.mon</span>
     <span class="sub">consensus observer</span>
   </a>
   <div class="right">
@@ -62,7 +62,7 @@
 
 <main>
   {#if error && !overview}
-    <div class="panel empty">Cannot reach sashimon API: {error}</div>
+    <div class="panel empty">Cannot reach sashi.mon API: {error}</div>
   {:else if !overview}
     <div class="panel empty">Loading…</div>
   {:else}

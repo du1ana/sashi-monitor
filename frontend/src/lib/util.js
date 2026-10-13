@@ -87,6 +87,7 @@ export function dur(start, end, now) {
 export function versionClass(v) {
   if (!v || v === '?') return 'neutral';
   if (v.startsWith('0.6.5') || v.startsWith('0.6.4')) return 'v065';
+  if (/^\d+\.\d+\.\d+\.\d+/.test(v)) return 'vpatch';   // patch releases on top of a version, e.g. 0.6.6.2
   return 'v066';
 }
 
