@@ -33,9 +33,10 @@ import zlib
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 
 PEER_STALE_S = 60     # keep using a peer's last good snapshot this long after a failed poll
+CAPTURE_COOLDOWN_S = 600  # a node event captures that node's log at most once per kind in this window
 
 # ---------------------------------------------------------------------------------------------------------
 # Log parsing
@@ -57,7 +58,7 @@ RE_FF = re.compile(r"ours:(\d+)-([0-9a-f]+) certified:(\d+)-([0-9a-f]+) from:([0
 RE_REFUSED = re.compile(r"lcl\(ours/theirs\):(\d+)-([0-9a-f]+)/(\d+)-([0-9a-f]+)")
 RE_VERSION = re.compile(r"^HotPocket (\d+(?:\.\d+)+)")  # any number of parts: 0.6.6, 0.6.6.2
 RE_PUBKEY = re.compile(r"^Public key: (ed[0-9a-f]+)")
-RE_PATCH_SYNC = re.compile(r"Applying pending patch recorded in synced ledger (\d+)-([0-9a-f]+)")
+RE_PATCH_SYNC = re.compile(r"Applying (?:pending )?patch recorded in (?:synced )?ledger (\d+)-([0-9a-f]+)")
 RE_CONFLICT = re.compile(r"Conflicting certified ledgers at seq (\d+)")
 
 VOTE_STATUS_NAMES = {0: "unknown", 1: "unreliable", 2: "desync", 3: "synced"}
@@ -236,8 +237,10 @@ class Store:
             ("DELETE FROM host_minutes WHERE minute < ?", (minute_cut,)),
             ("DELETE FROM ledgers WHERE last_ts < ?", (cutoff,)),
             ("DELETE FROM stats WHERE ts < ?", (cutoff,)),
-            ("DELETE FROM captures WHERE ts < ?", (cutoff,)),
-            ("DELETE FROM incidents WHERE start_ts < ? AND end_ts IS NOT NULL", (cutoff,)),
+            # Captures are the evidence of an incident and are kept until the size cap needs the space (below), however
+            # old: an incident is often looked at days later. Incidents without captures follow the age retention.
+            ("DELETE FROM incidents WHERE start_ts < ? AND end_ts IS NOT NULL"
+             " AND id NOT IN (SELECT DISTINCT incident_id FROM captures)", (cutoff,)),
         ]
         with self.id_lock:
             for sql, args in stmts:
@@ -250,28 +253,38 @@ class Store:
                 if not row or row[0] is None:
                     break
                 self.w.execute("DELETE FROM captures WHERE id < ?", (row[0] + 200,))
+                self.w.execute("DELETE FROM incidents WHERE start_ts < ? AND end_ts IS NOT NULL"
+                               " AND id NOT IN (SELECT DISTINCT incident_id FROM captures)", (cutoff,))
                 self.w.execute("PRAGMA incremental_vacuum(2000)")
             self.w.execute("PRAGMA incremental_vacuum(5000)")
             self.w.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     def purge_cluster(self, cluster_id):
-        """Delete everything stored about one cluster (used once it no longer exists)."""
+        """Delete what is stored about one cluster once it no longer exists. Incidents with captures (and the cluster
+        and node rows they refer to) are kept as evidence: clusters are usually deleted right after an incident was
+        investigated, and the size cap removes their captures in time. The cluster is purged completely on a later
+        pass once no capture of it is left. Returns True if it was purged completely."""
         with self.id_lock:
             nodes = "(SELECT id FROM nodes WHERE cluster_id=?)"
-            for sql in (
-                "DELETE FROM captures WHERE incident_id IN (SELECT id FROM incidents WHERE cluster_id=?)",
-                "DELETE FROM incidents WHERE cluster_id=?",
+            evidence = self.w.execute(
+                "SELECT COUNT(*) FROM captures WHERE incident_id IN (SELECT id FROM incidents WHERE cluster_id=?)",
+                (cluster_id,)).fetchone()[0] > 0
+            stmts = [
+                "DELETE FROM incidents WHERE cluster_id=? AND id NOT IN (SELECT DISTINCT incident_id FROM captures)",
                 "DELETE FROM node_minutes WHERE node_id IN " + nodes,
                 "DELETE FROM stats WHERE node_id IN " + nodes,
                 "DELETE FROM ledgers WHERE cluster_id=?",
-                "DELETE FROM nodes WHERE cluster_id=?",
-                "DELETE FROM clusters WHERE id=?",
-            ):
+            ]
+            if not evidence:
+                stmts += ["DELETE FROM nodes WHERE cluster_id=?", "DELETE FROM clusters WHERE id=?"]
+            for sql in stmts:
                 self.w.execute(sql, (cluster_id,))
             self.w.execute("PRAGMA incremental_vacuum(2000)")
-            for key in [k for k, v in self.ids.items() if (k[0] == "c" and v == cluster_id) or
-                        (k[0] == "n" and k[1] == cluster_id)]:
-                del self.ids[key]
+            if not evidence:
+                for key in [k for k, v in self.ids.items() if (k[0] == "c" and v == cluster_id) or
+                            (k[0] == "n" and k[1] == cluster_id)]:
+                    del self.ids[key]
+            return not evidence
 
     def clear(self):
         with self.id_lock:
@@ -296,6 +309,8 @@ class Node:
         self.log_dir = log_dir
         self.image = image
         self.cfg_path = cfg_path
+        # The contract's patch file (consensus config: UNL, roundtime, threshold) next to the node's config dir.
+        self.patch_path = os.path.join(os.path.dirname(os.path.dirname(cfg_path)), "contract_fs", "seed", "patch.cfg")
         self.cluster_id = app.store.cluster_id(contract_id)
         self.id = app.store.node_id(name, self.cluster_id, app.host, image)
         self.version = None
@@ -543,6 +558,8 @@ class Node:
         if msg.startswith("Peer proved a closed ledger"):
             self._bump(ts, "fast_forward")
             mm = RE_FF.search(msg)
+            if mm and (self.seq is None or int(mm.group(1)) > self.seq):
+                self.seq, self.hash = int(mm.group(1)), mm.group(2)
             self.app.detector.node_event(self, ts, "fast_forward", "info",
                                          "fast-forward %s -> %s" % ((mm.group(1), mm.group(3)) if mm else ("?", "?")),
                                          {"line": msg}, dedupe_s=30)
@@ -574,11 +591,22 @@ class Node:
             if self.post_exec_ts is not None and 0 <= ts - self.post_exec_ts <= 300:
                 self.app.cluster_started(self, ts, "post-exec")
             return
-        if msg.startswith("Applying pending patch"):
+        if msg.startswith("Applying pending patch") or msg.startswith("Applying patch recorded in ledger"):
             mm = RE_PATCH_SYNC.search(msg)
+            if mm and (self.seq is None or int(mm.group(1)) > self.seq):
+                self.seq, self.hash = int(mm.group(1)), mm.group(2)
             self.app.detector.node_event(self, ts, "patch_after_sync", "info",
                                          "pending patch applied after sync%s" % (" at %s" % mm.group(1) if mm else ""),
                                          {"line": msg}, dedupe_s=5)
+            return
+        if msg.startswith("Dropping certified target"):
+            self.app.detector.node_event(self, ts, "cert_target_dropped", "warn", msg[:200], {"line": msg}, dedupe_s=60)
+            return
+        if msg.startswith("Majority did not catch up"):
+            self.app.detector.node_event(self, ts, "gave_up_waiting", "warn", msg[:200], {"line": msg}, dedupe_s=60)
+            return
+        if msg.startswith("Became weakly connected") or msg.startswith("No longer weakly connected"):
+            self.app.detector.node_event(self, ts, "connectivity", "info", msg[:200], {"line": msg}, dedupe_s=60)
             return
         if msg.startswith("Invalid ledger certificate"):
             self.app.detector.node_event(self, ts, "invalid_cert", "high", "invalid ledger certificate", {"line": msg},
@@ -621,6 +649,21 @@ class Node:
         with self.lock:
             lines = list(self.ring)
         return "\n".join(lines)
+
+
+def node_config_snapshot(node):
+    """The node's hp.cfg (without its private key) and the contract's patch.cfg, for incident captures: peers, peer
+    discovery, UNL, roundtime and threshold are often what explains an incident."""
+    out = {}
+    for key, path in (("hp_cfg", node.cfg_path), ("patch_cfg", node.patch_path)):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                out[key] = json.load(f)
+        except (OSError, ValueError):
+            continue
+    if isinstance(out.get("hp_cfg", {}).get("node"), dict):
+        out["hp_cfg"]["node"].pop("private_key", None)
+    return out or None
 
 
 def find_hpcore_pid(user):
@@ -681,6 +724,7 @@ class Detector:
         self.recent = {}          # (cluster_id, seq) -> {hash: set(names)} for local nodes, last ~512 seqs
         self.open = {}            # (cluster_id, kind, key) -> incident id
         self.last_event = {}      # (node name, kind) -> ts
+        self.last_capture = {}    # (node name, kind) -> ts of the last capture for a node event of that kind
         self.cluster_state = {}   # contract_id -> {"max_seq", "advance_ts"}
         # Forks already reported (open or resolved), so a resolved fork is not raised again. Seeded from the DB.
         self.known_forks = {}     # (cluster_id, seq) -> incident id
@@ -727,7 +771,10 @@ class Detector:
         iid = self.app.store.insert_incident(node.cluster_id, node.id, kind, severity, ts, summary, detail)
         self.app.store.put("UPDATE incidents SET end_ts=? WHERE id=?", (ts, iid))
         if severity in ("high", "critical", "warn") and kind != "error":
-            self.capture(iid, node.cluster_id, [node])
+            last_cap = self.last_capture.get(key)
+            if not last_cap or ts - last_cap >= CAPTURE_COOLDOWN_S:
+                self.last_capture[key] = ts
+                self.capture(iid, node.cluster_id, [node])
         return iid
 
     def node_unfrozen(self, node, ts):
@@ -759,6 +806,10 @@ class Detector:
             if text:
                 self.app.store.put("INSERT INTO captures(incident_id, node_id, ts, kind, data) VALUES (?,?,?,?,?)",
                                    (iid, n.id, now, "log", zlib.compress(text.encode(), 6)))
+            cfg = node_config_snapshot(n)
+            if cfg:
+                self.app.store.put("INSERT INTO captures(incident_id, node_id, ts, kind, data) VALUES (?,?,?,?,?)",
+                                   (iid, n.id, now, "cfg", zlib.compress(json.dumps(cfg).encode(), 6)))
 
     def forget_cluster(self, cluster_id, contract_id):
         with self.lock:
@@ -1136,10 +1187,10 @@ class App:
         for r in rows:
             seen = max(self.cluster_seen.get(r["contract_id"], 0), r["last_seen"] or 0, self.started)
             if now - seen > after:
-                print("purging deleted cluster %s (no live nodes for %ds)" % (r["contract_id"], now - seen), flush=True)
                 self.detector.forget_cluster(r["id"], r["contract_id"])
-                self.store.purge_cluster(r["id"])
-                self.cluster_seen.pop(r["contract_id"], None)
+                if self.store.purge_cluster(r["id"]):
+                    print("purged deleted cluster %s (no live nodes for %ds)" % (r["contract_id"], now - seen), flush=True)
+                    self.cluster_seen.pop(r["contract_id"], None)
 
     # -- loops
     def run_loops(self):
@@ -1217,7 +1268,7 @@ def q_incident(app, iid):
             text = zlib.decompress(cap["data"]).decode("utf-8", "replace")
             caps.append({"node": names.get(cap["node_id"]), "ts": cap["ts"], "kind": cap["kind"],
                          "text": text if cap["kind"] == "log" else None,
-                         "json": json.loads(text) if cap["kind"] == "proc" else None})
+                         "json": json.loads(text) if cap["kind"] in ("proc", "cfg") else None})
         d = dict(r)
         d["detail"] = json.loads(d["detail"] or "{}")
         d["node"] = names.get(d["node_id"])

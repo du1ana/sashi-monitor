@@ -70,6 +70,18 @@
           </table>
         </div>
       {/each}
+      {@const cfgs = full.captures.filter((c) => c.kind === 'cfg')}
+      {#if cfgs.length}
+        <details>
+          <summary>Node config at capture time ({cfgs.length} node{cfgs.length === 1 ? '' : 's'}: peers, discovery, UNL, roundtime)</summary>
+          {#each cfgs as c}
+            <details>
+              <summary class="mono">{c.node} · captured {clock(c.ts)}</summary>
+              <pre class="mono">{JSON.stringify(c.json, null, 2)}</pre>
+            </details>
+          {/each}
+        </details>
+      {/if}
       {@const logs = full.captures.filter((c) => c.kind === 'log')}
       {#if logs.length}
         <div class="logbar">

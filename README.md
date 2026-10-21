@@ -30,7 +30,8 @@ in HotPocket clusters, and to compare clusters side by side (for example stock 0
 - **Peers:** each sashimon polls the others (`--peer`), so every dashboard shows the whole cluster across hosts.
 - **Bounded storage:**
   - batched writes, one transaction per second;
-  - age retention (72 h) plus a size cap (512 MB);
+  - age retention (72 h) plus a size cap (512 MB); captures (and their incidents) are exempt from the age retention
+    and are only dropped, oldest first, by the size cap, also after their cluster was deleted;
   - incremental vacuum and a truncated WAL.
 
   A busy 18-node debug-level cluster uses a few MB per hour.
@@ -78,11 +79,11 @@ Main options (flag / env):
 | `--peer URL` (repeatable) | `SASHIMON_PEERS` (comma-separated) | none | other hosts' sashimon |
 | `--host-label` | `SASHIMON_HOST_LABEL` | hostname | name shown for this host |
 | `--retention-hours` | `SASHIMON_RETENTION_HOURS` | 72 | |
-| `--max-db-mb` | `SASHIMON_MAX_DB_MB` | 512 | oldest log captures are dropped first |
+| `--max-db-mb` | `SASHIMON_MAX_DB_MB` | 512 | oldest captures are dropped first (captures are not subject to the age retention) |
 | `--freeze-seconds` | `SASHIMON_FREEZE_S` | 15 | |
 | `--stall-seconds` | `SASHIMON_STALL_S` | 60 | |
 | `--split-ledgers` | `SASHIMON_SPLIT_LEDGERS` | 5 | |
-| `--purge-deleted-after` | `SASHIMON_PURGE_DELETED_AFTER` | 300 | delete all data of a cluster once no host has seen a live node of it for this long (0 = keep) |
+| `--purge-deleted-after` | `SASHIMON_PURGE_DELETED_AFTER` | 300 | delete the data of a cluster once no host has seen a live node of it for this long (0 = keep); incidents with captures are kept until the size cap removes them |
 | `--ring-lines` | `SASHIMON_RING_LINES` | 6000 | per node |
 | `--placeholder-image REGEX` | `SASHIMON_PLACEHOLDER_IMAGE` | `placeholder` | instances whose image matches are placeholders (slot view only) |
 | `--sa-cfg` | `SASHIMON_SA_CFG` | `/etc/sashimono/sa.cfg` | read for the host's max instance count |
@@ -95,7 +96,7 @@ Main options (flag / env):
 |---|---|
 | `GET /api/overview` | hosts, clusters (live, plus offline ones still in the DB), open incidents |
 | `GET /api/cluster?contract_id=&window=` | live nodes (all hosts), per-host history, recent ledger hashes |
-| `GET /api/incident?host=&id=` | incident detail with log captures and process diagnosis |
+| `GET /api/incident?host=&id=` | incident detail with log captures, node configs (`hp.cfg` without the private key, `patch.cfg`) and process diagnosis |
 | `GET /api/local/live`, `/api/local/history`, `/api/local/incident` | per-host data, used between peers |
 | `POST /api/clear` | wipe stored history |
 
